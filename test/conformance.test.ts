@@ -17,6 +17,7 @@ import { loadTypes, getType } from "../src/types/loader.js";
 import { Collection } from "../src/operations/collection.js";
 import { parseFile } from "../src/frontmatter/parser.js";
 import { evaluateWhere, evaluateExpression, ExpressionError } from "../src/expressions/evaluator.js";
+import { parseLink } from "../src/links/parser.js";
 
 // Path to the spec's test files
 const SPEC_TESTS_DIR = path.resolve(
@@ -453,6 +454,18 @@ async function executeOperation(
       if (input.context && typeof input.context === "object") {
         frontmatter = { ...frontmatter, ...(input.context as Record<string, unknown>) };
       }
+      // Set up resolveFile callback for asFile() traversal
+      let resolveFile: ((target: string) => { frontmatter: Record<string, unknown>; path: string; types: string[] } | null) | undefined;
+      if (readPath) {
+        const opened2 = Collection.open(collectionRoot);
+        if (!opened2.error && opened2.collection) {
+          const coll = opened2.collection;
+          const files = (coll as any).scanFiles();
+          resolveFile = (target: string) => {
+            return (coll as any).resolveLink(target, readPath, files);
+          };
+        }
+      }
       try {
         const result = evaluateExpression(expression, {
           frontmatter,
@@ -461,6 +474,7 @@ async function executeOperation(
           types,
           body,
           file: fileInfo,
+          resolveFile,
         });
         return { result };
       } catch (e: unknown) {
@@ -515,6 +529,70 @@ async function executeOperation(
       const frontmatter = parsed.frontmatter ?? {};
       const types = opened.collection!.getTypesForFile(filePath, frontmatter);
       return { types };
+    }
+
+    case "resolve_link": {
+      const opened = Collection.open(collectionRoot);
+      if (opened.error) {
+        return { error: opened.error };
+      }
+      const filePath = input.path as string;
+      const field = input.field as string;
+
+      // Read the file to get the field value
+      const readResult = opened.collection!.read(filePath);
+      if (readResult.error) {
+        return { error: readResult.error };
+      }
+      const linkValue = readResult.frontmatter?.[field];
+      if (linkValue === null || linkValue === undefined) {
+        return { resolved_path: null };
+      }
+
+      // Look up the field's target constraint from type definitions
+      let targetType: string | undefined;
+      const fileTypes = readResult.types ?? [];
+      for (const typeName of fileTypes) {
+        const typeDef = (opened.collection! as any).typeDefs.get(typeName);
+        if (typeDef?.fields?.[field]) {
+          const fieldDef = typeDef.fields[field];
+          targetType = (fieldDef as any).target;
+          break;
+        }
+      }
+
+      // Use the collection's resolveLink method
+      const resolution = (opened.collection! as any).resolveLinkFull(
+        String(linkValue),
+        filePath,
+        targetType,
+      );
+      return { resolved_path: resolution.resolved ?? null };
+    }
+
+    case "parse_link": {
+      const value = input.value as string;
+      try {
+        const parsed = parseLink(value);
+        if (parsed) {
+          return { link: parsed };
+        }
+        // If parseLink returns null, the string is not a recognized link format
+        // but for parse_link operation, treat it as a simple name (valid)
+        return {
+          link: {
+            raw: value,
+            target: value,
+            alias: null,
+            anchor: null,
+            format: "path",
+            is_relative: false,
+          },
+        };
+      } catch (e: unknown) {
+        const err = e as { code?: string; message: string };
+        return { error: { code: err.code ?? "invalid_link", message: err.message } };
+      }
     }
 
     default:
@@ -709,6 +787,7 @@ function assertExpectation(
         "number_too_small", "number_too_large", "not_integer",
         "list_too_short", "list_too_long", "list_duplicate",
         "constraint_violation", "list_item_invalid", "invalid_enum_value",
+        "invalid_link", "link_not_found", "link_wrong_type", "ambiguous_link",
       ]);
 
       for (const expectedIssue of expected.issues) {
@@ -847,6 +926,22 @@ function assertExpectation(
         assertSubset(actualFile, filteredExpected, `${testName}: file`);
       }
     }
+  }
+
+  if ("resolved_path" in (expected as Record<string, unknown>)) {
+    const expectedPath = (expected as Record<string, unknown>).resolved_path;
+    const actualPath = (result as Record<string, unknown>).resolved_path;
+    if (expectedPath === null) {
+      expect(actualPath, `${testName}: resolved_path should be null`).toBeNull();
+    } else {
+      expect(actualPath, `${testName}: resolved_path`).toBe(expectedPath);
+    }
+  }
+
+  if ((expected as Record<string, unknown>).link !== undefined) {
+    const actualLink = (result as Record<string, unknown>).link;
+    expect(actualLink, `${testName}: link should exist`).toBeDefined();
+    assertSubset(actualLink, (expected as Record<string, unknown>).link, `${testName}: link`);
   }
 
   if (expected.type !== undefined) {

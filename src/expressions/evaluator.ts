@@ -10,6 +10,8 @@
  *   - Functions: exists(), isEmpty(), default(), if(), date(), now()
  */
 
+import { parseLink, extractBodyLinks, extractBodyTags, ParsedLink } from "../links/parser.js";
+
 export class ExpressionError extends Error {
   code: string;
   constructor(code: string, message: string) {
@@ -194,6 +196,7 @@ function tokenize(expr: string): Token[] {
 // ── Parser + Evaluator ──
 
 const MAX_DEPTH = 10;
+const MAX_TRAVERSAL_DEPTH = 10;
 
 class ExprParser {
   private tokens: Token[];
@@ -201,6 +204,7 @@ class ExprParser {
   private ctx: EvalContext;
   private source: string;
   private depth: number;
+  private traversalDepth: number;
 
   constructor(tokens: Token[], ctx: EvalContext, source: string) {
     this.tokens = tokens;
@@ -208,6 +212,7 @@ class ExprParser {
     this.ctx = ctx;
     this.source = source;
     this.depth = 0;
+    this.traversalDepth = 0;
   }
 
   private peek(): Token {
@@ -741,6 +746,10 @@ class ExprParser {
         if (args.length !== 3) throw new ExpressionError("wrong_argument_count", `replace() expects 3 arguments, got ${args.length}`);
         return String(args[0] ?? "").replace(String(args[1] ?? ""), String(args[2] ?? ""));
       }
+      case "link": {
+        // link("path") - construct a link string for use with hasLink()
+        return String(args[0] ?? "");
+      }
       default:
         throw new ExpressionError("unknown_function", `Unknown function: ${name}()`);
     }
@@ -845,14 +854,50 @@ class ExprParser {
         case "isTruthy": return obj !== "";
         case "asFile": {
           if (!this.ctx.resolveFile) return null;
-          // Strip wikilink brackets if present
+          // Track traversal depth
+          this.traversalDepth++;
+          if (this.traversalDepth > MAX_TRAVERSAL_DEPTH) {
+            throw new ExpressionError("expression_depth_exceeded", "Link traversal exceeds maximum depth of 10 hops");
+          }
+          // Parse the link value to extract the target
           let target = obj;
+          try {
+            const parsed = parseLink(obj);
+            if (parsed) target = parsed.target;
+          } catch {
+            // Use raw value if parsing fails
+          }
+          // Strip remaining wikilink brackets if present
           if (target.startsWith("[[") && target.endsWith("]]")) {
             target = target.slice(2, -2);
           }
+          // Strip anchor
+          const hashIdx = target.indexOf("#");
+          if (hashIdx !== -1) {
+            target = target.slice(0, hashIdx);
+          }
+          // Strip alias
+          const pipeIdx = target.indexOf("|");
+          if (pipeIdx !== -1) {
+            target = target.slice(0, pipeIdx);
+          }
           const resolved = this.ctx.resolveFile(target);
           if (!resolved) return null;
-          return { ...resolved.frontmatter, _path: resolved.path, _types: resolved.types };
+          // Build file metadata
+          const resolvedName = resolved.path.split("/").pop() ?? "";
+          return {
+            ...resolved.frontmatter,
+            _path: resolved.path,
+            _types: resolved.types,
+            file: {
+              path: resolved.path,
+              name: resolvedName,
+              basename: resolvedName.replace(/\.[^.]+$/, ""),
+              folder: resolved.path.includes("/") ? resolved.path.slice(0, resolved.path.lastIndexOf("/")) : "",
+              extension: "md",
+              ext: "md",
+            },
+          };
         }
         default: throw new ExpressionError("unknown_function", `Unknown string method: .${method}()`);
       }
@@ -1004,13 +1049,83 @@ class ExprParser {
           return fileFolder === folder || fileFolder.startsWith(folder + "/");
         }
         case "hasTag": {
-          // file.hasTag("tag1", "tag2") - check if file has any of the given tags
-          // This requires tag extraction from body (Level 4)
-          return false;
+          // file.hasTag("tag1", "tag2") - check if file has any of the given tags (variadic)
+          // Uses prefix matching on /-separated segments
+          const fileTags: string[] = (record.tags as string[]) ?? [];
+          return args.some((searchTag) => {
+            const needle = String(searchTag);
+            return fileTags.some((fileTag) => {
+              const t = String(fileTag);
+              // Exact match or prefix match on segment boundary
+              return t === needle || t.startsWith(needle + "/");
+            });
+          });
         }
         case "hasLink": {
-          // file.hasLink("target") - check if file has link to target (Level 4)
-          return false;
+          // file.hasLink(linkTarget) - check if file contains link to target
+          const fileLinks: string[] = (record.links as string[]) ?? [];
+          const searchTarget = String(args[0] ?? "");
+          // Extract and normalize the search target
+          let needle = searchTarget;
+          try {
+            const parsed = parseLink(searchTarget);
+            if (parsed) needle = parsed.target;
+          } catch {
+            // Use as-is
+          }
+          // Remove extension for comparison
+          const needleNoExt = needle.replace(/\.(md|markdown)$/, "");
+          const filePath = this.ctx.path ?? "";
+          const fileDir = filePath.includes("/") ? filePath.slice(0, filePath.lastIndexOf("/")) : "";
+
+          // Check if any file link matches
+          return fileLinks.some((linkVal) => {
+            let linkTarget = linkVal;
+            try {
+              const parsed = parseLink(linkVal);
+              if (parsed) linkTarget = parsed.target;
+            } catch {
+              // Use as-is
+            }
+            // Clean up target
+            linkTarget = linkTarget.replace(/\[\[|\]\]/g, "");
+            // Strip anchor and alias
+            const hashIdx = linkTarget.indexOf("#");
+            if (hashIdx !== -1) linkTarget = linkTarget.slice(0, hashIdx);
+            const pipeIdx = linkTarget.indexOf("|");
+            if (pipeIdx !== -1) linkTarget = linkTarget.slice(0, pipeIdx);
+
+            // Direct comparison
+            if (linkTarget === needle || linkTarget === needleNoExt) return true;
+            if (linkTarget + ".md" === needle) return true;
+            const linkTargetNoExt = linkTarget.replace(/\.(md|markdown)$/, "");
+            if (linkTargetNoExt === needleNoExt) return true;
+
+            // Resolve relative to file's directory for simple name comparison
+            // Simple name (no slash): resolve as fileDir/name
+            if (!linkTarget.includes("/") && !linkTarget.startsWith(".")) {
+              const resolvedPath = fileDir ? `${fileDir}/${linkTarget}` : linkTarget;
+              const resolvedNoExt = resolvedPath.replace(/\.(md|markdown)$/, "");
+              if (resolvedPath === needle || resolvedNoExt === needleNoExt) return true;
+              if (resolvedPath + ".md" === needle || resolvedNoExt + ".md" === needle) return true;
+            }
+
+            // Relative path resolution
+            if (linkTarget.startsWith("./") || linkTarget.startsWith("../")) {
+              const parts = [...(fileDir ? fileDir.split("/") : []), ...linkTarget.split("/")];
+              const normalized: string[] = [];
+              for (const p of parts) {
+                if (p === ".") continue;
+                if (p === "..") { normalized.pop(); continue; }
+                normalized.push(p);
+              }
+              const resolvedPath = normalized.join("/");
+              const resolvedNoExt = resolvedPath.replace(/\.(md|markdown)$/, "");
+              if (resolvedPath === needle || resolvedNoExt === needleNoExt) return true;
+            }
+
+            return false;
+          });
         }
         default: return null;
       }
@@ -1105,44 +1220,62 @@ class ExprParser {
       const fullName = this.ctx.path ? this.ctx.path.split("/").pop() ?? "" : "";
       const body = this.ctx.body ?? "";
 
-      // Extract tags from body (#tag patterns) and frontmatter tags field
-      const bodyTags: string[] = [];
-      const tagPattern = /(?:^|\s)#([a-zA-Z][a-zA-Z0-9_-]*)/g;
-      let tagMatch;
-      while ((tagMatch = tagPattern.exec(body)) !== null) {
-        bodyTags.push(tagMatch[1]);
-      }
-      // Include frontmatter tags field if it's an array
+      // Extract tags using proper parser (excludes code blocks and inline code)
+      const bodyTagList = extractBodyTags(body);
+      // Include frontmatter tags field
       const fmTags = this.ctx.frontmatter.tags;
-      const tags = Array.isArray(fmTags) ? [...fmTags.map(String), ...bodyTags] : bodyTags;
-
-      // Extract links from body ([[target]] patterns) and frontmatter link fields
-      const bodyLinks: string[] = [];
-      const linkPattern = /(?<!!)\[\[([^\]]+)\]\]/g;
-      let linkMatch;
-      while ((linkMatch = linkPattern.exec(body)) !== null) {
-        bodyLinks.push(linkMatch[1]);
+      let tags: string[];
+      if (typeof fmTags === "string") {
+        tags = [fmTags, ...bodyTagList];
+      } else if (Array.isArray(fmTags)) {
+        tags = [...fmTags.map(String), ...bodyTagList];
+      } else {
+        tags = bodyTagList;
       }
-      // Include frontmatter link fields
+
+      // Extract links using proper parser (excludes code blocks and inline code)
+      const bodyParsedLinks = extractBodyLinks(body);
+      // Non-embed body links
+      const bodyLinkTargets = bodyParsedLinks
+        .filter((l) => !l.is_embed)
+        .map((l) => l.raw);
+      // Body embeds
+      const bodyEmbedTargets = bodyParsedLinks
+        .filter((l) => l.is_embed)
+        .map((l) => l.raw);
+      // Include frontmatter link-typed fields
       const fmLinks: string[] = [];
       for (const val of Object.values(this.ctx.frontmatter)) {
         if (typeof val === "string") {
-          const fmLinkPattern = /\[\[([^\]]+)\]\]/g;
-          let fml;
-          while ((fml = fmLinkPattern.exec(val)) !== null) {
-            fmLinks.push(fml[1]);
+          try {
+            const parsed = parseLink(val);
+            if (parsed) fmLinks.push(val);
+          } catch {
+            // Invalid link, skip
+          }
+        } else if (Array.isArray(val)) {
+          for (const item of val) {
+            if (typeof item === "string") {
+              try {
+                const parsed = parseLink(item);
+                if (parsed) fmLinks.push(item);
+              } catch {
+                // Invalid link, skip
+              }
+            }
           }
         }
       }
-      const links = [...fmLinks, ...bodyLinks];
-
-      // Extract embeds from body (![[target]] patterns)
-      const embeds: string[] = [];
-      const embedPattern = /!\[\[([^\]]+)\]\]/g;
-      let embedMatch;
-      while ((embedMatch = embedPattern.exec(body)) !== null) {
-        embeds.push(embedMatch[1]);
+      // De-duplicate links (same link in frontmatter and body counts once)
+      const linkSet = new Set<string>();
+      const links: string[] = [];
+      for (const l of [...fmLinks, ...bodyLinkTargets]) {
+        if (!linkSet.has(l)) {
+          linkSet.add(l);
+          links.push(l);
+        }
       }
+      const embeds = bodyEmbedTargets;
 
       return {
         path: this.ctx.path ?? "",

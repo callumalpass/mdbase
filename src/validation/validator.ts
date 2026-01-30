@@ -7,6 +7,7 @@
 import { MdbaseConfig } from "../config/loader.js";
 import { TypeDefinition, FieldDefinition } from "../types/loader.js";
 import { MdbaseError } from "../errors.js";
+import { parseLink } from "../links/parser.js";
 
 export interface ValidationResult {
   valid: boolean;
@@ -734,6 +735,30 @@ function validateFieldValue(
             issues.push(...nestedIssues);
           }
         }
+      }
+      break;
+
+    case "link":
+      if (typeof val !== "string") {
+        issues.push({
+          code: "type_mismatch",
+          message: `Expected link (string) for "${fullFieldName}"`,
+          field: fullFieldName,
+          severity: "error",
+        });
+        break;
+      }
+      // Validate link syntax
+      try {
+        parseLink(val);
+      } catch (e: unknown) {
+        const err = e as { code?: string };
+        issues.push({
+          code: err.code ?? "invalid_link",
+          message: `Invalid link value for "${fullFieldName}": ${val}`,
+          field: fullFieldName,
+          severity: "error",
+        });
       }
       break;
 

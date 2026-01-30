@@ -13,6 +13,7 @@ import { parseFile, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateWhere, evaluateExpression, ExpressionError } from "../expressions/evaluator.js";
+import { parseLink, ParsedLink } from "../links/parser.js";
 
 function toBoolExternal(val: unknown): boolean {
   if (typeof val === "boolean") return val;
@@ -671,30 +672,8 @@ export class Collection {
       }
     }
 
-    // Check validate_exists for link fields
-    for (const typeDef of typeDefs) {
-      if (!typeDef.fields) continue;
-      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-        if (fieldDef.type !== "link" || !fieldDef.validate_exists) continue;
-        const value = frontmatter[fieldName];
-        if (value === null || value === undefined) continue;
-        const linkStr = String(value);
-        // Extract target from wikilink [[target]] or bare path
-        const wikiMatch = linkStr.match(/^\[\[([^\]]+)\]\]$/);
-        const target = wikiMatch ? wikiMatch[1] : linkStr;
-        // Check if target exists in collection
-        if (!this.linkTargetExists(target, relativePath)) {
-          result.issues.push({
-            code: "link_not_found",
-            field: fieldName,
-            message: `Link target "${target}" not found`,
-            path: relativePath,
-            severity: "error",
-          });
-          result.valid = false;
-        }
-      }
-    }
+    // Check link fields: validate_exists, target constraint, ambiguous_link
+    this.validateLinkFields(typeDefs, frontmatter, relativePath, result);
 
     // Check cross-file uniqueness for this file
     const uniqueFields = new Set<string>();
@@ -2196,22 +2175,397 @@ export class Collection {
   }
 
   /**
+   * Validate link fields in frontmatter: validate_exists, target constraint, ambiguous_link.
+   */
+  private validateLinkFields(
+    typeDefs: TypeDefinition[],
+    frontmatter: Record<string, unknown>,
+    relativePath: string,
+    result: { valid: boolean; issues: MdbaseError[] },
+  ): void {
+    for (const typeDef of typeDefs) {
+      if (!typeDef.fields) continue;
+      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+        if (fieldDef.type === "link") {
+          this.validateSingleLink(fieldName, fieldDef, frontmatter[fieldName], relativePath, result);
+        } else if (fieldDef.type === "list" && fieldDef.items?.type === "link") {
+          const value = frontmatter[fieldName];
+          if (!Array.isArray(value)) continue;
+          for (const item of value) {
+            this.validateSingleLink(fieldName, fieldDef.items, item, relativePath, result);
+          }
+        }
+      }
+    }
+  }
+
+  private validateSingleLink(
+    fieldName: string,
+    fieldDef: FieldDefinition,
+    value: unknown,
+    fromPath: string,
+    result: { valid: boolean; issues: MdbaseError[] },
+  ): void {
+    if (value === null || value === undefined) return;
+    if (typeof value !== "string") return; // type_mismatch handled by validator
+
+    // Parse the link
+    let parsed: ParsedLink | null;
+    try {
+      parsed = parseLink(value);
+    } catch {
+      // invalid_link already caught by validator
+      return;
+    }
+
+    // Check for path traversal before resolution
+    const target = parsed ? parsed.target : value;
+    const isRelative = parsed ? parsed.is_relative : false;
+    if (isRelative || target.includes("..")) {
+      const fromDir = path.dirname(fromPath);
+      const resolved = path.posix.normalize(path.posix.join(fromDir, target));
+      if (resolved.startsWith("..") || resolved.startsWith("/")) {
+        result.issues.push({
+          code: "path_traversal",
+          field: fieldName,
+          message: `Link "${value}" escapes collection root`,
+          path: fromPath,
+          severity: "error",
+        });
+        result.valid = false;
+        return;
+      }
+      // For wikilinks, also check if the normalized target itself has deep traversal
+      // (2+ leading .. segments after normalization = suspicious path)
+      if (parsed && parsed.format === "wikilink") {
+        const normalizedTarget = path.posix.normalize(target);
+        const segs = normalizedTarget.split("/");
+        let dotdotCount = 0;
+        for (const seg of segs) {
+          if (seg === "..") dotdotCount++;
+          else break;
+        }
+        if (dotdotCount >= 2) {
+          result.issues.push({
+            code: "path_traversal",
+            field: fieldName,
+            message: `Link "${value}" escapes collection root`,
+            path: fromPath,
+            severity: "error",
+          });
+          result.valid = false;
+          return;
+        }
+      }
+    }
+
+    // For validate_exists or target constraints, we need to resolve
+    const targetConstraint = (fieldDef as unknown as Record<string, unknown>).target as string | undefined;
+    const validateExists = (fieldDef as unknown as Record<string, unknown>).validate_exists as boolean | undefined;
+
+    if (!validateExists && !targetConstraint) return;
+
+    // Resolve the link
+    const resolution = this.resolveLinkFull(value, fromPath, targetConstraint);
+
+    if (resolution.ambiguous) {
+      result.issues.push({
+        code: "ambiguous_link",
+        field: fieldName,
+        message: `Ambiguous link "${value}": multiple candidates found`,
+        path: fromPath,
+        severity: "error",
+      });
+      result.valid = false;
+      return;
+    }
+
+    if (resolution.wrongType) {
+      result.issues.push({
+        code: "link_wrong_type",
+        field: fieldName,
+        message: `Link "${value}" resolves to wrong type (expected ${targetConstraint})`,
+        path: fromPath,
+        severity: "error",
+      });
+      result.valid = false;
+      return;
+    }
+
+    if (validateExists && !resolution.resolved) {
+      result.issues.push({
+        code: "link_not_found",
+        field: fieldName,
+        message: `Link target "${value}" not found`,
+        path: fromPath,
+        severity: "error",
+      });
+      result.valid = false;
+    }
+  }
+
+  /**
+   * Resolve a link value to a file, with full support for:
+   * - Path-based resolution (relative, absolute, root-relative)
+   * - Extension fallback
+   * - ID field matching
+   * - Filename matching with tiebreakers
+   * - Target type constraint
+   */
+  private resolveLinkFull(
+    linkValue: string,
+    fromPath: string,
+    targetType?: string,
+  ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
+    // Parse the link to get the target
+    let parsed: ParsedLink | null;
+    try {
+      parsed = parseLink(linkValue);
+    } catch {
+      return { resolved: null };
+    }
+
+    const target = parsed ? parsed.target : linkValue;
+    const format = parsed ? parsed.format : "path";
+    const isRelative = parsed ? parsed.is_relative : false;
+
+    const files = this.scanFiles();
+    const fromDir = path.dirname(fromPath);
+
+    // Strip anchor from target for resolution
+    let resolveTarget = target;
+
+    // Helper to check if a file exists (markdown files in scan list, or any file on disk)
+    const fileExists = (p: string): boolean => {
+      if (files.includes(p)) return true;
+      // Check on disk for non-markdown files
+      const fullPath = path.join(this.root, p);
+      try { return fs.statSync(fullPath).isFile(); } catch { return false; }
+    };
+
+    // Step 1: Path-based resolution
+    if (format === "markdown" || format === "path") {
+      // Markdown/path links resolve relative to containing file directory
+      let resolved: string;
+      if (resolveTarget.startsWith("/")) {
+        // Root-relative
+        resolved = resolveTarget.slice(1);
+      } else if (isRelative || !resolveTarget.startsWith("/")) {
+        // Relative to containing file
+        resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
+      } else {
+        resolved = resolveTarget;
+      }
+      resolved = resolved.replace(/\\/g, "/");
+
+      // Check if file exists
+      if (fileExists(resolved)) {
+        return this.checkTargetType(resolved, targetType);
+      }
+      // Try with extensions
+      for (const ext of this.getExtensions()) {
+        if (fileExists(resolved + ext)) {
+          return this.checkTargetType(resolved + ext, targetType);
+        }
+      }
+      return { resolved: null };
+    }
+
+    // Wikilink resolution
+    if (format === "wikilink") {
+      // Relative wikilinks (./, ../)
+      if (isRelative) {
+        let resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
+        resolved = resolved.replace(/\\/g, "/");
+        if (fileExists(resolved)) {
+          return this.checkTargetType(resolved, targetType);
+        }
+        for (const ext of this.getExtensions()) {
+          if (files.includes(resolved + ext)) {
+            return this.checkTargetType(resolved + ext, targetType);
+          }
+        }
+        return { resolved: null };
+      }
+
+      // Root-relative (/path)
+      if (resolveTarget.startsWith("/")) {
+        const resolved = resolveTarget.slice(1);
+        if (fileExists(resolved)) {
+          return this.checkTargetType(resolved, targetType);
+        }
+        for (const ext of this.getExtensions()) {
+          if (files.includes(resolved + ext)) {
+            return this.checkTargetType(resolved + ext, targetType);
+          }
+        }
+        return { resolved: null };
+      }
+
+      // Contains slash (absolute from root)
+      if (resolveTarget.includes("/")) {
+        if (fileExists(resolveTarget)) {
+          return this.checkTargetType(resolveTarget, targetType);
+        }
+        for (const ext of this.getExtensions()) {
+          if (fileExists(resolveTarget + ext)) {
+            return this.checkTargetType(resolveTarget + ext, targetType);
+          }
+        }
+        return { resolved: null };
+      }
+
+      // Simple name resolution
+      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType);
+    }
+
+    // Fallback: try as simple name
+    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType);
+  }
+
+  /**
+   * Resolve a simple name (no path separators) using ID field match, then filename match.
+   */
+  private resolveSimpleName(
+    name: string,
+    fromPath: string,
+    files: string[],
+    targetType?: string,
+  ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
+    const fromDir = path.dirname(fromPath);
+
+    // Determine scope: if target constraint, limit to files of that type
+    let scopeFiles = files;
+    if (targetType) {
+      scopeFiles = files.filter((f) => {
+        const readResult = this.read(f);
+        if (!readResult.types) return false;
+        return readResult.types.includes(targetType);
+      });
+    }
+
+    // Step 1: ID field match
+    const idField = this.config.settings.id_field;
+    const idMatches: string[] = [];
+    if (idField) {
+      for (const filePath of scopeFiles) {
+        const readResult = this.read(filePath);
+        if (!readResult.frontmatter) continue;
+        const idValue = readResult.frontmatter[idField];
+        if (idValue !== null && idValue !== undefined && String(idValue) === name) {
+          idMatches.push(filePath);
+        }
+      }
+    }
+
+    if (idMatches.length === 1) {
+      return this.checkTargetType(idMatches[0], targetType);
+    }
+    if (idMatches.length > 1) {
+      return { resolved: null, ambiguous: true };
+    }
+
+    // Step 2: Filename match
+    const filenameMatches: string[] = [];
+    for (const filePath of scopeFiles) {
+      const basename = path.basename(filePath, path.extname(filePath));
+      if (basename === name) {
+        filenameMatches.push(filePath);
+      }
+    }
+
+    if (filenameMatches.length === 0) {
+      // If there's a target constraint and no match found, check if a match exists outside scope
+      if (targetType) {
+        const allFiles = files;
+        for (const filePath of allFiles) {
+          const basename = path.basename(filePath, path.extname(filePath));
+          if (basename === name) {
+            // Found a file but it's wrong type
+            return { resolved: null, wrongType: true };
+          }
+        }
+        // Also check ID match outside scope
+        if (idField) {
+          for (const filePath of allFiles) {
+            const readResult = this.read(filePath);
+            if (!readResult.frontmatter) continue;
+            const idValue = readResult.frontmatter[idField];
+            if (idValue !== null && idValue !== undefined && String(idValue) === name) {
+              return { resolved: null, wrongType: true };
+            }
+          }
+        }
+      }
+      return { resolved: null };
+    }
+
+    if (filenameMatches.length === 1) {
+      return this.checkTargetType(filenameMatches[0], targetType);
+    }
+
+    // Apply tiebreakers
+    // 1. Same directory preference
+    const sameDir = filenameMatches.filter((f) => path.dirname(f) === fromDir);
+    if (sameDir.length === 1) {
+      return this.checkTargetType(sameDir[0], targetType);
+    }
+
+    // 2. Shortest path
+    const sorted = [...filenameMatches].sort((a, b) => {
+      const depthA = a.split("/").length;
+      const depthB = b.split("/").length;
+      if (depthA !== depthB) return depthA - depthB;
+      // 3. Alphabetical
+      return a.localeCompare(b);
+    });
+
+    // If multiple with same depth after sort, check if it's ambiguous
+    const shortestDepth = sorted[0].split("/").length;
+    const shortestPaths = sorted.filter((f) => f.split("/").length === shortestDepth);
+    if (shortestPaths.length > 1) {
+      // Alphabetical tiebreaker
+      return this.checkTargetType(shortestPaths.sort()[0], targetType);
+    }
+
+    return this.checkTargetType(sorted[0], targetType);
+  }
+
+  /**
+   * Check if the resolved file matches the target type constraint.
+   */
+  private checkTargetType(
+    resolvedPath: string,
+    targetType?: string,
+  ): { resolved: string; wrongType?: boolean } {
+    if (!targetType) {
+      return { resolved: resolvedPath };
+    }
+
+    const readResult = this.read(resolvedPath);
+    if (!readResult.types || !readResult.types.includes(targetType)) {
+      return { resolved: resolvedPath, wrongType: true };
+    }
+    return { resolved: resolvedPath };
+  }
+
+  /**
+   * Get configured file extensions to try for link resolution.
+   */
+  private getExtensions(): string[] {
+    const configExts = this.config.settings?.extensions ?? [];
+    const normalizedExtra = configExts.map((e: string) => e.startsWith(".") ? e : `.${e}`);
+    // .md is always first, then configured extras
+    return [".md", ...normalizedExtra.filter((e: string) => e !== ".md")];
+  }
+
+  /**
    * Check if a link target exists in the collection.
    * Searches for files matching the target by filename (without extension) or by path.
    */
   private linkTargetExists(target: string, fromPath: string): boolean {
-    const files = this.scanFiles();
-    for (const filePath of files) {
-      // Match by basename without extension
-      const basename = path.basename(filePath, path.extname(filePath));
-      if (basename === target) return true;
-      // Match by full relative path
-      if (filePath === target) return true;
-      // Match by path without extension
-      const withoutExt = filePath.replace(/\.(md|markdown)$/, "");
-      if (withoutExt === target) return true;
-    }
-    return false;
+    const resolution = this.resolveLinkFull(target, fromPath);
+    return resolution.resolved !== null;
   }
 
   private normalizeLinkTarget(value: string): string {
@@ -2302,44 +2656,25 @@ export class Collection {
   private resolveLink(
     linkTarget: string,
     fromPath: string,
-    knownFiles: string[],
+    _knownFiles: string[],
   ): { frontmatter: Record<string, unknown>; path: string; types: string[] } | null {
-    // Candidates to try
-    const candidates: string[] = [linkTarget];
-    if (!linkTarget.endsWith(".md")) candidates.push(linkTarget + ".md");
-
-    // Also try relative to fromPath's directory
-    const fromDir = path.dirname(fromPath);
-    if (fromDir !== ".") {
-      candidates.push(path.join(fromDir, linkTarget).replace(/\\/g, "/"));
-      if (!linkTarget.endsWith(".md"))
-        candidates.push(path.join(fromDir, linkTarget + ".md").replace(/\\/g, "/"));
+    // Use the full link resolution system
+    // Wrap as wikilink if not already a link format
+    let linkValue = linkTarget;
+    if (!linkTarget.startsWith("[[") && !linkTarget.startsWith("[") &&
+        !linkTarget.startsWith("./") && !linkTarget.startsWith("../") &&
+        !linkTarget.startsWith("/") && !linkTarget.includes("/")) {
+      linkValue = `[[${linkTarget}]]`;
     }
-
-    // Try basename matching against all known files
-    const baseName = path.basename(linkTarget);
-    const baseNameMd = baseName.endsWith(".md") ? baseName : baseName + ".md";
-
-    for (const candidate of candidates) {
-      if (knownFiles.includes(candidate)) {
-        const result = this.read(candidate);
-        if (!result.error) {
-          return { frontmatter: result.frontmatter ?? {}, path: candidate, types: result.types ?? [] };
-        }
-      }
-    }
-
-    // Basename match
-    for (const f of knownFiles) {
-      if (path.basename(f) === baseNameMd || path.basename(f) === baseName) {
-        const result = this.read(f);
-        if (!result.error) {
-          return { frontmatter: result.frontmatter ?? {}, path: f, types: result.types ?? [] };
-        }
-      }
-    }
-
-    return null;
+    const resolution = this.resolveLinkFull(linkValue, fromPath);
+    if (!resolution.resolved) return null;
+    const result = this.read(resolution.resolved);
+    if (result.error) return null;
+    return {
+      frontmatter: result.frontmatter ?? {},
+      path: resolution.resolved,
+      types: result.types ?? [],
+    };
   }
 
   /**
