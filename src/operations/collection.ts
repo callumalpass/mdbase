@@ -13,7 +13,8 @@ import { parseFile, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateWhere, evaluateExpression, ExpressionError } from "../expressions/evaluator.js";
-import { parseLink, ParsedLink } from "../links/parser.js";
+import { parseLink, extractBodyLinks, ParsedLink } from "../links/parser.js";
+import { BacklinkEntry } from "../expressions/evaluator.js";
 
 function toBoolExternal(val: unknown): boolean {
   if (typeof val === "boolean") return val;
@@ -108,6 +109,11 @@ export class Collection {
    * Used by test runner to simulate I/O failures.
    */
   public ioErrorPaths?: Set<string>;
+
+  /**
+   * When true, batch operations skip files that depend on failed files.
+   */
+  public skipDependents?: boolean;
 
   constructor(
     private root: string,
@@ -1322,9 +1328,18 @@ export class Collection {
   }
 
   /**
-   * Rename/move a file in the collection.
+   * Pre-ref-update hook for testing concurrent modifications during reference updates.
    */
-  rename(input: { from: string; to: string }): { valid?: boolean; error?: { code: string; message: string } } {
+  preRefUpdateHook?: (refPath: string) => void;
+
+  /**
+   * Rename/move a file in the collection, optionally updating references.
+   */
+  rename(input: {
+    from: string;
+    to: string;
+    update_refs?: boolean;
+  }): Record<string, unknown> {
     const fromPath = path.join(this.root, input.from);
     const toPath = path.join(this.root, input.to);
 
@@ -1373,7 +1388,410 @@ export class Collection {
     fs.mkdirSync(path.dirname(toPath), { recursive: true });
     fs.renameSync(fromPath, toPath);
 
-    return { valid: true };
+    // Determine if we should update references
+    const shouldUpdateRefs = input.update_refs !== undefined
+      ? input.update_refs
+      : this.config.settings.rename_update_refs;
+
+    if (!shouldUpdateRefs) {
+      return { valid: true, from: input.from, to: input.to };
+    }
+
+    // Update references across the collection
+    return this.updateReferencesAfterRename(input.from, input.to);
+  }
+
+  /**
+   * After a file has been renamed, find and update all references to it.
+   */
+  private updateReferencesAfterRename(
+    oldPath: string,
+    newPath: string,
+  ): Record<string, unknown> {
+    const files = this.scanFiles();
+    const referencesUpdated: Array<{ path: string; field?: string; location?: string }> = [];
+    const warnings: Array<{ path: string; message_contains?: string; message?: string }> = [];
+    const partialFailures: Array<{ path: string; reason: string }> = [];
+
+    // Get old and new file basenames (without extension) for wikilink matching
+    const oldBase = path.basename(oldPath, path.extname(oldPath));
+    const newBase = path.basename(newPath, path.extname(newPath));
+    const oldNoExt = oldPath.replace(/\.(md|markdown)$/, "");
+    const newNoExt = newPath.replace(/\.(md|markdown)$/, "");
+
+    // Check if the renamed file's id_field is still the same
+    // (if so, id-based links don't need rewriting)
+    const idField = this.config.settings.id_field;
+    let renamedFileId: string | undefined;
+    if (idField) {
+      const readResult = this.read(newPath);
+      if (!readResult.error && readResult.frontmatter) {
+        const idVal = readResult.frontmatter[idField];
+        if (typeof idVal === "string") {
+          renamedFileId = idVal;
+        }
+      }
+    }
+
+    for (const filePath of files) {
+      const fullPath = path.join(this.root, filePath);
+      const readResult = this.read(filePath);
+      if (readResult.error) continue;
+      const frontmatter = readResult.frontmatter ?? {};
+      const types = readResult.types ?? [];
+      const body = readResult.body ?? "";
+
+      let fmUpdated = false;
+      let bodyUpdated = false;
+      const fmUpdatedFields: string[] = [];
+      const updatedFm = { ...frontmatter };
+
+      // Check frontmatter link fields
+      for (const typeName of types) {
+        const typeDef = this.typeDefs.get(typeName);
+        if (!typeDef?.fields) continue;
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          const value = frontmatter[fieldName];
+          if (value === null || value === undefined) continue;
+
+          if (fieldDef.type === "link" && typeof value === "string") {
+            const result = this.updateLinkValue(value, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
+            if (result.warning) {
+              warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
+            } else if (result.updated && result.newValue !== value) {
+              updatedFm[fieldName] = result.newValue;
+              fmUpdated = true;
+              fmUpdatedFields.push(fieldName);
+            }
+          } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
+            const newList = [...value];
+            let listUpdated = false;
+            for (let i = 0; i < newList.length; i++) {
+              const item = newList[i];
+              if (typeof item !== "string") continue;
+              const result = this.updateLinkValue(item, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
+              if (result.warning) {
+                warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
+              } else if (result.updated && result.newValue !== item) {
+                newList[i] = result.newValue;
+                listUpdated = true;
+                fmUpdatedFields.push(`${fieldName}[${i}]`);
+              }
+            }
+            if (listUpdated) {
+              updatedFm[fieldName] = newList;
+              fmUpdated = true;
+            }
+          }
+        }
+      }
+
+      // Check body links
+      const newBody = this.updateBodyLinks(body, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
+      if (newBody !== body) {
+        bodyUpdated = true;
+      }
+
+      // Write updates if needed
+      if (fmUpdated || bodyUpdated) {
+        // Record mtime before potential hook
+        const beforeHookMtime = fs.statSync(fullPath).mtimeMs;
+
+        // Call pre-ref-update hook (for concurrent modification simulation)
+        if (this.preRefUpdateHook) {
+          this.preRefUpdateHook(filePath);
+        }
+
+        // Concurrency check on referring file
+        const currentMtime = fs.statSync(fullPath).mtimeMs;
+        if (currentMtime !== beforeHookMtime) {
+          // File was modified externally during ref update
+          partialFailures.push({ path: filePath, reason: "concurrent_modification" });
+          continue;
+        }
+
+        // Write the updated file
+        try {
+          const updatedContent = serializeFile(
+            fmUpdated ? updatedFm : frontmatter,
+            bodyUpdated ? newBody : body,
+            this.config.settings.write_nulls,
+            this.config.settings.write_empty_lists,
+          );
+          fs.writeFileSync(fullPath, updatedContent);
+
+          for (const field of fmUpdatedFields) {
+            referencesUpdated.push({ path: filePath, field });
+          }
+          if (bodyUpdated) {
+            referencesUpdated.push({ path: filePath, location: "body" });
+          }
+        } catch {
+          partialFailures.push({ path: filePath, reason: "write_error" });
+        }
+      }
+    }
+
+    const result: Record<string, unknown> = {
+      valid: true,
+      from: oldPath,
+      to: newPath,
+      references_updated: referencesUpdated,
+    };
+
+    if (warnings.length > 0) {
+      result.warnings = warnings;
+    }
+
+    if (partialFailures.length > 0) {
+      result.error = {
+        code: "rename_ref_update_failed",
+        message: `Rename succeeded but ${partialFailures.length} reference update(s) failed`,
+      };
+      result.partial_updates = { failed: partialFailures };
+    }
+
+    return result;
+  }
+
+  /**
+   * Check if a link value references the old path and compute the new value.
+   * Preserves link style (wikilink, markdown link, bare path).
+   */
+  private updateLinkValue(
+    linkValue: string,
+    oldPath: string,
+    newPath: string,
+    oldBase: string,
+    newBase: string,
+    oldNoExt: string,
+    newNoExt: string,
+    fromFile: string,
+    renamedFileId?: string,
+  ): { updated: boolean; newValue: string; warning?: string } {
+    let parsed: ParsedLink;
+    try {
+      parsed = parseLink(linkValue);
+    } catch {
+      return { updated: false, newValue: linkValue };
+    }
+
+    // Determine if this link references the old path
+    const resolution = this.resolveLinkFull(linkValue, fromFile);
+
+    // Check if the link references the old path
+    const target = parsed.target;
+    const normalizedTarget = this.normalizeLinkTarget(target);
+
+    // Direct text matching
+    const matchesOld = (
+      normalizedTarget === oldBase ||
+      normalizedTarget === oldPath ||
+      normalizedTarget === oldNoExt ||
+      target === oldPath ||
+      target === oldNoExt
+    );
+
+    // Resolve the relative link target to an absolute collection path
+    let resolvedOldTarget: string | undefined;
+    if (parsed.format === "markdown" || parsed.format === "path") {
+      const fromDir = path.dirname(fromFile);
+      const resolved = path.normalize(path.join(fromDir, target)).replace(/\\/g, "/");
+      if (resolved === oldPath || resolved === oldNoExt || resolved + ".md" === oldPath) {
+        resolvedOldTarget = oldPath;
+      }
+    }
+
+    // Also check via resolution: if the link now resolves to the new path, it was referencing the old file
+    const resolvesToNew = resolution.resolved === newPath;
+
+    if (!matchesOld && !resolvedOldTarget && !resolvesToNew) {
+      return { updated: false, newValue: linkValue };
+    }
+
+    // Check for ambiguous resolution
+    if (resolution.ambiguous) {
+      return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
+    }
+
+    // Check if the link is ambiguous because other files also match the same simple name
+    // (the original link was ambiguous before the rename)
+    if (parsed.format === "wikilink" && !target.includes("/") && !target.startsWith("./") && !target.startsWith("../")) {
+      const files = this.scanFiles();
+      const matchingFiles = files.filter((f) => {
+        const base = path.basename(f, path.extname(f));
+        return base === normalizedTarget && f !== newPath;
+      });
+      if (matchingFiles.length > 0) {
+        // The link was ambiguous before rename — don't update
+        return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
+      }
+    }
+
+    // Compute new link value preserving style
+    if (parsed.format === "wikilink") {
+      return this.updateWikilink(linkValue, parsed, oldPath, newPath, oldBase, newBase, fromFile);
+    } else if (parsed.format === "markdown") {
+      return this.updateMarkdownLink(linkValue, parsed, oldPath, newPath, fromFile);
+    } else {
+      // Bare path
+      return this.updateBarePath(linkValue, parsed, oldPath, newPath, fromFile);
+    }
+  }
+
+  private updateWikilink(
+    _linkValue: string,
+    parsed: ParsedLink,
+    _oldPath: string,
+    newPath: string,
+    _oldBase: string,
+    newBase: string,
+    _fromFile: string,
+  ): { updated: boolean; newValue: string } {
+    const target = parsed.target;
+    // Determine new target
+    let newTarget: string;
+    if (target.includes("/")) {
+      // Path-style wikilink: use the new path without extension
+      newTarget = newPath.replace(/\.(md|markdown)$/, "");
+    } else {
+      // Simple name wikilink: use just the new basename
+      newTarget = newBase;
+    }
+
+    // Rebuild wikilink with anchor and alias preserved
+    let result = "[[" + newTarget;
+    if (parsed.anchor) result += "#" + parsed.anchor;
+    if (parsed.alias) result += "|" + parsed.alias;
+    result += "]]";
+
+    // Handle embed prefix
+    if ((parsed as unknown as Record<string, unknown>).is_embed) {
+      result = "!" + result;
+    }
+
+    return { updated: true, newValue: result };
+  }
+
+  private updateMarkdownLink(
+    _linkValue: string,
+    parsed: ParsedLink,
+    oldPath: string,
+    newPath: string,
+    fromFile: string,
+  ): { updated: boolean; newValue: string } {
+    // Compute new relative path from the referring file to the new target
+    const fromDir = path.dirname(fromFile);
+    let newRelative = path.relative(fromDir, newPath).replace(/\\/g, "/");
+    if (!newRelative.startsWith(".") && !newRelative.startsWith("/")) {
+      newRelative = "./" + newRelative;
+    }
+
+    // Rebuild markdown link preserving alias (display text) and anchor
+    const alias = parsed.alias ?? "";
+    let newHref = newRelative;
+    if (parsed.anchor) newHref += "#" + parsed.anchor;
+
+    const isEmbed = (parsed as unknown as Record<string, unknown>).is_embed;
+    const prefix = isEmbed ? "!" : "";
+    const result = `${prefix}[${alias}](${newHref})`;
+
+    return { updated: true, newValue: result };
+  }
+
+  private updateBarePath(
+    _linkValue: string,
+    parsed: ParsedLink,
+    _oldPath: string,
+    newPath: string,
+    fromFile: string,
+  ): { updated: boolean; newValue: string } {
+    // Compute new relative path
+    const fromDir = path.dirname(fromFile);
+    let newRelative = path.relative(fromDir, newPath).replace(/\\/g, "/");
+    if (!newRelative.startsWith(".") && !newRelative.startsWith("/")) {
+      newRelative = "./" + newRelative;
+    }
+    return { updated: true, newValue: newRelative };
+  }
+
+  /**
+   * Update links in body text, excluding code blocks and inline code.
+   */
+  private updateBodyLinks(
+    body: string,
+    oldPath: string,
+    newPath: string,
+    oldBase: string,
+    newBase: string,
+    oldNoExt: string,
+    newNoExt: string,
+    fromFile: string,
+    renamedFileId?: string,
+  ): string {
+    if (!body) return body;
+
+    const lines = body.split("\n");
+    let inFencedCode = false;
+    const result: string[] = [];
+
+    for (const line of lines) {
+      // Track fenced code blocks
+      if (/^```/.test(line.trimStart())) {
+        inFencedCode = !inFencedCode;
+        result.push(line);
+        continue;
+      }
+      if (inFencedCode) {
+        result.push(line);
+        continue;
+      }
+
+      // Process line: find inline code spans and protect them
+      let processed = "";
+      let pos = 0;
+      const inlineCodeRegex = /`[^`]+`/g;
+      let codeMatch;
+      const codeSpans: Array<{ start: number; end: number }> = [];
+
+      while ((codeMatch = inlineCodeRegex.exec(line)) !== null) {
+        codeSpans.push({ start: codeMatch.index, end: codeMatch.index + codeMatch[0].length });
+      }
+
+      // Process wikilinks and markdown links outside code spans
+      const linkRegex = /(!?\[\[([^\]\n]+)\]\])|(!?\[([^\]]*)\]\(([^)]+)\))/g;
+      let linkMatch;
+      let lastEnd = 0;
+
+      while ((linkMatch = linkRegex.exec(line)) !== null) {
+        const matchStart = linkMatch.index;
+        const matchEnd = matchStart + linkMatch[0].length;
+
+        // Skip if inside inline code
+        const inCode = codeSpans.some((cs) => matchStart >= cs.start && matchEnd <= cs.end);
+        if (inCode) continue;
+
+        // Determine what kind of link this is and try to update it
+        const raw = linkMatch[0];
+        const updateResult = this.updateLinkValue(
+          raw, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, fromFile, renamedFileId,
+        );
+
+        if (updateResult.updated && updateResult.newValue !== raw) {
+          processed += line.slice(lastEnd, matchStart) + updateResult.newValue;
+          lastEnd = matchEnd;
+        }
+      }
+
+      if (lastEnd > 0) {
+        processed += line.slice(lastEnd);
+        result.push(processed);
+      } else {
+        result.push(line);
+      }
+    }
+
+    return result.join("\n");
   }
 
   /**
@@ -1507,6 +1925,7 @@ export class Collection {
           const resolveFile = (linkTarget: string) => {
             return this.resolveLink(linkTarget, relativePath, files);
           };
+          const computeBacklinks = (fp: string) => this.computeBacklinksForFile(fp);
           const ctx = {
             frontmatter: { ...frontmatterWithFormulas, formula: formulaValues ?? {} },
             rawFrontmatter: readResult.rawFrontmatter,
@@ -1516,6 +1935,7 @@ export class Collection {
             file: fileInfo,
             thisContext,
             resolveFile,
+            computeBacklinks,
           };
           try {
             const whereResult = evaluateExpression(input.where, ctx);
@@ -1589,16 +2009,19 @@ export class Collection {
             if (prop === "path") { va = a.path; vb = b.path; }
             else if (prop.includes(".")) {
               // Complex file property like file.embeds.length — evaluate as expression
+              const backlinksCb = (fp: string) => this.computeBacklinksForFile(fp);
               try {
                 va = evaluateExpression(field, {
                   frontmatter: a.frontmatter, path: a.path, types: a.types,
                   body: a.body ?? undefined, file: a._file,
+                  computeBacklinks: backlinksCb,
                 });
               } catch { va = null; }
               try {
                 vb = evaluateExpression(field, {
                   frontmatter: b.frontmatter, path: b.path, types: b.types,
                   body: b.body ?? undefined, file: b._file,
+                  computeBacklinks: backlinksCb,
                 });
               } catch { vb = null; }
             }
@@ -2014,12 +2437,68 @@ export class Collection {
     // Actually update
     let succeeded = 0;
     let failed = 0;
+    let skipped = 0;
     const details: BatchResultDetail[] = [];
+    const failedPaths = new Set<string>();
 
     for (const relativePath of matchingPaths) {
+      // Check if this file depends on a failed file (skip_dependents)
+      if (this.skipDependents && failedPaths.size > 0) {
+        const fullPath = path.join(this.root, relativePath);
+        const parsed = parseFile(fullPath);
+        const typeNames = this.getTypesForFile(relativePath, parsed.frontmatter);
+        let dependsOnFailed = false;
+        // Collect title→path mappings from failed files for link resolution
+        const failedTitles = new Map<string, string>();
+        for (const fp of failedPaths) {
+          const fpFull = path.join(this.root, fp);
+          try {
+            const fpParsed = parseFile(fpFull);
+            if (fpParsed.frontmatter.title) {
+              failedTitles.set(String(fpParsed.frontmatter.title), fp);
+            }
+          } catch { /* skip */ }
+          failedTitles.set(path.basename(fp, path.extname(fp)), fp);
+        }
+        for (const typeName of typeNames) {
+          const typeDef = this.typeDefs.get(typeName);
+          if (!typeDef?.fields) continue;
+          for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+            if (fieldDef.type === "link" && parsed.frontmatter[fieldName]) {
+              const linkVal = String(parsed.frontmatter[fieldName]);
+              // Extract wikilink target
+              const wikiMatch = linkVal.match(/\[\[([^\]#|]+)/);
+              const target = wikiMatch ? wikiMatch[1].trim() : linkVal;
+              // Check if target matches any failed file's title or basename
+              if (failedTitles.has(target)) {
+                dependsOnFailed = true;
+              }
+              // Also try full link resolution
+              if (!dependsOnFailed) {
+                try {
+                  const allFiles = this.scanFiles();
+                  const resolved = this.resolveLinkFull(linkVal, relativePath, allFiles);
+                  if (resolved && failedPaths.has(resolved)) {
+                    dependsOnFailed = true;
+                  }
+                } catch { /* skip */ }
+              }
+            }
+            if (dependsOnFailed) break;
+          }
+          if (dependsOnFailed) break;
+        }
+        if (dependsOnFailed) {
+          skipped++;
+          details.push({ path: relativePath, status: "skipped" });
+          continue;
+        }
+      }
+
       // Check for simulated I/O error
       if (this.ioErrorPaths?.has(relativePath)) {
         failed++;
+        failedPaths.add(relativePath);
         details.push({ path: relativePath, status: "failed", error: { code: "io_error", message: `I/O error writing ${relativePath}` } });
         continue;
       }
@@ -2030,6 +2509,7 @@ export class Collection {
         });
         if (result.error) {
           failed++;
+          failedPaths.add(relativePath);
           details.push({ path: relativePath, status: "failed", error: result.error });
         } else {
           succeeded++;
@@ -2037,6 +2517,7 @@ export class Collection {
         }
       } catch {
         failed++;
+        failedPaths.add(relativePath);
         details.push({ path: relativePath, status: "failed", error: { code: "io_error", message: `Failed to update ${relativePath}` } });
       }
     }
@@ -2046,6 +2527,7 @@ export class Collection {
         total: matchingPaths.length,
         succeeded,
         failed,
+        ...(skipped > 0 ? { skipped } : {}),
         details,
       },
     };
@@ -2647,6 +3129,76 @@ export class Collection {
     }
 
     return results;
+  }
+
+  /**
+   * Compute backlinks for a specific file.
+   * Scans all files in the collection for links (frontmatter, body, embeds) that resolve to targetPath.
+   * Returns one entry per source file (deduplicated).
+   */
+  computeBacklinksForFile(targetPath: string): BacklinkEntry[] {
+    const files = this.scanFiles();
+    const seenSources = new Set<string>();
+    const backlinks: BacklinkEntry[] = [];
+
+    for (const sourcePath of files) {
+      const readResult = this.read(sourcePath);
+      if (readResult.error) continue;
+      const frontmatter = readResult.frontmatter ?? {};
+      const types = readResult.types ?? [];
+      const body = readResult.body ?? "";
+
+      // Collect all link values from this source file
+      const allLinkValues: string[] = [];
+
+      // 1. Frontmatter link-typed fields
+      for (const typeName of types) {
+        const typeDef = this.typeDefs.get(typeName);
+        if (!typeDef?.fields) continue;
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          const value = frontmatter[fieldName];
+          if (value === null || value === undefined) continue;
+          if (fieldDef.type === "link" && typeof value === "string") {
+            allLinkValues.push(value);
+          } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
+            for (const item of value) {
+              if (typeof item === "string") allLinkValues.push(item);
+            }
+          }
+        }
+      }
+
+      // 2. Body links (including embeds) — all create backlinks
+      const bodyLinks = extractBodyLinks(body);
+      for (const bl of bodyLinks) {
+        allLinkValues.push(bl.raw);
+      }
+
+      // Check if any link resolves to the target
+      for (const linkValue of allLinkValues) {
+        if (seenSources.has(sourcePath)) break;
+        try {
+          const resolution = this.resolveLinkFull(linkValue, sourcePath);
+          if (resolution.resolved === targetPath) {
+            seenSources.add(sourcePath);
+            const name = sourcePath.split("/").pop() ?? "";
+            backlinks.push({
+              file: {
+                path: sourcePath,
+                name,
+                basename: name.replace(/\.[^.]+$/, ""),
+                folder: sourcePath.includes("/") ? sourcePath.slice(0, sourcePath.lastIndexOf("/")) : "",
+                extension: "md",
+              },
+            });
+          }
+        } catch {
+          // Invalid link, skip
+        }
+      }
+    }
+
+    return backlinks;
   }
 
   /**

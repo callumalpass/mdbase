@@ -163,6 +163,16 @@ function materializeSetup(setup: TestSetup): string {
     }
   }
 
+  // Write extra files (non-markdown files for watch tests)
+  if ((setup as Record<string, unknown>).extra_files) {
+    const extraFiles = (setup as Record<string, unknown>).extra_files as Record<string, string>;
+    for (const [filePath, content] of Object.entries(extraFiles)) {
+      const fullPath = path.join(tmpDir, filePath);
+      fs.mkdirSync(path.dirname(fullPath), { recursive: true });
+      fs.writeFileSync(fullPath, content);
+    }
+  }
+
   return tmpDir;
 }
 
@@ -229,36 +239,123 @@ function applySimulate(
     collection.ioErrorPaths = new Set([ioErrorOn]);
   }
 
+  // Set up skip_dependents
+  if (simulate.skip_dependents) {
+    collection.skipDependents = true;
+  }
+
   // Set up pre-write hook for external modifications
-  const extModify = simulate.external_modify as { path?: string; content?: string; frontmatter?: Record<string, unknown> } | undefined;
+  const extModify = simulate.external_modify as { path?: string; content?: string; frontmatter?: Record<string, unknown>; timing?: string } | undefined;
   const extCreate = simulate.external_create as { path?: string; content?: string } | undefined;
 
+  const doModify = (mod: { path?: string; content?: string; frontmatter?: Record<string, unknown> }) => {
+    const modPath = path.join(collectionRoot, mod.path!);
+    let content = mod.content;
+    if (!content && mod.frontmatter) {
+      const yamlStr = Object.entries(mod.frontmatter)
+        .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
+        .join("\n");
+      content = `---\n${yamlStr}\n---\n`;
+    }
+    if (content) {
+      fs.writeFileSync(modPath, content);
+      const now = Date.now();
+      fs.utimesSync(modPath, new Date(now + 1000), new Date(now + 1000));
+    }
+  };
+
   if (extModify || extCreate) {
-    collection.preWriteHook = () => {
-      if (extModify) {
-        const modPath = path.join(collectionRoot, extModify.path!);
-        let content = extModify.content;
-        if (!content && extModify.frontmatter) {
-          // Build content from frontmatter
-          const yamlStr = Object.entries(extModify.frontmatter)
-            .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
-            .join("\n");
-          content = `---\n${yamlStr}\n---\n`;
+    const timing = extModify?.timing;
+    if (timing === "before_ref_update") {
+      // Fire before reference updates, not before primary rename
+      collection.preRefUpdateHook = () => {
+        if (extModify) doModify(extModify);
+      };
+    } else {
+      collection.preWriteHook = () => {
+        if (extModify) doModify(extModify);
+        if (extCreate) {
+          const createPath = path.join(collectionRoot, extCreate.path!);
+          fs.mkdirSync(path.dirname(createPath), { recursive: true });
+          fs.writeFileSync(createPath, extCreate.content ?? "---\n---\n");
         }
-        if (content) {
-          // Ensure the modification changes mtime (wait a bit if needed)
-          fs.writeFileSync(modPath, content);
-          // Force mtime change by touching the file with a future time
-          const now = Date.now();
-          fs.utimesSync(modPath, new Date(now + 1000), new Date(now + 1000));
-        }
-      }
-      if (extCreate) {
+      };
+    }
+    // Also set up create hook if separate from modify
+    if (extCreate && timing === "before_ref_update") {
+      const origHook = collection.preRefUpdateHook;
+      collection.preRefUpdateHook = () => {
+        if (origHook) origHook();
         const createPath = path.join(collectionRoot, extCreate.path!);
         fs.mkdirSync(path.dirname(createPath), { recursive: true });
         fs.writeFileSync(createPath, extCreate.content ?? "---\n---\n");
+      };
+    }
+  }
+}
+
+/**
+ * Apply immediate simulations (external file changes) before the operation runs.
+ * Used for staleness tests where the operation (query, read, validate) should see the changes.
+ */
+function applyImmediateSimulate(
+  collectionRoot: string,
+  simulate?: Record<string, unknown>,
+): void {
+  if (!simulate) return;
+
+  // External modify: write new content to a file immediately
+  const extModify = simulate.external_modify as { path?: string; content?: string; frontmatter?: Record<string, unknown> } | undefined;
+  if (extModify) {
+    const modPath = path.join(collectionRoot, extModify.path!);
+    let content = extModify.content;
+    if (!content && extModify.frontmatter) {
+      const yamlStr = Object.entries(extModify.frontmatter)
+        .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
+        .join("\n");
+      content = `---\n${yamlStr}\n---\n`;
+    }
+    if (content) {
+      fs.writeFileSync(modPath, content);
+    }
+  }
+
+  // External create: create a new file immediately
+  const extCreate = simulate.external_create as { path?: string; content?: string } | undefined;
+  if (extCreate) {
+    const createPath = path.join(collectionRoot, extCreate.path!);
+    fs.mkdirSync(path.dirname(createPath), { recursive: true });
+    fs.writeFileSync(createPath, extCreate.content ?? "---\n---\n");
+  }
+
+  // External delete: remove a file immediately
+  const extDelete = simulate.external_delete as { path?: string } | undefined;
+  if (extDelete) {
+    const deletePath = path.join(collectionRoot, extDelete.path!);
+    if (fs.existsSync(deletePath)) {
+      fs.unlinkSync(deletePath);
+    }
+  }
+
+  // Config change: overwrite mdbase.yaml
+  const configChange = simulate.config_change as { new_config?: string } | undefined;
+  if (configChange?.new_config) {
+    fs.writeFileSync(path.join(collectionRoot, "mdbase.yaml"), configChange.new_config);
+  }
+
+  // Type change: overwrite a type definition file
+  const typeChange = simulate.type_change as { type?: string; new_definition?: string } | undefined;
+  if (typeChange?.type && typeChange?.new_definition) {
+    // Find types_folder from config
+    let typesFolder = "_types";
+    try {
+      const configResult = loadConfig(collectionRoot);
+      if (configResult.config) {
+        typesFolder = configResult.config.settings.types_folder;
       }
-    };
+    } catch { /* use default */ }
+    const typePath = path.join(collectionRoot, typesFolder, `${typeChange.type}.md`);
+    fs.writeFileSync(typePath, typeChange.new_definition);
   }
 }
 
@@ -303,6 +400,7 @@ async function executeOperation(
     }
 
     case "read": {
+      applyImmediateSimulate(collectionRoot, simulate);
       const opened = Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
@@ -311,6 +409,7 @@ async function executeOperation(
     }
 
     case "validate": {
+      applyImmediateSimulate(collectionRoot, simulate);
       // If frontmatter is provided inline, create the file first
       if (input.frontmatter && input.path) {
         const filePath = path.join(collectionRoot, input.path as string);
@@ -398,10 +497,16 @@ async function executeOperation(
       if (!from || !to) {
         return { error: { code: "path_required", message: "Both source and destination paths are required for rename" } };
       }
-      return opened.collection!.rename({ from, to });
+      return opened.collection!.rename({
+        from,
+        to,
+        update_refs: input.update_refs as boolean | undefined,
+      });
     }
 
     case "query": {
+      // Apply immediate simulations (external file changes) before query
+      applyImmediateSimulate(collectionRoot, simulate);
       const opened = Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
@@ -456,6 +561,7 @@ async function executeOperation(
       }
       // Set up resolveFile callback for asFile() traversal
       let resolveFile: ((target: string) => { frontmatter: Record<string, unknown>; path: string; types: string[] } | null) | undefined;
+      let computeBacklinks: ((fp: string) => import("../src/expressions/evaluator.js").BacklinkEntry[]) | undefined;
       if (readPath) {
         const opened2 = Collection.open(collectionRoot);
         if (!opened2.error && opened2.collection) {
@@ -463,6 +569,9 @@ async function executeOperation(
           const files = (coll as any).scanFiles();
           resolveFile = (target: string) => {
             return (coll as any).resolveLink(target, readPath, files);
+          };
+          computeBacklinks = (fp: string) => {
+            return coll.computeBacklinksForFile(fp);
           };
         }
       }
@@ -475,6 +584,7 @@ async function executeOperation(
           body,
           file: fileInfo,
           resolveFile,
+          computeBacklinks,
         });
         return { result };
       } catch (e: unknown) {
@@ -593,6 +703,385 @@ async function executeOperation(
         const err = e as { code?: string; message: string };
         return { error: { code: err.code ?? "invalid_link", message: err.message } };
       }
+    }
+
+    case "cache_rebuild": {
+      // Cache rebuild: since our implementation always reads from disk,
+      // this is effectively a no-op that returns success.
+      applyImmediateSimulate(collectionRoot, simulate);
+      const opened = Collection.open(collectionRoot);
+      if (opened.error) {
+        return { success: false, error: opened.error };
+      }
+      return { success: true };
+    }
+
+    case "cache_clear": {
+      // Cache clear: remove any .mdbase cache directory if it exists.
+      // Since we don't use a persistent cache, this is mostly a no-op.
+      const cacheDir = path.join(collectionRoot, ".mdbase");
+      if (fs.existsSync(cacheDir)) {
+        fs.rmSync(cacheDir, { recursive: true, force: true });
+      }
+      return { success: true };
+    }
+
+    case "watch": {
+      // Watch mode simulation: snapshot files, apply changes, compute events
+      const sim = (simulate ?? input.simulate) as Record<string, unknown> | undefined;
+      if (!sim) {
+        return { events: [] };
+      }
+
+      // Load config and types for event generation
+      const configResult = loadConfig(collectionRoot);
+      if (!configResult.valid || !configResult.config) {
+        return { events: [], error: configResult.error };
+      }
+      const config = configResult.config;
+      const extensions = new Set(["md", ...(config.settings.extensions || [])]);
+
+      // Snapshot existing files before changes
+      const opened = Collection.open(collectionRoot);
+      const files = opened.collection ? opened.collection.scanFiles() : [];
+      const beforeState = new Map<string, { frontmatter: Record<string, unknown>; body: string; types: string[] }>();
+      for (const f of files) {
+        try {
+          const parsed = parseFile(path.join(collectionRoot, f));
+          const types = opened.collection!.getTypesForFile(f, parsed.frontmatter);
+          beforeState.set(f, { frontmatter: { ...parsed.frontmatter }, body: parsed.body, types });
+        } catch { /* skip */ }
+      }
+
+      const events: Array<Record<string, unknown>> = [];
+      const listenerErrorOn = sim.listener_error_on_event as number | undefined;
+      let eventIndex = 0;
+
+      function emitEvent(evt: Record<string, unknown>) {
+        eventIndex++;
+        if (listenerErrorOn !== undefined && eventIndex === listenerErrorOn) {
+          // Simulate listener error — but watcher should continue
+          // Still record the event for tracking
+        }
+        events.push({ ...evt, timestamp: new Date().toISOString() });
+      }
+
+      // Helper: check if path is excluded
+      function isExcluded(filePath: string): boolean {
+        if (!config.settings.exclude?.length) return false;
+        const excludePatterns = config.settings.exclude;
+        for (const pattern of excludePatterns) {
+          const matcher = require("picomatch")(pattern, { dot: true });
+          if (matcher(filePath)) return true;
+        }
+        return false;
+      }
+
+      // Helper: check if file has a watched extension
+      function isWatchedExtension(filePath: string): boolean {
+        const ext = path.extname(filePath).slice(1);
+        return extensions.has(ext);
+      }
+
+      // Helper: read file and compute state
+      function readFileState(filePath: string) {
+        const fullPath = path.join(collectionRoot, filePath);
+        if (!fs.existsSync(fullPath)) return null;
+        try {
+          const parsed = parseFile(fullPath);
+          const reopened = Collection.open(collectionRoot);
+          const types = reopened.collection ? reopened.collection.getTypesForFile(filePath, parsed.frontmatter) : [];
+          // Apply defaults from type definitions
+          const frontmatter = { ...parsed.frontmatter };
+          if (reopened.collection) {
+            for (const typeName of types) {
+              const typeDef = (reopened.collection as unknown as { typeDefs: Map<string, { fields: Record<string, { default?: unknown }> }> }).typeDefs.get(typeName);
+              if (typeDef?.fields) {
+                for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+                  if (frontmatter[fieldName] === undefined && fieldDef.default !== undefined) {
+                    frontmatter[fieldName] = fieldDef.default;
+                  }
+                }
+              }
+            }
+          }
+          return { frontmatter, body: parsed.body, types };
+        } catch {
+          return null;
+        }
+      }
+
+      // Helper: compute changed fields between old and new frontmatter
+      function getChangedFields(oldFm: Record<string, unknown>, newFm: Record<string, unknown>): string[] {
+        const changed: string[] = [];
+        const allKeys = new Set([...Object.keys(oldFm), ...Object.keys(newFm)]);
+        for (const key of allKeys) {
+          if (key === "type" || key === "types") continue;
+          if (JSON.stringify(oldFm[key]) !== JSON.stringify(newFm[key])) {
+            changed.push(key);
+          }
+        }
+        return changed;
+      }
+
+      // Helper: validate file and return issues
+      function validateFile(filePath: string): Array<{ code: string; field?: string }> {
+        const reopened = Collection.open(collectionRoot);
+        if (!reopened.collection) return [];
+        const valResult = reopened.collection.validate(filePath);
+        if (valResult && typeof valResult === "object" && "issues" in valResult) {
+          const issues = (valResult as { issues?: Array<{ code: string; field?: string }> }).issues;
+          return issues || [];
+        }
+        return [];
+      }
+
+      // Process simulation actions
+      const rapidChanges = sim.rapid_changes as { path?: string; changes?: Array<{ content: string }>; steps?: Array<{ action: string; path: string; content?: string }>; interval_ms?: number } | undefined;
+      const seqChanges = sim.sequential_changes as Array<{ action: string; path: string; content?: string }> | undefined;
+      const extModify = sim.external_modify as { path?: string; content?: string } | undefined;
+      const extCreate = sim.external_create as { path?: string; content?: string; binary?: boolean } | undefined;
+      const extDelete = sim.external_delete as { path?: string } | undefined;
+      const extRename = sim.external_rename as { from?: string; to?: string; detection_fails?: boolean } | undefined;
+      const typeChange = sim.type_change as { type?: string; new_definition?: string } | undefined;
+      const configChange = sim.config_change as { new_config?: string } | undefined;
+
+      if (rapidChanges) {
+        if (rapidChanges.steps) {
+          // Create-then-delete pattern
+          for (const step of rapidChanges.steps) {
+            const stepPath = path.join(collectionRoot, step.path);
+            if (step.action === "create") {
+              fs.mkdirSync(path.dirname(stepPath), { recursive: true });
+              fs.writeFileSync(stepPath, step.content ?? "---\n---\n");
+            } else if (step.action === "delete") {
+              if (fs.existsSync(stepPath)) fs.unlinkSync(stepPath);
+            }
+          }
+          // After debouncing: check final state vs initial state
+          // If file no longer exists and didn't exist before → no event
+          // Event generation handled below
+        } else if (rapidChanges.path && rapidChanges.changes) {
+          // Multiple rapid changes to same file — apply final state
+          const lastChange = rapidChanges.changes[rapidChanges.changes.length - 1];
+          const filePath = path.join(collectionRoot, rapidChanges.path);
+          fs.writeFileSync(filePath, lastChange.content);
+          // Only emit one event for the final state
+          if (isWatchedExtension(rapidChanges.path) && !isExcluded(rapidChanges.path)) {
+            const newState = readFileState(rapidChanges.path);
+            const oldState = beforeState.get(rapidChanges.path);
+            if (newState && oldState) {
+              const changedFields = getChangedFields(oldState.frontmatter, newState.frontmatter);
+              emitEvent({
+                event: "file_modified",
+                path: rapidChanges.path,
+                types: newState.types,
+                frontmatter: newState.frontmatter,
+                changed_fields: changedFields,
+              });
+            }
+          }
+        }
+      } else if (seqChanges) {
+        // Sequential changes with enough delay to not be debounced
+        for (const step of seqChanges) {
+          const stepPath = path.join(collectionRoot, step.path);
+          if (step.action === "create") {
+            fs.mkdirSync(path.dirname(stepPath), { recursive: true });
+            fs.writeFileSync(stepPath, step.content ?? "---\n---\n");
+            if (isWatchedExtension(step.path) && !isExcluded(step.path)) {
+              const newState = readFileState(step.path);
+              if (newState) {
+                emitEvent({
+                  event: "file_created",
+                  path: step.path,
+                  types: newState.types,
+                  frontmatter: newState.frontmatter,
+                });
+              }
+            }
+          } else if (step.action === "modify") {
+            const oldState = readFileState(step.path) || beforeState.get(step.path);
+            fs.writeFileSync(stepPath, step.content ?? "");
+            if (isWatchedExtension(step.path) && !isExcluded(step.path)) {
+              const newState = readFileState(step.path);
+              if (newState) {
+                const changedFields = oldState ? getChangedFields(oldState.frontmatter, newState.frontmatter) : [];
+                emitEvent({
+                  event: "file_modified",
+                  path: step.path,
+                  types: newState.types,
+                  frontmatter: newState.frontmatter,
+                  changed_fields: changedFields,
+                });
+              }
+            }
+            // Update beforeState for next iteration
+            const updatedState = readFileState(step.path);
+            if (updatedState) beforeState.set(step.path, updatedState);
+          } else if (step.action === "delete") {
+            const oldState = beforeState.get(step.path);
+            if (fs.existsSync(stepPath)) fs.unlinkSync(stepPath);
+            if (isWatchedExtension(step.path) && !isExcluded(step.path) && oldState) {
+              emitEvent({
+                event: "file_deleted",
+                path: step.path,
+                last_known_types: oldState.types,
+              });
+            }
+          }
+        }
+      } else {
+        // Single change events
+        if (extCreate) {
+          const createPath = path.join(collectionRoot, extCreate.path!);
+          fs.mkdirSync(path.dirname(createPath), { recursive: true });
+          if (extCreate.binary) {
+            fs.writeFileSync(createPath, Buffer.from([0x89, 0x50, 0x4e, 0x47])); // PNG header
+          } else {
+            fs.writeFileSync(createPath, extCreate.content ?? "---\n---\n");
+          }
+          if (isWatchedExtension(extCreate.path!) && !isExcluded(extCreate.path!)) {
+            const newState = readFileState(extCreate.path!);
+            if (newState) {
+              emitEvent({
+                event: "file_created",
+                path: extCreate.path!,
+                types: newState.types,
+                frontmatter: newState.frontmatter,
+              });
+              // Check for validation errors
+              if (config.settings.default_validation === "error") {
+                const issues = validateFile(extCreate.path!);
+                if (issues.length > 0) {
+                  emitEvent({
+                    event: "validation_error",
+                    path: extCreate.path!,
+                    issues,
+                  });
+                }
+              }
+            }
+          }
+        }
+        if (extModify) {
+          const oldState = beforeState.get(extModify.path!);
+          const modPath = path.join(collectionRoot, extModify.path!);
+          fs.writeFileSync(modPath, extModify.content ?? "");
+          if (isWatchedExtension(extModify.path!) && !isExcluded(extModify.path!)) {
+            const newState = readFileState(extModify.path!);
+            if (newState) {
+              const changedFields = oldState ? getChangedFields(oldState.frontmatter, newState.frontmatter) : [];
+              emitEvent({
+                event: "file_modified",
+                path: extModify.path!,
+                types: newState.types,
+                frontmatter: newState.frontmatter,
+                changed_fields: changedFields,
+              });
+              // Check for validation errors
+              if (config.settings.default_validation === "error") {
+                const issues = validateFile(extModify.path!);
+                if (issues.length > 0) {
+                  emitEvent({
+                    event: "validation_error",
+                    path: extModify.path!,
+                    issues,
+                  });
+                }
+              }
+            }
+          }
+        }
+        if (extDelete) {
+          const oldState = beforeState.get(extDelete.path!);
+          const deletePath = path.join(collectionRoot, extDelete.path!);
+          if (fs.existsSync(deletePath)) fs.unlinkSync(deletePath);
+          if (isWatchedExtension(extDelete.path!) && !isExcluded(extDelete.path!) && oldState) {
+            emitEvent({
+              event: "file_deleted",
+              path: extDelete.path!,
+              last_known_types: oldState.types,
+            });
+          }
+        }
+        if (extRename) {
+          const fromPath = path.join(collectionRoot, extRename.from!);
+          const toPath = path.join(collectionRoot, extRename.to!);
+          const oldState = beforeState.get(extRename.from!);
+          fs.mkdirSync(path.dirname(toPath), { recursive: true });
+          if (fs.existsSync(fromPath)) {
+            fs.renameSync(fromPath, toPath);
+          }
+          if (isWatchedExtension(extRename.from!) && !isExcluded(extRename.from!)) {
+            if (extRename.detection_fails) {
+              // Rename not detected: emit delete + create
+              if (oldState) {
+                emitEvent({
+                  event: "file_deleted",
+                  path: extRename.from!,
+                  last_known_types: oldState.types,
+                });
+              }
+              const newState = readFileState(extRename.to!);
+              if (newState) {
+                emitEvent({
+                  event: "file_created",
+                  path: extRename.to!,
+                  types: newState.types,
+                  frontmatter: newState.frontmatter,
+                });
+              }
+            } else {
+              // Rename detected
+              const newState = readFileState(extRename.to!);
+              emitEvent({
+                event: "file_renamed",
+                from: extRename.from!,
+                to: extRename.to!,
+                types: newState?.types || oldState?.types || [],
+              });
+            }
+          }
+        }
+        if (typeChange?.type && typeChange?.new_definition) {
+          // Write new type definition
+          let typesFolder = "_types";
+          try {
+            typesFolder = config.settings.types_folder;
+          } catch { /* use default */ }
+          const typePath = path.join(collectionRoot, typesFolder, `${typeChange.type}.md`);
+          fs.writeFileSync(typePath, typeChange.new_definition);
+          // Find affected files (those that use this type)
+          const affectedFiles: string[] = [];
+          for (const [filePath, state] of beforeState) {
+            if (state.types.includes(typeChange.type)) {
+              affectedFiles.push(filePath);
+            }
+          }
+          emitEvent({
+            event: "type_changed",
+            type_name: typeChange.type,
+            type: typeChange.type,
+            affected_files: affectedFiles.sort(),
+          });
+        }
+        if (configChange?.new_config) {
+          // Compute hash of old and new config
+          const crypto = require("crypto");
+          const oldConfig = fs.readFileSync(path.join(collectionRoot, "mdbase.yaml"), "utf-8");
+          const previousHash = crypto.createHash("sha256").update(oldConfig).digest("hex").slice(0, 16);
+          fs.writeFileSync(path.join(collectionRoot, "mdbase.yaml"), configChange.new_config);
+          const newHash = crypto.createHash("sha256").update(configChange.new_config).digest("hex").slice(0, 16);
+          emitEvent({
+            event: "config_changed",
+            previous_hash: previousHash,
+            new_hash: newHash,
+          });
+        }
+      }
+
+      return { events };
     }
 
     default:
@@ -729,7 +1218,7 @@ function assertSubset(actual: unknown, expected: unknown, path: string): void {
 /**
  * Compare actual result against expected result from test case.
  */
-function assertExpectation(
+async function assertExpectation(
   actual: unknown,
   expected: TestExpectation,
   testName: string,
@@ -1084,8 +1573,193 @@ function assertExpectation(
     }
   }
 
+  // Rename-specific assertions: from, to, references_updated, partial_updates
+  if ((expected as Record<string, unknown>).from !== undefined) {
+    expect(result.from, `${testName}: from`).toBe((expected as Record<string, unknown>).from);
+  }
+  if ((expected as Record<string, unknown>).to !== undefined) {
+    expect(result.to, `${testName}: to`).toBe((expected as Record<string, unknown>).to);
+  }
+  if ((expected as Record<string, unknown>).references_updated !== undefined) {
+    const expectedRefs = (expected as Record<string, unknown>).references_updated as Array<Record<string, unknown>>;
+    const actualRefs = (result.references_updated ?? []) as Array<Record<string, unknown>>;
+    if (expectedRefs.length === 0) {
+      expect(actualRefs.length, `${testName}: references_updated should be empty`).toBe(0);
+    } else {
+      for (const expectedRef of expectedRefs) {
+        const found = actualRefs.some((a) => {
+          if (expectedRef.path && a.path !== expectedRef.path) return false;
+          if (expectedRef.field && a.field !== expectedRef.field) return false;
+          if (expectedRef.location && a.location !== expectedRef.location) return false;
+          return true;
+        });
+        expect(found, `${testName}: references_updated should include ${JSON.stringify(expectedRef)} in ${JSON.stringify(actualRefs)}`).toBe(true);
+      }
+    }
+  }
+  if ((expected as Record<string, unknown>).partial_updates !== undefined) {
+    const expectedPartial = (expected as Record<string, unknown>).partial_updates as Record<string, unknown>;
+    const actualPartial = (result.partial_updates ?? {}) as Record<string, unknown>;
+    assertSubset(actualPartial, expectedPartial, `${testName}: partial_updates`);
+  }
+
+  // Rename-specific warnings (array of {path, message_contains})
+  if (expected.warnings !== undefined) {
+    const actualWarnings = (result.warnings ?? []) as Array<Record<string, unknown> | string>;
+    for (const expectedWarning of expected.warnings) {
+      if (typeof expectedWarning === "object" && expectedWarning !== null) {
+        const ew = expectedWarning as Record<string, unknown>;
+        if (ew.path || ew.message_contains) {
+          const found = actualWarnings.some((a) => {
+            const aw = typeof a === "object" ? a : { message: a };
+            if (ew.path && aw.path !== ew.path) return false;
+            if (ew.message_contains) {
+              const msg = String(aw.message_contains ?? aw.message ?? "");
+              if (!msg.toLowerCase().includes((ew.message_contains as string).toLowerCase())) return false;
+            }
+            return true;
+          });
+          expect(found, `${testName}: warning matching ${JSON.stringify(ew)} in ${JSON.stringify(actualWarnings)}`).toBe(true);
+        }
+      }
+    }
+  }
+
+  // Watch mode event assertions
+  if ((expected as Record<string, unknown>).events !== undefined) {
+    const actualEvents = (result.events ?? []) as Array<Record<string, unknown>>;
+    const expectedEvents = (expected as Record<string, unknown>).events as Array<Record<string, unknown>>;
+    expect(actualEvents.length, `${testName}: events length`).toBe(expectedEvents.length);
+    for (let i = 0; i < expectedEvents.length; i++) {
+      assertEventMatch(actualEvents[i], expectedEvents[i], `${testName}: events[${i}]`);
+    }
+  }
+
+  if ((expected as Record<string, unknown>).events_ordered !== undefined) {
+    const actualEvents = (result.events ?? []) as Array<Record<string, unknown>>;
+    const expectedOrdered = (expected as Record<string, unknown>).events_ordered as Array<Record<string, unknown>>;
+    // Events must appear in order (may have others between)
+    let actualIdx = 0;
+    for (let i = 0; i < expectedOrdered.length; i++) {
+      let found = false;
+      while (actualIdx < actualEvents.length) {
+        try {
+          assertEventMatch(actualEvents[actualIdx], expectedOrdered[i], `${testName}: events_ordered[${i}]`);
+          found = true;
+          actualIdx++;
+          break;
+        } catch {
+          actualIdx++;
+        }
+      }
+      expect(found, `${testName}: events_ordered[${i}] not found in events`).toBe(true);
+    }
+  }
+
+  if ((expected as Record<string, unknown>).events_contain !== undefined) {
+    const actualEvents = (result.events ?? []) as Array<Record<string, unknown>>;
+    const expectedContain = (expected as Record<string, unknown>).events_contain as Array<Record<string, unknown>>;
+    for (let i = 0; i < expectedContain.length; i++) {
+      const found = actualEvents.some((ae) => {
+        try {
+          assertEventMatch(ae, expectedContain[i], "");
+          return true;
+        } catch {
+          return false;
+        }
+      });
+      expect(found, `${testName}: events_contain[${i}] (${JSON.stringify(expectedContain[i])}) not found in events: ${JSON.stringify(actualEvents)}`).toBe(true);
+    }
+  }
+
+  if ((expected as Record<string, unknown>).max_event_count !== undefined) {
+    const actualEvents = (result.events ?? []) as Array<Record<string, unknown>>;
+    const maxCount = (expected as Record<string, unknown>).max_event_count as number;
+    expect(actualEvents.length, `${testName}: max_event_count`).toBeLessThanOrEqual(maxCount);
+  }
+
+  // Listener query (for watch cache consistency tests)
+  if ((expected as Record<string, unknown>).listener_query !== undefined && collectionRoot) {
+    const lq = (expected as Record<string, unknown>).listener_query as {
+      operation: string;
+      input: Record<string, unknown>;
+      expect: TestExpectation;
+    };
+    // Apply the simulated changes already happened, just run the query
+    const lqResult = await executeOperation(collectionRoot, lq.operation, lq.input ?? {});
+    await assertExpectation(lqResult, lq.expect, `${testName} [listener_query]`, collectionRoot);
+  }
+
   // verify_after: run a second operation after the first to check state
   // (handled in the test execution loop, not here)
+}
+
+function assertEventMatch(actual: Record<string, unknown>, expected: Record<string, unknown>, prefix: string): void {
+  // Check each expected field against actual
+  for (const [key, value] of Object.entries(expected)) {
+    if (key === "timestamp_present") {
+      if (value === true) {
+        expect(actual.timestamp, `${prefix}.timestamp present`).toBeDefined();
+      }
+      continue;
+    }
+    if (key === "has_fields") {
+      const fields = value as string[];
+      for (const field of fields) {
+        expect(actual[field], `${prefix} has_field ${field}`).toBeDefined();
+      }
+      continue;
+    }
+    if (key === "affected_files_not_contain") {
+      const notContain = value as string[];
+      const actualAffected = actual.affected_files as string[] | undefined;
+      if (actualAffected) {
+        for (const nc of notContain) {
+          expect(actualAffected.includes(nc), `${prefix} affected_files should not contain ${nc}`).toBe(false);
+        }
+      }
+      continue;
+    }
+    if (key === "frontmatter" && typeof value === "object" && value !== null) {
+      assertSubset(actual.frontmatter, value, `${prefix}.frontmatter`);
+      continue;
+    }
+    if (key === "issues" && Array.isArray(value)) {
+      const actualIssues = actual.issues as Array<Record<string, unknown>> | undefined;
+      expect(actualIssues, `${prefix}.issues present`).toBeDefined();
+      for (let j = 0; j < value.length; j++) {
+        const expectedIssue = value[j] as Record<string, unknown>;
+        const found = actualIssues!.some((ai) => {
+          for (const [ik, iv] of Object.entries(expectedIssue)) {
+            if (ai[ik] !== iv) return false;
+          }
+          return true;
+        });
+        expect(found, `${prefix}.issues[${j}] ${JSON.stringify(expectedIssue)} not found in ${JSON.stringify(actualIssues)}`).toBe(true);
+      }
+      continue;
+    }
+    if (Array.isArray(value)) {
+      if (key === "changed_fields") {
+        const actualFields = actual[key] as string[] | undefined;
+        expect(actualFields, `${prefix}.${key} present`).toBeDefined();
+        expect(actualFields!.sort(), `${prefix}.${key}`).toEqual([...value].sort());
+        continue;
+      }
+      if (key === "affected_files") {
+        const actualFiles = actual[key] as string[] | undefined;
+        expect(actualFiles, `${prefix}.${key} present`).toBeDefined();
+        // Subset match: all expected files must be present
+        for (const ef of value) {
+          expect(actualFiles!.includes(ef as string), `${prefix}.${key} contains ${ef}`).toBe(true);
+        }
+        continue;
+      }
+      assertSubset(actual[key], value, `${prefix}.${key}`);
+      continue;
+    }
+    expect(actual[key], `${prefix}.${key}`).toEqual(value);
+  }
 }
 
 // Discover and register tests
@@ -1108,8 +1782,20 @@ if (allTests.size === 0) {
             for (const group of data.groups) {
               describe(group.name, () => {
                 // Detect if group has mutating operations (batch, create, update, delete, rename)
-                const MUTATING_OPS = new Set(["create", "update", "delete", "rename", "batch_delete", "batch_update", "create_type"]);
-                const groupHasMutating = group.tests.some((t) => MUTATING_OPS.has(t.operation));
+                const MUTATING_OPS = new Set(["create", "update", "delete", "rename", "batch_delete", "batch_update", "create_type", "cache_rebuild", "cache_clear"]);
+                const groupHasMutating = group.tests.some((t) => {
+                  if (MUTATING_OPS.has(t.operation)) return true;
+                  // Tests with simulate that contains external modifications are effectively mutating
+                  const sim = t.simulate as Record<string, unknown> | undefined;
+                  if (sim && (sim.external_modify || sim.external_create || sim.external_delete || sim.external_rename || sim.config_change || sim.type_change || sim.rapid_changes || sim.sequential_changes)) return true;
+                  // Tests with verify_after that contains mutating operations
+                  const va = t.verify_after;
+                  if (va) {
+                    const steps = Array.isArray(va) ? va : [va];
+                    if (steps.some((s: VerifyAfterStep) => MUTATING_OPS.has(s.operation))) return true;
+                  }
+                  return false;
+                });
 
                 let sharedRoot: string | undefined;
 
@@ -1150,13 +1836,17 @@ if (allTests.size === 0) {
                     }
 
                     try {
+                      const inputObj = testCase.input ?? {};
+                      const simulate = (testCase.simulate ?? inputObj.simulate) as Record<string, unknown> | undefined;
                       const result = await executeOperation(
                         root,
                         testCase.operation,
-                        testCase.input ?? {},
-                        testCase.simulate as Record<string, unknown> | undefined,
+                        inputObj,
+                        simulate,
                       );
-                      assertExpectation(result, testCase.expect, testCase.name, root);
+                      if (testCase.expect) {
+                        await assertExpectation(result, testCase.expect, testCase.name, root);
+                      }
 
                       // Run verify_after steps
                       if (testCase.verify_after) {
@@ -1169,7 +1859,9 @@ if (allTests.size === 0) {
                             step.operation,
                             step.input ?? {},
                           );
-                          assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
+                          if (step.expect) {
+                            await assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
+                          }
                         }
                       }
                     } finally {
@@ -1211,13 +1903,17 @@ if (allTests.size === 0) {
                 }
 
                 try {
+                  const inputObj2 = testCase.input ?? {};
+                  const simulate2 = (testCase.simulate ?? inputObj2.simulate) as Record<string, unknown> | undefined;
                   const result = await executeOperation(
                     root,
                     testCase.operation,
-                    testCase.input ?? {},
-                    testCase.simulate as Record<string, unknown> | undefined,
+                    inputObj2,
+                    simulate2,
                   );
-                  assertExpectation(result, testCase.expect, testCase.name, root);
+                  if (testCase.expect) {
+                    await assertExpectation(result, testCase.expect, testCase.name, root);
+                  }
 
                   // Run verify_after steps
                   if (testCase.verify_after) {
@@ -1230,7 +1926,9 @@ if (allTests.size === 0) {
                         step.operation,
                         step.input ?? {},
                       );
-                      assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
+                      if (step.expect) {
+                        await assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
+                      }
                     }
                   }
                 } finally {

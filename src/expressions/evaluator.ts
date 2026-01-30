@@ -20,6 +20,16 @@ export class ExpressionError extends Error {
   }
 }
 
+export interface BacklinkEntry {
+  file: {
+    path: string;
+    name: string;
+    basename: string;
+    folder: string;
+    extension: string;
+  };
+}
+
 export interface EvalContext {
   frontmatter: Record<string, unknown>;
   rawFrontmatter?: Record<string, unknown>;
@@ -30,6 +40,7 @@ export interface EvalContext {
   computedFields?: Map<string, unknown>;
   strictArithmetic?: boolean; // Throw on division by zero instead of returning null
   resolveFile?: (linkTarget: string) => { frontmatter: Record<string, unknown>; path: string; types: string[] } | null;
+  computeBacklinks?: (filePath: string) => BacklinkEntry[];
   thisContext?: {
     frontmatter: Record<string, unknown>;
     path: string;
@@ -1277,6 +1288,11 @@ class ExprParser {
       }
       const embeds = bodyEmbedTargets;
 
+      // Compute backlinks if callback provided
+      const backlinks = this.ctx.computeBacklinks && this.ctx.path
+        ? this.ctx.computeBacklinks(this.ctx.path)
+        : [];
+
       return {
         path: this.ctx.path ?? "",
         name: fullName,
@@ -1292,6 +1308,7 @@ class ExprParser {
         tags,
         links,
         embeds,
+        backlinks,
         properties: this.ctx.rawFrontmatter ?? this.ctx.frontmatter,
         hasProperty: null, // handled via method calls
       };
