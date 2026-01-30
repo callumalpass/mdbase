@@ -17,6 +17,7 @@ export interface FieldDefinition {
   deprecated?: boolean;
   unique?: boolean;
   generated?: string | { from: string; transform: string };
+  computed?: string;
   // String constraints
   min_length?: number;
   max_length?: number;
@@ -32,6 +33,15 @@ export interface FieldDefinition {
   max_items?: number;
   // Object
   fields?: Record<string, FieldDefinition>;
+  // Link
+  validate_exists?: boolean;
+  target_type?: string;
+}
+
+export interface MatchRules {
+  path_glob?: string;
+  fields_present?: string[];
+  where?: Record<string, unknown>;
 }
 
 export interface TypeDefinition {
@@ -42,6 +52,7 @@ export interface TypeDefinition {
   fields?: Record<string, FieldDefinition>;
   path_pattern?: string;
   validation?: string;
+  match?: MatchRules;
 }
 
 export interface TypeLoadResult {
@@ -149,6 +160,15 @@ export function loadTypes(
       typeDef.description = String(data.description);
     }
     if (data.extends !== undefined) {
+      if (Array.isArray(data.extends)) {
+        return {
+          valid: false,
+          error: {
+            code: "invalid_type_definition",
+            message: `Type "${typeName}" has extends as a list; only single inheritance is allowed`,
+          },
+        };
+      }
       typeDef.extends = String(data.extends).toLowerCase();
     }
     if (data.strict !== undefined) {
@@ -156,12 +176,91 @@ export function loadTypes(
     }
     if (data.fields !== undefined && data.fields !== null) {
       typeDef.fields = data.fields as Record<string, FieldDefinition>;
+      // Validate field definitions
+      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+        // Validate enum values are strings
+        if (fieldDef.type === "enum" && fieldDef.values) {
+          for (const val of fieldDef.values) {
+            if (typeof val !== "string") {
+              return {
+                valid: false,
+                error: {
+                  code: "invalid_type_definition",
+                  message: `Type "${typeName}" field "${fieldName}" has non-string enum value: ${val}`,
+                },
+              };
+            }
+          }
+        }
+        // Validate computed field constraints
+        if (fieldDef.computed) {
+          if (fieldDef.required) {
+            return {
+              valid: false,
+              error: {
+                code: "invalid_type_definition",
+                message: `Type "${typeName}" field "${fieldName}" cannot be both computed and required`,
+              },
+            };
+          }
+          if (fieldDef.default !== undefined) {
+            return {
+              valid: false,
+              error: {
+                code: "invalid_type_definition",
+                message: `Type "${typeName}" field "${fieldName}" cannot be both computed and have a default`,
+              },
+            };
+          }
+          if (fieldDef.generated !== undefined) {
+            return {
+              valid: false,
+              error: {
+                code: "invalid_type_definition",
+                message: `Type "${typeName}" field "${fieldName}" cannot be both computed and generated`,
+              },
+            };
+          }
+        }
+        // Validate regex patterns are valid
+        if (fieldDef.pattern) {
+          try {
+            new RegExp(fieldDef.pattern);
+          } catch {
+            return {
+              valid: false,
+              error: {
+                code: "invalid_type_definition",
+                message: `Type "${typeName}" field "${fieldName}" has invalid regex pattern: ${fieldDef.pattern}`,
+              },
+            };
+          }
+        }
+      }
     }
     if (data.path_pattern !== undefined) {
       typeDef.path_pattern = String(data.path_pattern);
+    } else if (data.filename_pattern !== undefined) {
+      typeDef.path_pattern = String(data.filename_pattern);
     }
     if (data.validation !== undefined) {
       typeDef.validation = String(data.validation);
+    }
+
+    // Parse match rules
+    if (data.match !== undefined && data.match !== null && typeof data.match === "object") {
+      const matchData = data.match as Record<string, unknown>;
+      const match: MatchRules = {};
+      if (matchData.path_glob !== undefined) {
+        match.path_glob = String(matchData.path_glob);
+      }
+      if (matchData.fields_present !== undefined && Array.isArray(matchData.fields_present)) {
+        match.fields_present = matchData.fields_present.map(String);
+      }
+      if (matchData.where !== undefined && typeof matchData.where === "object" && matchData.where !== null) {
+        match.where = matchData.where as Record<string, unknown>;
+      }
+      typeDef.match = match;
     }
 
     rawTypes.set(typeName, typeDef);
@@ -174,6 +273,25 @@ export function loadTypes(
       valid: false,
       error: resolved.error,
     };
+  }
+
+  // Check for circular computed field dependencies across all types
+  if (resolved.types) {
+    for (const [, typeDef] of resolved.types) {
+      if (!typeDef.fields) continue;
+      const computedFields = new Map<string, string>();
+      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+        if (fieldDef.computed) {
+          computedFields.set(fieldName, fieldDef.computed);
+        }
+      }
+      if (computedFields.size > 0) {
+        const circularError = detectCircularComputed(computedFields);
+        if (circularError) {
+          return { valid: false, error: circularError };
+        }
+      }
+    }
   }
 
   return {
@@ -265,6 +383,59 @@ function findMarkdownFiles(dir: string): string[] {
   return files;
 }
 
+function detectCircularComputed(computedFields: Map<string, string>): { code: string; message: string } | null {
+  // Build dependency graph: for each computed field, find which other computed fields it references
+  const deps = new Map<string, Set<string>>();
+  const allComputed = new Set(computedFields.keys());
+
+  for (const [fieldName, expr] of computedFields) {
+    const fieldDeps = new Set<string>();
+    // Simple identifier extraction from expression
+    const identPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    let match;
+    while ((match = identPattern.exec(expr)) !== null) {
+      const ident = match[1];
+      if (allComputed.has(ident) && ident !== fieldName) {
+        fieldDeps.add(ident);
+      }
+      // Self-reference
+      if (ident === fieldName) {
+        return {
+          code: "circular_computed",
+          message: `Self-referencing computed field: "${fieldName}"`,
+        };
+      }
+    }
+    deps.set(fieldName, fieldDeps);
+  }
+
+  // DFS cycle detection
+  const visited = new Set<string>();
+  const inStack = new Set<string>();
+
+  function dfs(node: string): boolean {
+    if (inStack.has(node)) return true; // cycle
+    if (visited.has(node)) return false;
+    visited.add(node);
+    inStack.add(node);
+    for (const dep of deps.get(node) ?? []) {
+      if (dfs(dep)) return true;
+    }
+    inStack.delete(node);
+    return false;
+  }
+
+  for (const fieldName of computedFields.keys()) {
+    if (dfs(fieldName)) {
+      return {
+        code: "circular_computed",
+        message: `Circular dependency detected in computed fields involving "${fieldName}"`,
+      };
+    }
+  }
+  return null;
+}
+
 interface InheritanceResult {
   valid: boolean;
   types?: Map<string, TypeDefinition>;
@@ -328,6 +499,18 @@ function resolveInheritance(types: Map<string, TypeDefinition>): InheritanceResu
       ...type,
       fields: Object.keys(mergedFields).length > 0 ? mergedFields : undefined,
     };
+    // Inherit strict from parent if not explicitly set on child
+    if (resolvedType.strict === undefined && parent.strict !== undefined) {
+      resolvedType.strict = parent.strict;
+    }
+    // Inherit path_pattern from parent if not set
+    if (resolvedType.path_pattern === undefined && parent.path_pattern !== undefined) {
+      resolvedType.path_pattern = parent.path_pattern;
+    }
+    // Inherit match rules from parent if not set
+    if (resolvedType.match === undefined && parent.match !== undefined) {
+      resolvedType.match = parent.match;
+    }
     // Don't carry extends into the resolved type
     delete resolvedType.extends;
 

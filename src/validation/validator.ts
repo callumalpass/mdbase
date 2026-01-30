@@ -14,6 +14,299 @@ export interface ValidationResult {
 }
 
 /**
+ * Merge field definitions from multiple types.
+ * Returns merged fields and any type_conflict issues.
+ */
+function mergeTypeFields(
+  types: TypeDefinition[],
+  prefix?: string,
+): { mergedFields: Record<string, FieldDefinition>; conflicts: MdbaseError[] } {
+  const mergedFields: Record<string, FieldDefinition> = {};
+  const conflicts: MdbaseError[] = [];
+
+  for (const typeDef of types) {
+    if (!typeDef.fields) continue;
+    for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+      const fullName = prefix ? `${prefix}.${fieldName}` : fieldName;
+      if (!(fieldName in mergedFields)) {
+        mergedFields[fieldName] = { ...fieldDef };
+        // Deep copy items and sub-fields
+        if (fieldDef.items) mergedFields[fieldName].items = { ...fieldDef.items };
+        if (fieldDef.fields) {
+          mergedFields[fieldName].fields = {};
+          for (const [k, v] of Object.entries(fieldDef.fields)) {
+            mergedFields[fieldName].fields![k] = { ...v };
+          }
+        }
+        if (fieldDef.values) mergedFields[fieldName].values = [...fieldDef.values];
+      } else {
+        const existing = mergedFields[fieldName];
+        // Check base type compatibility
+        if (existing.type && fieldDef.type && existing.type !== fieldDef.type) {
+          conflicts.push({
+            code: "type_conflict",
+            message: `Incompatible field types for "${fullName}": ${existing.type} vs ${fieldDef.type}`,
+            field: fullName,
+            severity: "error",
+          });
+          continue;
+        }
+
+        // Merge required: OR
+        if (fieldDef.required) existing.required = true;
+
+        // Merge deprecated: OR
+        if (fieldDef.deprecated) existing.deprecated = true;
+
+        // Merge unique: OR
+        if (fieldDef.unique) existing.unique = true;
+
+        // Merge min: MAX
+        if (fieldDef.min !== undefined) {
+          existing.min = existing.min !== undefined ? Math.max(existing.min, fieldDef.min) : fieldDef.min;
+        }
+
+        // Merge max: MIN
+        if (fieldDef.max !== undefined) {
+          existing.max = existing.max !== undefined ? Math.min(existing.max, fieldDef.max) : fieldDef.max;
+        }
+
+        // Check merged min > merged max
+        if (existing.min !== undefined && existing.max !== undefined && existing.min > existing.max) {
+          conflicts.push({
+            code: "type_conflict",
+            message: `Merged min (${existing.min}) exceeds merged max (${existing.max}) for "${fullName}"`,
+            field: fullName,
+            severity: "error",
+          });
+        }
+
+        // Merge min_length: MAX
+        if (fieldDef.min_length !== undefined) {
+          existing.min_length = existing.min_length !== undefined ? Math.max(existing.min_length, fieldDef.min_length) : fieldDef.min_length;
+        }
+
+        // Merge max_length: MIN
+        if (fieldDef.max_length !== undefined) {
+          existing.max_length = existing.max_length !== undefined ? Math.min(existing.max_length, fieldDef.max_length) : fieldDef.max_length;
+        }
+
+        // Merge min_items: MAX
+        if (fieldDef.min_items !== undefined) {
+          existing.min_items = existing.min_items !== undefined ? Math.max(existing.min_items, fieldDef.min_items) : fieldDef.min_items;
+        }
+
+        // Merge max_items: MIN
+        if (fieldDef.max_items !== undefined) {
+          existing.max_items = existing.max_items !== undefined ? Math.min(existing.max_items, fieldDef.max_items) : fieldDef.max_items;
+        }
+
+        // Merge enum values: intersection
+        if (fieldDef.values !== undefined && existing.values !== undefined) {
+          const intersection = existing.values.filter((v) => fieldDef.values!.includes(v));
+          if (intersection.length === 0) {
+            conflicts.push({
+              code: "type_conflict",
+              message: `Empty enum intersection for "${fullName}"`,
+              field: fullName,
+              severity: "error",
+            });
+          }
+          existing.values = intersection;
+        } else if (fieldDef.values !== undefined) {
+          existing.values = [...fieldDef.values];
+        }
+
+        // Merge pattern: collect all (must match all)
+        if (fieldDef.pattern !== undefined) {
+          if (existing.pattern !== undefined && existing.pattern !== fieldDef.pattern) {
+            // Store multiple patterns as _patterns array
+            const existingPatterns = (existing as unknown as Record<string, unknown>)._patterns as string[] | undefined;
+            if (existingPatterns) {
+              if (!existingPatterns.includes(fieldDef.pattern)) {
+                existingPatterns.push(fieldDef.pattern);
+              }
+            } else {
+              (existing as unknown as Record<string, unknown>)._patterns = [existing.pattern, fieldDef.pattern];
+            }
+          } else if (existing.pattern === undefined) {
+            existing.pattern = fieldDef.pattern;
+          }
+        }
+
+        // Merge default: must be equal or type_conflict
+        if (fieldDef.default !== undefined && existing.default !== undefined) {
+          if (JSON.stringify(fieldDef.default) !== JSON.stringify(existing.default)) {
+            conflicts.push({
+              code: "type_conflict",
+              message: `Conflicting defaults for "${fullName}": ${JSON.stringify(existing.default)} vs ${JSON.stringify(fieldDef.default)}`,
+              field: fullName,
+              severity: "error",
+            });
+          }
+        } else if (fieldDef.default !== undefined) {
+          existing.default = fieldDef.default;
+        }
+
+        // Merge generated: must be same strategy or type_conflict
+        if (fieldDef.generated !== undefined && existing.generated !== undefined) {
+          const existingGen = typeof existing.generated === "string" ? existing.generated : JSON.stringify(existing.generated);
+          const newGen = typeof fieldDef.generated === "string" ? fieldDef.generated : JSON.stringify(fieldDef.generated);
+          if (existingGen !== newGen) {
+            conflicts.push({
+              code: "type_conflict",
+              message: `Conflicting generated strategies for "${fullName}"`,
+              field: fullName,
+              severity: "error",
+            });
+          }
+        } else if (fieldDef.generated !== undefined) {
+          existing.generated = fieldDef.generated;
+        }
+
+        // Merge link target: must be same or type_conflict
+        const existingTarget = (existing as unknown as Record<string, unknown>).target as string | undefined;
+        const newTarget = (fieldDef as unknown as Record<string, unknown>).target as string | undefined;
+        if (existingTarget !== undefined && newTarget !== undefined && existingTarget !== newTarget) {
+          conflicts.push({
+            code: "type_conflict",
+            message: `Conflicting link targets for "${fullName}": ${existingTarget} vs ${newTarget}`,
+            field: fullName,
+            severity: "error",
+          });
+        } else if (newTarget !== undefined) {
+          (existing as unknown as Record<string, unknown>).target = newTarget;
+        }
+
+        // Merge validate_exists: OR
+        const existingVE = (existing as unknown as Record<string, unknown>).validate_exists as boolean | undefined;
+        const newVE = (fieldDef as unknown as Record<string, unknown>).validate_exists as boolean | undefined;
+        if (newVE) {
+          (existing as unknown as Record<string, unknown>).validate_exists = true;
+        }
+
+        // Recursively merge list items
+        if (fieldDef.items && existing.items) {
+          // Merge item-level constraints
+          const itemConflicts = mergeFieldDefs(existing.items, fieldDef.items, fullName);
+          conflicts.push(...itemConflicts);
+        } else if (fieldDef.items) {
+          existing.items = { ...fieldDef.items };
+        }
+
+        // Recursively merge object sub-fields
+        if (fieldDef.fields && existing.fields) {
+          const subMerge = mergeTypeFields(
+            [{ name: "_a", fields: existing.fields }, { name: "_b", fields: fieldDef.fields }],
+            fullName,
+          );
+          if (subMerge.conflicts.length > 0) {
+            conflicts.push(...subMerge.conflicts);
+          }
+          existing.fields = subMerge.mergedFields;
+        } else if (fieldDef.fields) {
+          existing.fields = {};
+          for (const [k, v] of Object.entries(fieldDef.fields)) {
+            existing.fields[k] = { ...v };
+          }
+        }
+      }
+    }
+  }
+  return { mergedFields, conflicts };
+}
+
+/**
+ * Merge two FieldDefinition objects in place (mutates 'existing').
+ * Returns any type_conflict issues.
+ */
+function mergeFieldDefs(existing: FieldDefinition, incoming: FieldDefinition, fieldPath: string): MdbaseError[] {
+  const conflicts: MdbaseError[] = [];
+
+  // Check base type compatibility
+  if (existing.type && incoming.type && existing.type !== incoming.type) {
+    conflicts.push({
+      code: "type_conflict",
+      message: `Incompatible item types for "${fieldPath}": ${existing.type} vs ${incoming.type}`,
+      field: fieldPath,
+      severity: "error",
+    });
+    return conflicts;
+  }
+  if (!existing.type && incoming.type) existing.type = incoming.type;
+
+  if (incoming.required) existing.required = true;
+  if (incoming.deprecated) existing.deprecated = true;
+  if (incoming.unique) existing.unique = true;
+
+  if (incoming.min !== undefined) {
+    existing.min = existing.min !== undefined ? Math.max(existing.min, incoming.min) : incoming.min;
+  }
+  if (incoming.max !== undefined) {
+    existing.max = existing.max !== undefined ? Math.min(existing.max, incoming.max) : incoming.max;
+  }
+  if (incoming.min_length !== undefined) {
+    existing.min_length = existing.min_length !== undefined ? Math.max(existing.min_length, incoming.min_length) : incoming.min_length;
+  }
+  if (incoming.max_length !== undefined) {
+    existing.max_length = existing.max_length !== undefined ? Math.min(existing.max_length, incoming.max_length) : incoming.max_length;
+  }
+  if (incoming.min_items !== undefined) {
+    existing.min_items = existing.min_items !== undefined ? Math.max(existing.min_items, incoming.min_items) : incoming.min_items;
+  }
+  if (incoming.max_items !== undefined) {
+    existing.max_items = existing.max_items !== undefined ? Math.min(existing.max_items, incoming.max_items) : incoming.max_items;
+  }
+
+  if (incoming.values !== undefined && existing.values !== undefined) {
+    const intersection = existing.values.filter((v) => incoming.values!.includes(v));
+    if (intersection.length === 0) {
+      conflicts.push({ code: "type_conflict", message: `Empty enum intersection for "${fieldPath}"`, field: fieldPath, severity: "error" });
+    }
+    existing.values = intersection;
+  } else if (incoming.values !== undefined) {
+    existing.values = [...incoming.values];
+  }
+
+  if (incoming.pattern !== undefined) {
+    if (existing.pattern !== undefined && existing.pattern !== incoming.pattern) {
+      const existingPatterns = (existing as unknown as Record<string, unknown>)._patterns as string[] | undefined;
+      if (existingPatterns) {
+        if (!existingPatterns.includes(incoming.pattern)) existingPatterns.push(incoming.pattern);
+      } else {
+        (existing as unknown as Record<string, unknown>)._patterns = [existing.pattern, incoming.pattern];
+      }
+    } else if (existing.pattern === undefined) {
+      existing.pattern = incoming.pattern;
+    }
+  }
+
+  // Recursively merge items (for nested lists)
+  if (incoming.items && existing.items) {
+    conflicts.push(...mergeFieldDefs(existing.items, incoming.items, fieldPath));
+  } else if (incoming.items) {
+    existing.items = { ...incoming.items };
+  }
+
+  // Recursively merge object sub-fields
+  if (incoming.fields && existing.fields) {
+    const subMerge = mergeTypeFields(
+      [{ name: "_a", fields: existing.fields }, { name: "_b", fields: incoming.fields }],
+      fieldPath,
+    );
+    conflicts.push(...subMerge.conflicts);
+    existing.fields = subMerge.mergedFields;
+  } else if (incoming.fields) {
+    existing.fields = {};
+    for (const [k, v] of Object.entries(incoming.fields)) {
+      existing.fields[k] = { ...v };
+    }
+  }
+
+  return conflicts;
+}
+
+/**
  * Validate frontmatter against resolved type definitions.
  */
 export function validateFrontmatter(
@@ -24,42 +317,74 @@ export function validateFrontmatter(
 ): ValidationResult {
   const issues: MdbaseError[] = [];
 
-  for (const typeDef of types) {
-    if (!typeDef.fields) continue;
+  // Merge fields from all types
+  const { mergedFields, conflicts } = mergeTypeFields(types);
+  issues.push(...conflicts);
 
-    // Check required fields
-    for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-      if (fieldDef.required) {
-        const value = frontmatter[fieldName];
-        if (!(fieldName in frontmatter) || value === null || value === undefined) {
-          issues.push({
-            code: "missing_required",
-            message: `Required field "${fieldName}" is missing`,
-            field: fieldName,
-            severity: "error",
-          });
-        }
+  // Determine strictness
+  // If any type explicitly sets strict, use the strictest explicit setting.
+  // If no type sets strict, use config default.
+  let effectiveStrict: boolean | "warn" | undefined;
+  let anyExplicitStrict = false;
+  for (const typeDef of types) {
+    if (typeDef.strict !== undefined) {
+      anyExplicitStrict = true;
+      if (typeDef.strict === true) {
+        effectiveStrict = true;
+      } else if (typeDef.strict === "warn" && effectiveStrict !== true) {
+        effectiveStrict = "warn";
+      } else if (typeDef.strict === false && effectiveStrict === undefined) {
+        effectiveStrict = false;
       }
     }
+  }
+  if (!anyExplicitStrict) {
+    effectiveStrict = config.settings.default_strict;
+  }
 
-    // Check field values
-    for (const [fieldName, value] of Object.entries(frontmatter)) {
-      // Skip type declaration keys
-      if (config.settings.explicit_type_keys.includes(fieldName)) continue;
+  // Collect all known fields from all types (for strict mode union)
+  const allKnownFields = new Set<string>();
+  for (const typeDef of types) {
+    if (typeDef.fields) {
+      for (const fieldName of Object.keys(typeDef.fields)) {
+        allKnownFields.add(fieldName);
+      }
+    }
+  }
 
-      const fieldDef = typeDef.fields[fieldName];
+  // Check required fields from merged definitions
+  for (const [fieldName, fieldDef] of Object.entries(mergedFields)) {
+    if (fieldDef.required) {
+      const value = frontmatter[fieldName];
+      if (!(fieldName in frontmatter) || value === null || value === undefined) {
+        issues.push({
+          code: "missing_required",
+          message: `Required field "${fieldName}" is missing`,
+          field: fieldName,
+          severity: "error",
+        });
+      }
+    }
+  }
 
-      if (!fieldDef) {
-        // Unknown field - strictness check
-        const strict = typeDef.strict ?? config.settings.default_strict;
-        if (strict === true) {
+  // Check field values against merged definitions
+  for (const [fieldName, value] of Object.entries(frontmatter)) {
+    // Skip type declaration keys
+    if (config.settings.explicit_type_keys.includes(fieldName)) continue;
+
+    const fieldDef = mergedFields[fieldName];
+
+    if (!fieldDef) {
+      // Unknown field — strictness check uses union of all type fields
+      if (!allKnownFields.has(fieldName)) {
+        if (effectiveStrict === true) {
           issues.push({
             code: "unknown_field",
             message: `Unknown field "${fieldName}"`,
             field: fieldName,
             severity: "error",
           });
-        } else if (strict === "warn") {
+        } else if (effectiveStrict === "warn") {
           issues.push({
             code: "unknown_field",
             message: `Unknown field "${fieldName}"`,
@@ -67,36 +392,33 @@ export function validateFrontmatter(
             severity: "warning",
           });
         }
-        continue;
       }
-
-      // Deprecated field check
-      if (fieldDef.deprecated && value !== null && value !== undefined) {
-        issues.push({
-          code: "deprecated_field",
-          message: `Field "${fieldName}" is deprecated`,
-          field: fieldName,
-          severity: "warning",
-        });
-      }
-
-      // Skip validation for null values
-      if (value === null || value === undefined) continue;
-
-      // Type-specific validation
-      const fieldIssues = validateFieldValue(fieldName, value, fieldDef, config);
-      issues.push(...fieldIssues);
+      continue;
     }
+
+    // Deprecated field check
+    if (fieldDef.deprecated && value !== null && value !== undefined) {
+      issues.push({
+        code: "deprecated_field",
+        message: `Field "${fieldName}" is deprecated`,
+        field: fieldName,
+        severity: "warning",
+      });
+    }
+
+    // Skip validation for null values
+    if (value === null || value === undefined) continue;
+
+    // Type-specific validation
+    const fieldIssues = validateFieldValue(fieldName, value, fieldDef, config);
+    issues.push(...fieldIssues);
   }
 
   // Check unique constraints across all files
   if (allFiles && types.length > 0) {
-    for (const typeDef of types) {
-      if (!typeDef.fields) continue;
-      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-        if (fieldDef.unique) {
-          checkUniqueness(fieldName, allFiles, issues);
-        }
+    for (const [fieldName, fieldDef] of Object.entries(mergedFields)) {
+      if (fieldDef.unique) {
+        checkUniqueness(fieldName, allFiles, issues);
       }
     }
 
@@ -145,31 +467,37 @@ function validateFieldValue(
         });
         break;
       }
-      if (fieldDef.min_length !== undefined && val.length < fieldDef.min_length) {
+      if (fieldDef.min_length !== undefined && [...val].length < fieldDef.min_length) {
         issues.push({
           code: "string_too_short",
-          message: `String "${fullFieldName}" is too short (${val.length} < ${fieldDef.min_length})`,
+          message: `String "${fullFieldName}" is too short (${[...val].length} < ${fieldDef.min_length})`,
           field: fullFieldName,
           severity: "error",
         });
       }
-      if (fieldDef.max_length !== undefined && val.length > fieldDef.max_length) {
+      if (fieldDef.max_length !== undefined && [...val].length > fieldDef.max_length) {
         issues.push({
           code: "string_too_long",
-          message: `String "${fullFieldName}" is too long (${val.length} > ${fieldDef.max_length})`,
+          message: `String "${fullFieldName}" is too long (${[...val].length} > ${fieldDef.max_length})`,
           field: fullFieldName,
           severity: "error",
         });
       }
       if (fieldDef.pattern) {
-        const regex = new RegExp(fieldDef.pattern);
-        if (!regex.test(val)) {
-          issues.push({
-            code: "pattern_mismatch",
-            message: `String "${fullFieldName}" doesn't match pattern "${fieldDef.pattern}"`,
-            field: fullFieldName,
-            severity: "error",
-          });
+        // Check all patterns (may have _patterns array from merge)
+        const patterns = (fieldDef as unknown as Record<string, unknown>)._patterns as string[] | undefined;
+        const allPatterns = patterns ?? [fieldDef.pattern];
+        for (const pat of allPatterns) {
+          const regex = new RegExp(pat);
+          if (!regex.test(val)) {
+            issues.push({
+              code: "pattern_mismatch",
+              message: `String "${fullFieldName}" doesn't match pattern "${pat}"`,
+              field: fullFieldName,
+              severity: "error",
+            });
+            break; // One mismatch is enough
+          }
         }
       }
       break;
@@ -193,7 +521,7 @@ function validateFieldValue(
         });
         break;
       }
-      if (fieldDef.min !== undefined && val < fieldDef.min) {
+      if (fieldDef.min !== undefined && !(val >= fieldDef.min)) {
         issues.push({
           code: "number_too_small",
           message: `Integer "${fullFieldName}" is too small (${val} < ${fieldDef.min})`,
@@ -201,7 +529,7 @@ function validateFieldValue(
           severity: "error",
         });
       }
-      if (fieldDef.max !== undefined && val > fieldDef.max) {
+      if (fieldDef.max !== undefined && !(val <= fieldDef.max)) {
         issues.push({
           code: "number_too_large",
           message: `Integer "${fullFieldName}" is too large (${val} > ${fieldDef.max})`,
@@ -221,18 +549,19 @@ function validateFieldValue(
         });
         break;
       }
-      if (fieldDef.min !== undefined && val < fieldDef.min) {
+      // NaN fails any min/max constraint
+      if (fieldDef.min !== undefined && !(val >= fieldDef.min)) {
         issues.push({
           code: "number_too_small",
-          message: `Number "${fullFieldName}" is too small (${val} < ${fieldDef.min})`,
+          message: `Number "${fullFieldName}" violates min constraint (${val} < ${fieldDef.min})`,
           field: fullFieldName,
           severity: "error",
         });
       }
-      if (fieldDef.max !== undefined && val > fieldDef.max) {
+      if (fieldDef.max !== undefined && !(val <= fieldDef.max)) {
         issues.push({
           code: "number_too_large",
-          message: `Number "${fullFieldName}" is too large (${val} > ${fieldDef.max})`,
+          message: `Number "${fullFieldName}" violates max constraint (${val} > ${fieldDef.max})`,
           field: fullFieldName,
           severity: "error",
         });
@@ -345,6 +674,7 @@ function validateFieldValue(
       }
       // Validate items
       if (fieldDef.items) {
+        let hasItemError = false;
         for (let i = 0; i < val.length; i++) {
           const itemIssues = validateFieldValue(
             `${fieldName}[${i}]`,
@@ -353,6 +683,15 @@ function validateFieldValue(
             config,
             parentPath,
           );
+          if (itemIssues.length > 0 && !hasItemError) {
+            hasItemError = true;
+            issues.push({
+              code: "list_item_invalid",
+              message: `Invalid item in list "${fullFieldName}"`,
+              field: fullFieldName,
+              severity: "error",
+            });
+          }
           issues.push(...itemIssues);
         }
       }
@@ -527,8 +866,22 @@ function isValidDatetime(value: unknown): boolean {
   if (typeof value !== "string") return false;
 
   // ISO 8601 datetime: YYYY-MM-DDTHH:MM:SS[.sss][Z|±HH:MM]
-  const pattern = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
-  return pattern.test(value);
+  const pattern = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(\.\d+)?(Z|[+-]\d{2}:\d{2})?$/;
+  const match = pattern.exec(value);
+  if (!match) return false;
+
+  // Validate ranges
+  const month = parseInt(match[2], 10);
+  const day = parseInt(match[3], 10);
+  const hours = parseInt(match[4], 10);
+  const minutes = parseInt(match[5], 10);
+  const seconds = parseInt(match[6], 10);
+
+  if (month < 1 || month > 12) return false;
+  if (day < 1 || day > 31) return false;
+  if (hours > 23 || minutes > 59 || seconds > 59) return false;
+
+  return true;
 }
 
 function isValidTime(value: unknown): boolean {

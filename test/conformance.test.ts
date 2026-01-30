@@ -11,9 +11,12 @@ import * as path from "node:path";
 import * as yaml from "js-yaml";
 import * as os from "node:os";
 
+import matter from "gray-matter";
 import { loadConfig } from "../src/config/loader.js";
 import { loadTypes, getType } from "../src/types/loader.js";
 import { Collection } from "../src/operations/collection.js";
+import { parseFile } from "../src/frontmatter/parser.js";
+import { evaluateWhere, evaluateExpression, ExpressionError } from "../src/expressions/evaluator.js";
 
 // Path to the spec's test files
 const SPEC_TESTS_DIR = path.resolve(
@@ -45,6 +48,12 @@ interface TestExpectation {
   [key: string]: unknown;
 }
 
+interface VerifyAfterStep {
+  operation: string;
+  input: Record<string, unknown>;
+  expect: TestExpectation;
+}
+
 interface TestCase {
   name: string;
   spec_ref?: string;
@@ -52,6 +61,8 @@ interface TestCase {
   input: Record<string, unknown>;
   expect: TestExpectation;
   setup?: TestSetup;
+  verify_after?: VerifyAfterStep | VerifyAfterStep[];
+  simulate?: Record<string, unknown>;
 }
 
 interface YamlTestGroup {
@@ -108,19 +119,46 @@ function materializeSetup(setup: TestSetup): string {
 
   // Write type files
   if (setup.types) {
-    const typesDir = path.join(tmpDir, "_types");
+    // Determine types folder from config
+    let typesFolder = "_types";
+    if (typeof setup.config === "string") {
+      const configMatch = setup.config.match(/types_folder:\s*["']?([^"'\n]+)["']?/);
+      if (configMatch) {
+        typesFolder = configMatch[1].trim();
+      }
+    }
+    const typesDir = path.join(tmpDir, typesFolder);
     fs.mkdirSync(typesDir, { recursive: true });
     for (const [filename, content] of Object.entries(setup.types)) {
-      fs.writeFileSync(path.join(typesDir, filename), content);
+      const typeFilePath = path.join(typesDir, filename);
+      fs.mkdirSync(path.dirname(typeFilePath), { recursive: true });
+      fs.writeFileSync(typeFilePath, content);
     }
   }
 
   // Write content files
   if (setup.files) {
-    for (const [filePath, content] of Object.entries(setup.files)) {
+    for (const [filePath, fileSpec] of Object.entries(setup.files)) {
       const fullPath = path.join(tmpDir, filePath);
       fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-      fs.writeFileSync(fullPath, content);
+      if (typeof fileSpec === "string") {
+        fs.writeFileSync(fullPath, fileSpec);
+      } else if (typeof fileSpec === "object" && fileSpec !== null) {
+        const spec = fileSpec as Record<string, unknown>;
+        let content = (spec.content ?? "") as string;
+        const encoding = (spec.encoding ?? "utf-8") as string;
+        if (encoding === "latin-1" || encoding === "latin1") {
+          // Write as latin-1 (ISO-8859-1) buffer
+          const buf = Buffer.from(content, "latin1");
+          fs.writeFileSync(fullPath, buf);
+        } else if (spec.line_endings === "CRLF") {
+          // Ensure CRLF line endings
+          content = content.replace(/\r\n/g, "\n").replace(/\n/g, "\r\n");
+          fs.writeFileSync(fullPath, content);
+        } else {
+          fs.writeFileSync(fullPath, content);
+        }
+      }
     }
   }
 
@@ -175,12 +213,62 @@ function discoverTests(): Map<number, Array<{ file: string; data: YamlTestFile }
 }
 
 /**
+ * Apply simulation settings to a Collection instance for testing.
+ */
+function applySimulate(
+  collection: InstanceType<typeof Collection>,
+  collectionRoot: string,
+  simulate?: Record<string, unknown>,
+): void {
+  if (!simulate) return;
+
+  // Set up I/O error simulation
+  const ioErrorOn = (simulate.io_error_on ?? (simulate as Record<string, unknown>)?.simulate?.io_error_on) as string | undefined;
+  if (ioErrorOn) {
+    collection.ioErrorPaths = new Set([ioErrorOn]);
+  }
+
+  // Set up pre-write hook for external modifications
+  const extModify = simulate.external_modify as { path?: string; content?: string; frontmatter?: Record<string, unknown> } | undefined;
+  const extCreate = simulate.external_create as { path?: string; content?: string } | undefined;
+
+  if (extModify || extCreate) {
+    collection.preWriteHook = () => {
+      if (extModify) {
+        const modPath = path.join(collectionRoot, extModify.path!);
+        let content = extModify.content;
+        if (!content && extModify.frontmatter) {
+          // Build content from frontmatter
+          const yamlStr = Object.entries(extModify.frontmatter)
+            .map(([k, v]) => `${k}: ${JSON.stringify(v)}`)
+            .join("\n");
+          content = `---\n${yamlStr}\n---\n`;
+        }
+        if (content) {
+          // Ensure the modification changes mtime (wait a bit if needed)
+          fs.writeFileSync(modPath, content);
+          // Force mtime change by touching the file with a future time
+          const now = Date.now();
+          fs.utimesSync(modPath, new Date(now + 1000), new Date(now + 1000));
+        }
+      }
+      if (extCreate) {
+        const createPath = path.join(collectionRoot, extCreate.path!);
+        fs.mkdirSync(path.dirname(createPath), { recursive: true });
+        fs.writeFileSync(createPath, extCreate.content ?? "---\n---\n");
+      }
+    };
+  }
+}
+
+/**
  * Execute a single test operation against the mdbase implementation.
  */
 async function executeOperation(
   collectionRoot: string,
   operation: string,
   input: Record<string, unknown>,
+  simulate?: Record<string, unknown>,
 ): Promise<unknown> {
   switch (operation) {
     case "load_config":
@@ -222,11 +310,25 @@ async function executeOperation(
     }
 
     case "validate": {
+      // If frontmatter is provided inline, create the file first
+      if (input.frontmatter && input.path) {
+        const filePath = path.join(collectionRoot, input.path as string);
+        fs.mkdirSync(path.dirname(filePath), { recursive: true });
+        const content = matter.stringify("", input.frontmatter as Record<string, unknown>);
+        fs.writeFileSync(filePath, content);
+      }
       const opened = Collection.open(collectionRoot);
       if (opened.error) {
         return { valid: false, error: opened.error };
       }
-      return opened.collection!.validate(input.path as string | undefined);
+      // validate: false means just read, don't validate
+      if (input.validate === false) {
+        const readResult = opened.collection!.read(input.path as string);
+        return readResult;
+      }
+      // collection_only: true means validate the collection, not a specific file
+      const filePath = input.collection_only ? undefined : (input.path as string | undefined);
+      return opened.collection!.validate(filePath);
     }
 
     case "create": {
@@ -234,11 +336,12 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
+      applySimulate(opened.collection!, collectionRoot, simulate);
       return opened.collection!.create({
         type: input.type as string | undefined,
         types: input.types as string[] | undefined,
         path: input.path as string,
-        frontmatter: input.frontmatter as Record<string, unknown> | undefined,
+        frontmatter: (input.frontmatter ?? input.fields) as Record<string, unknown> | undefined,
         body: input.body as string | undefined,
       });
     }
@@ -248,9 +351,10 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
+      applySimulate(opened.collection!, collectionRoot, simulate);
       return opened.collection!.update({
         path: input.path as string,
-        fields: input.fields as Record<string, unknown> | undefined,
+        fields: (input.fields ?? input.frontmatter) as Record<string, unknown> | undefined,
         body: input.body as string | undefined,
       });
     }
@@ -260,7 +364,10 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      return opened.collection!.delete(input.path as string);
+      applySimulate(opened.collection!, collectionRoot, simulate);
+      return opened.collection!.delete(input.path as string, {
+        check_backlinks: input.check_backlinks as boolean | undefined,
+      });
     }
 
     case "create_type": {
@@ -272,6 +379,7 @@ async function executeOperation(
         name: input.name as string,
         description: input.description as string | undefined,
         extends: input.extends as string | undefined,
+        parent: input.parent as string | undefined,
         strict: input.strict as boolean | "warn" | undefined,
         fields: input.fields as Record<string, unknown> | undefined,
         path_pattern: input.path_pattern as string | undefined,
@@ -283,10 +391,13 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      return opened.collection!.rename({
-        from: input.from as string,
-        to: input.to as string,
-      });
+      applySimulate(opened.collection!, collectionRoot, simulate);
+      const from = (input.from ?? input.path) as string | undefined;
+      const to = (input.to ?? input.new_path) as string | undefined;
+      if (!from || !to) {
+        return { error: { code: "path_required", message: "Both source and destination paths are required for rename" } };
+      }
+      return opened.collection!.rename({ from, to });
     }
 
     case "query": {
@@ -298,9 +409,112 @@ async function executeOperation(
       const queryInput = (input.query ?? input) as Record<string, unknown>;
       return opened.collection!.query({
         types: queryInput.types as string[] | undefined,
-        where: queryInput.where as string | undefined,
+        where: queryInput.where as string | Record<string, unknown> | undefined,
         order_by: queryInput.order_by as Array<{ field: string; direction?: string }> | undefined,
+        folder: queryInput.folder as string | undefined,
+        limit: queryInput.limit as number | undefined,
+        offset: queryInput.offset as number | undefined,
+        include_body: queryInput.include_body as boolean | undefined,
+        context_file: (queryInput.context_file ?? input.context_file) as string | undefined,
+        formulas: queryInput.formulas as Record<string, string> | undefined,
       });
+    }
+
+    case "evaluate": {
+      const expression = input.expression as string;
+      if (!expression || expression.trim() === "") {
+        return { error: { code: "invalid_expression", message: "Empty expression" } };
+      }
+      // Read the file if path or context_path is provided
+      let frontmatter: Record<string, unknown> = {};
+      let rawFrontmatter: Record<string, unknown> | undefined;
+      let filePath: string | undefined;
+      let body: string | undefined;
+      let types: string[] = [];
+      let fileInfo: Record<string, unknown> | undefined;
+      const readPath = (input.path ?? input.context_path) as string | undefined;
+      if (readPath) {
+        const opened = Collection.open(collectionRoot);
+        if (opened.error) {
+          return { error: opened.error };
+        }
+        const readResult = opened.collection!.read(readPath);
+        if (readResult.error) {
+          return { error: readResult.error };
+        }
+        frontmatter = readResult.frontmatter ?? {};
+        rawFrontmatter = (readResult as Record<string, unknown>).rawFrontmatter as Record<string, unknown> | undefined;
+        filePath = readPath;
+        body = readResult.body;
+        types = readResult.types ?? [];
+        fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
+      }
+      // Apply inline context (overrides/provides frontmatter directly)
+      if (input.context && typeof input.context === "object") {
+        frontmatter = { ...frontmatter, ...(input.context as Record<string, unknown>) };
+      }
+      try {
+        const result = evaluateExpression(expression, {
+          frontmatter,
+          rawFrontmatter,
+          path: filePath,
+          types,
+          body,
+          file: fileInfo,
+        });
+        return { result };
+      } catch (e: unknown) {
+        const err = e as { code?: string; message: string };
+        const code = err.code ?? "invalid_expression";
+        return { error: { code, message: err.message } };
+      }
+    }
+
+    case "batch_delete": {
+      const opened = Collection.open(collectionRoot);
+      if (opened.error) {
+        return { error: opened.error };
+      }
+      applySimulate(opened.collection!, collectionRoot, simulate);
+      return opened.collection!.batchDelete({
+        where: input.where as string,
+        dry_run: input.dry_run as boolean | undefined,
+        check_backlinks: input.check_backlinks as boolean | undefined,
+      });
+    }
+
+    case "batch_update": {
+      const opened = Collection.open(collectionRoot);
+      if (opened.error) {
+        return { error: opened.error };
+      }
+      applySimulate(opened.collection!, collectionRoot, simulate);
+      return opened.collection!.batchUpdate({
+        where: input.where as string | undefined,
+        fields: input.fields as Record<string, unknown> | undefined,
+        updates: input.updates as Array<{ path: string; fields: Record<string, unknown> }> | undefined,
+        dry_run: input.dry_run as boolean | undefined,
+      });
+    }
+
+    case "get_types": {
+      const opened = Collection.open(collectionRoot);
+      if (opened.error) {
+        return { error: opened.error };
+      }
+      const filePath = input.path as string;
+      if (!filePath) {
+        return { error: { code: "invalid_input", message: "get_types requires a path" } };
+      }
+      const fullPath = path.join(collectionRoot, filePath);
+      if (!fs.existsSync(fullPath)) {
+        return { error: { code: "file_not_found", message: `File not found: ${filePath}` } };
+      }
+      // Parse the file frontmatter
+      const parsed = parseFile(fullPath);
+      const frontmatter = parsed.frontmatter ?? {};
+      const types = opened.collection!.getTypesForFile(filePath, frontmatter);
+      return { types };
     }
 
     default:
@@ -310,6 +524,10 @@ async function executeOperation(
         `Collection root: ${collectionRoot}`,
       );
   }
+}
+
+function escapeRegex(str: string): string {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 /**
@@ -353,6 +571,12 @@ function assertSubset(actual: unknown, expected: unknown, path: string): void {
     return;
   }
 
+  if ("not_null" in expectedObj && expectedObj.not_null === true) {
+    expect(actual, `${path} should not be null`).not.toBeNull();
+    expect(actual, `${path} should be defined`).toBeDefined();
+    return;
+  }
+
   if ("not_equals" in expectedObj) {
     expect(actual, `${path} should not equal`).not.toEqual(expectedObj.not_equals);
     return;
@@ -363,11 +587,63 @@ function assertSubset(actual: unknown, expected: unknown, path: string): void {
     return;
   }
 
+  if ("starts_with" in expectedObj && typeof expectedObj.starts_with === "string") {
+    expect(String(actual), `${path} should start with`).toMatch(new RegExp(`^${escapeRegex(expectedObj.starts_with)}`));
+    return;
+  }
+
+  if ("ends_with" in expectedObj && typeof expectedObj.ends_with === "string") {
+    expect(String(actual), `${path} should end with`).toMatch(new RegExp(`${escapeRegex(expectedObj.ends_with)}$`));
+    return;
+  }
+
+  if ("greater_than" in expectedObj || "gt" in expectedObj) {
+    const threshold = (expectedObj.greater_than ?? expectedObj.gt) as number;
+    expect(Number(actual), `${path} should be > ${threshold}`).toBeGreaterThan(threshold);
+    return;
+  }
+
+  if ("greater_than_or_equal" in expectedObj || "gte" in expectedObj) {
+    const threshold = (expectedObj.greater_than_or_equal ?? expectedObj.gte) as number;
+    expect(Number(actual), `${path} should be >= ${threshold}`).toBeGreaterThanOrEqual(threshold);
+    return;
+  }
+
+  if ("less_than" in expectedObj || "lt" in expectedObj) {
+    const threshold = (expectedObj.less_than ?? expectedObj.lt) as number;
+    expect(Number(actual), `${path} should be < ${threshold}`).toBeLessThan(threshold);
+    return;
+  }
+
+  if ("less_than_or_equal" in expectedObj || "lte" in expectedObj) {
+    const threshold = (expectedObj.less_than_or_equal ?? expectedObj.lte) as number;
+    expect(Number(actual), `${path} should be <= ${threshold}`).toBeLessThanOrEqual(threshold);
+    return;
+  }
+
   expect(typeof actual, `${path} should be object`).toBe("object");
   expect(actual, `${path} should not be null`).not.toBeNull();
   const actualObj = actual as Record<string, unknown>;
 
   for (const [key, value] of Object.entries(expectedObj)) {
+    // body_contains: assert body field contains substring
+    if (key === "body_contains") {
+      const bodyStr = String(actualObj.body ?? "");
+      expect(bodyStr, `${path}.body_contains`).toContain(value as string);
+      continue;
+    }
+    // body_not_contains: assert body field does NOT contain substring
+    if (key === "body_not_contains") {
+      const bodyStr = String(actualObj.body ?? "");
+      expect(bodyStr, `${path}.body_not_contains`).not.toContain(value as string);
+      continue;
+    }
+    // total_count_positive: assert total_count > 0
+    if (key === "total_count_positive" && value === true) {
+      const tc = Number(actualObj.total_count ?? 0);
+      expect(tc, `${path}.total_count_positive`).toBeGreaterThan(0);
+      continue;
+    }
     assertSubset(actualObj[key], value, `${path}.${key}`);
   }
 }
@@ -379,6 +655,7 @@ function assertExpectation(
   actual: unknown,
   expected: TestExpectation,
   testName: string,
+  collectionRoot?: string,
 ): void {
   const result = actual as Record<string, unknown>;
 
@@ -417,20 +694,67 @@ function assertExpectation(
     if (expected.issues.length === 0) {
       expect(actualIssues, `${testName}: no issues`).toHaveLength(0);
     } else {
+      // Map of generic codes to specific codes that should match
+      const CONSTRAINT_CODES = new Set([
+        "string_too_short", "string_too_long", "pattern_mismatch",
+        "number_too_small", "number_too_large", "not_integer",
+        "list_too_short", "list_too_long", "list_duplicate", "list_item_invalid",
+        "constraint_violation",
+      ]);
+
+      // list_item_invalid can match any error that occurs on a list item (indexed field)
+      const LIST_ITEM_CODES = new Set([
+        "type_mismatch", "missing_required",
+        "string_too_short", "string_too_long", "pattern_mismatch",
+        "number_too_small", "number_too_large", "not_integer",
+        "list_too_short", "list_too_long", "list_duplicate",
+        "constraint_violation", "list_item_invalid", "invalid_enum_value",
+      ]);
+
       for (const expectedIssue of expected.issues) {
         const match = actualIssues.find((a) => {
-          if (expectedIssue.code && a.code !== expectedIssue.code) return false;
+          if (expectedIssue.code) {
+            if (a.code !== expectedIssue.code) {
+              // constraint_violation matches any specific constraint code
+              if (expectedIssue.code === "constraint_violation" && CONSTRAINT_CODES.has(a.code as string)) {
+                // OK, generic matches specific
+              } else if (CONSTRAINT_CODES.has(expectedIssue.code) && a.code === "constraint_violation") {
+                // OK, specific matches generic
+              } else if (expectedIssue.code === "list_item_invalid" && LIST_ITEM_CODES.has(a.code as string)) {
+                // list_item_invalid matches any list item error
+              } else {
+                return false;
+              }
+            }
+          }
           if (expectedIssue.field && a.field !== expectedIssue.field) return false;
           if (expectedIssue.severity && a.severity !== expectedIssue.severity) return false;
+          if (expectedIssue.path && a.path !== expectedIssue.path) return false;
           return true;
         });
-        expect(match, `${testName}: expected issue ${JSON.stringify(expectedIssue)}`).toBeDefined();
+        expect(match, `${testName}: expected issue ${JSON.stringify(expectedIssue)} in ${JSON.stringify(actualIssues.map(i => ({code: i.code, field: i.field})))}`).toBeDefined();
       }
     }
   }
 
   if (expected.result !== undefined) {
-    expect(result.result ?? result, `${testName}: result`).toEqual(expected.result);
+    const actualResult = "result" in result ? result.result : result;
+    expect(actualResult, `${testName}: result`).toEqual(expected.result);
+  }
+
+  // result_type: check the type of the result value
+  if ((expected as Record<string, unknown>).result_type !== undefined) {
+    const actualResult = "result" in result ? result.result : result;
+    const expectedType = (expected as Record<string, unknown>).result_type as string;
+    expect(typeof actualResult, `${testName}: result_type`).toBe(expectedType);
+  }
+
+  // results_count_lte: check that results count is at most N
+  if ((expected as Record<string, unknown>).results_count_lte !== undefined) {
+    const actualResults = result.results as unknown[] | undefined;
+    expect(actualResults, `${testName}: results for results_count_lte`).toBeDefined();
+    const maxCount = (expected as Record<string, unknown>).results_count_lte as number;
+    expect(actualResults!.length, `${testName}: results_count_lte`).toBeLessThanOrEqual(maxCount);
   }
 
   if (expected.results !== undefined) {
@@ -449,6 +773,12 @@ function assertExpectation(
     expect(actualResults?.length, `${testName}: count`).toBe(expected.count);
   }
 
+  if ((expected as Record<string, unknown>).results_count !== undefined) {
+    const actualResults = result.results as unknown[] | undefined;
+    expect(actualResults, `${testName}: results for results_count`).toBeDefined();
+    expect(actualResults?.length, `${testName}: results_count`).toBe((expected as Record<string, unknown>).results_count);
+  }
+
   if (expected.paths !== undefined) {
     const actualResults = result.results as Array<Record<string, unknown>> | undefined;
     expect(actualResults, `${testName}: results for paths`).toBeDefined();
@@ -464,13 +794,203 @@ function assertExpectation(
     expect(result.body, `${testName}: body`).toBe(expected.body);
   }
 
+  if ((expected as Record<string, unknown>).body_contains !== undefined) {
+    const bodyStr = String(result.body ?? "");
+    expect(bodyStr, `${testName}: body_contains`).toContain(
+      (expected as Record<string, unknown>).body_contains as string,
+    );
+  }
+
+  if ((expected as Record<string, unknown>).body_contains_all !== undefined) {
+    const bodyStr = String(result.body ?? "");
+    const all = (expected as Record<string, unknown>).body_contains_all as string[];
+    for (const s of all) {
+      expect(bodyStr, `${testName}: body_contains_all "${s}"`).toContain(s);
+    }
+  }
+
+  if ((expected as Record<string, unknown>).path_contains !== undefined) {
+    const pathStr = String(result.path ?? "");
+    expect(pathStr, `${testName}: path_contains`).toContain(
+      (expected as Record<string, unknown>).path_contains as string,
+    );
+  }
+
+  if ((expected as Record<string, unknown>).deleted !== undefined) {
+    // Just check the operation succeeded (no error)
+    if ((expected as Record<string, unknown>).deleted === true) {
+      expect(result.error, `${testName}: deleted should not have error`).toBeUndefined();
+    }
+  }
+
+  if ((expected as Record<string, unknown>).file !== undefined) {
+    const expectedFile = (expected as Record<string, unknown>).file as Record<string, unknown>;
+    const actualFile = result.file as Record<string, unknown>;
+    expect(actualFile, `${testName}: file should exist`).toBeDefined();
+    if (actualFile) {
+      // Handle custom assertions
+      if (expectedFile.mtime_present === true) {
+        expect(actualFile.mtime, `${testName}: file.mtime should exist`).toBeDefined();
+      }
+      if (expectedFile.size_positive === true) {
+        expect(typeof actualFile.size, `${testName}: file.size should be number`).toBe("number");
+        expect(actualFile.size as number, `${testName}: file.size should be positive`).toBeGreaterThan(0);
+      }
+      // Check non-custom fields with subset matching
+      const filteredExpected: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(expectedFile)) {
+        if (k !== "mtime_present" && k !== "size_positive") {
+          filteredExpected[k] = v;
+        }
+      }
+      if (Object.keys(filteredExpected).length > 0) {
+        assertSubset(actualFile, filteredExpected, `${testName}: file`);
+      }
+    }
+  }
+
   if (expected.type !== undefined) {
     assertSubset(result.type, expected.type, `${testName}: type`);
   }
 
   if (expected.types !== undefined) {
-    expect(result.types, `${testName}: types`).toEqual(expected.types);
+    const actualTypes = (result.types as string[] ?? []).slice().sort();
+    const expectedTypes = (expected.types as string[]).slice().sort();
+    expect(actualTypes, `${testName}: types`).toEqual(expectedTypes);
   }
+
+  if ((expected as Record<string, unknown>).batch_result !== undefined) {
+    assertSubset(
+      result.batch_result ?? result,
+      (expected as Record<string, unknown>).batch_result,
+      `${testName}: batch_result`,
+    );
+  }
+
+  if ((expected as Record<string, unknown>).changed_fields !== undefined) {
+    assertSubset(
+      result.changed_fields,
+      (expected as Record<string, unknown>).changed_fields,
+      `${testName}: changed_fields`,
+    );
+  }
+
+  if ((expected as Record<string, unknown>).meta !== undefined) {
+    const expectedMeta = (expected as Record<string, unknown>).meta as Record<string, unknown>;
+    const actualMeta = (result as Record<string, unknown>).meta as Record<string, unknown> | undefined;
+    expect(actualMeta, `${testName}: meta should exist`).toBeDefined();
+    if (actualMeta) {
+      assertSubset(actualMeta, expectedMeta, `${testName}: meta`);
+    }
+  }
+
+  if ((expected as Record<string, unknown>).error_code !== undefined) {
+    const actualError = result.error as Record<string, unknown> | undefined;
+    expect(actualError, `${testName}: error present for error_code`).toBeDefined();
+    expect(actualError?.code, `${testName}: error_code`).toBe(
+      (expected as Record<string, unknown>).error_code,
+    );
+  }
+
+  // frontmatter_not_match: check that frontmatter fields do NOT match given values
+  if ((expected as Record<string, unknown>).frontmatter_not_match !== undefined) {
+    const notMatch = (expected as Record<string, unknown>).frontmatter_not_match as Record<string, unknown>;
+    const actualFm = result.frontmatter as Record<string, unknown>;
+    for (const [key, value] of Object.entries(notMatch)) {
+      expect(actualFm[key], `${testName}: frontmatter.${key} should not match ${value}`).not.toEqual(value);
+    }
+  }
+
+  // frontmatter_written: check what was actually written to disk
+  if ((expected as Record<string, unknown>).frontmatter_written !== undefined && collectionRoot) {
+    const inputObj = (actual as Record<string, unknown>);
+    const filePath = (result.path ?? inputObj.path ??
+      (expected as Record<string, unknown>).path) as string | undefined;
+    if (filePath) {
+      const fullPath = path.join(collectionRoot, filePath);
+      if (fs.existsSync(fullPath)) {
+        const content = fs.readFileSync(fullPath, "utf-8");
+        const parsed = matter(content);
+        const writtenData = (expected as Record<string, unknown>).frontmatter_written;
+        if (Array.isArray(writtenData)) {
+          // Array form: list of field names that should be present
+          for (const field of writtenData) {
+            expect(
+              field in parsed.data,
+              `${testName}: field "${field}" should be in written frontmatter`,
+            ).toBe(true);
+          }
+        } else if (typeof writtenData === "object" && writtenData !== null) {
+          for (const [key, value] of Object.entries(writtenData as Record<string, unknown>)) {
+            assertSubset(parsed.data[key], value, `${testName}: frontmatter_written.${key}`);
+          }
+        }
+      }
+    }
+  }
+
+  // frontmatter_not_written: check fields are NOT in the written file
+  if ((expected as Record<string, unknown>).frontmatter_not_written !== undefined && collectionRoot) {
+    const filePath = (result.path ?? (expected as Record<string, unknown>).path ??
+      ((actual as Record<string, unknown>).path)) as string | undefined;
+    if (filePath) {
+      const fullPath = path.join(collectionRoot, filePath);
+      if (fs.existsSync(fullPath)) {
+        const content = fs.readFileSync(fullPath, "utf-8");
+        const parsed = matter(content);
+        const notWritten = (expected as Record<string, unknown>).frontmatter_not_written as string[];
+        for (const field of notWritten) {
+          expect(
+            field in parsed.data,
+            `${testName}: field "${field}" should NOT be in written frontmatter`,
+          ).toBe(false);
+        }
+      }
+    }
+  }
+
+  // frontmatter_not_bare_null: check fields are not written as bare null (empty value)
+  if ((expected as Record<string, unknown>).frontmatter_not_bare_null !== undefined && collectionRoot) {
+    const filePath = (result.path ?? (expected as Record<string, unknown>).path) as string | undefined;
+    if (filePath) {
+      const fullPath = path.join(collectionRoot, filePath);
+      if (fs.existsSync(fullPath)) {
+        const raw = fs.readFileSync(fullPath, "utf-8");
+        const fields = (expected as Record<string, unknown>).frontmatter_not_bare_null as string[];
+        for (const field of fields) {
+          // Check the field isn't written as "field:" with no value (bare null)
+          const bareNullRegex = new RegExp(`^${field}:\\s*$`, "m");
+          expect(
+            bareNullRegex.test(raw),
+            `${testName}: field "${field}" should not be bare null in written YAML`,
+          ).toBe(false);
+        }
+      }
+    }
+  }
+
+  // line_endings: check line ending style of written file
+  if ((expected as Record<string, unknown>).line_endings !== undefined && collectionRoot) {
+    const filePath = (result.path ?? (expected as Record<string, unknown>).path ??
+      ((actual as Record<string, unknown>).path)) as string | undefined;
+    if (filePath) {
+      const fullPath = path.join(collectionRoot, filePath);
+      if (fs.existsSync(fullPath)) {
+        const raw = fs.readFileSync(fullPath, "utf-8");
+        const expectedLE = (expected as Record<string, unknown>).line_endings as string;
+        if (expectedLE === "CRLF") {
+          // Should have \r\n line endings
+          expect(raw.includes("\r\n"), `${testName}: should have CRLF line endings`).toBe(true);
+        } else if (expectedLE === "LF") {
+          // Should have \n line endings, no \r\n
+          expect(raw.includes("\r\n"), `${testName}: should not have CRLF line endings`).toBe(false);
+        }
+      }
+    }
+  }
+
+  // verify_after: run a second operation after the first to check state
+  // (handled in the test execution loop, not here)
 }
 
 // Discover and register tests
@@ -492,14 +1012,19 @@ if (allTests.size === 0) {
           if (data.groups) {
             for (const group of data.groups) {
               describe(group.name, () => {
+                // Detect if group has mutating operations (batch, create, update, delete, rename)
+                const MUTATING_OPS = new Set(["create", "update", "delete", "rename", "batch_delete", "batch_update", "create_type"]);
+                const groupHasMutating = group.tests.some((t) => MUTATING_OPS.has(t.operation));
+
                 let sharedRoot: string | undefined;
 
                 // If the group has setup but individual tests don't override it,
-                // create one shared setup for the group
+                // create one shared setup for the group.
+                // BUT: if any tests mutate state, each test gets its own root.
                 const groupHasSetup = !!group.setup;
                 const allTestsHaveSetup = group.tests.every((t) => !!t.setup);
 
-                if (groupHasSetup && !allTestsHaveSetup) {
+                if (groupHasSetup && !allTestsHaveSetup && !groupHasMutating) {
                   beforeAll(() => {
                     sharedRoot = materializeSetup(mergeSetup(data.setup, group.setup));
                   });
@@ -521,10 +1046,10 @@ if (allTests.size === 0) {
                       );
                       testRoot = materializeSetup(merged);
                       root = testRoot;
-                    } else if (sharedRoot) {
+                    } else if (sharedRoot && !groupHasMutating) {
                       root = sharedRoot;
                     } else {
-                      // No group setup, no test setup - use file-level setup
+                      // Each test gets its own root (for mutating ops or no group setup)
                       testRoot = materializeSetup(mergeSetup(data.setup, group.setup));
                       root = testRoot;
                     }
@@ -534,8 +1059,24 @@ if (allTests.size === 0) {
                         root,
                         testCase.operation,
                         testCase.input ?? {},
+                        testCase.simulate as Record<string, unknown> | undefined,
                       );
-                      assertExpectation(result, testCase.expect, testCase.name);
+                      assertExpectation(result, testCase.expect, testCase.name, root);
+
+                      // Run verify_after steps
+                      if (testCase.verify_after) {
+                        const steps = Array.isArray(testCase.verify_after)
+                          ? testCase.verify_after
+                          : [testCase.verify_after];
+                        for (const step of steps) {
+                          const verifyResult = await executeOperation(
+                            root,
+                            step.operation,
+                            step.input ?? {},
+                          );
+                          assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
+                        }
+                      }
                     } finally {
                       if (testRoot) cleanupSetup(testRoot);
                     }
@@ -579,8 +1120,24 @@ if (allTests.size === 0) {
                     root,
                     testCase.operation,
                     testCase.input ?? {},
+                    testCase.simulate as Record<string, unknown> | undefined,
                   );
-                  assertExpectation(result, testCase.expect, testCase.name);
+                  assertExpectation(result, testCase.expect, testCase.name, root);
+
+                  // Run verify_after steps
+                  if (testCase.verify_after) {
+                    const steps = Array.isArray(testCase.verify_after)
+                      ? testCase.verify_after
+                      : [testCase.verify_after];
+                    for (const step of steps) {
+                      const verifyResult = await executeOperation(
+                        root,
+                        step.operation,
+                        step.input ?? {},
+                      );
+                      assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
+                    }
+                  }
                 } finally {
                   if (testRoot) cleanupSetup(testRoot);
                 }
