@@ -1,0 +1,12 @@
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Ralph Loop files
+PROMPT.md
+AGENTS.md
+PROGRESS.md
+loop.sh
+
+# Test artifacts
+.mdbase-test-*/

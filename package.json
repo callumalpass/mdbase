@@ -1,0 +1,30 @@
+{
+  "name": "mdbase",
+  "version": "0.1.0",
+  "description": "TypeScript implementation of the mdbase specification",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.0.0",
+    "chokidar": "^4.0.0",
+    "gray-matter": "^4.0.3",
+    "js-yaml": "^4.1.0",
+    "picomatch": "^4.0.0",
+    "ulid": "^2.3.0",
+    "uuid": "^10.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.0",
+    "@types/js-yaml": "^4.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0",
+    "vitest": "^2.0.0"
+  }
+}
