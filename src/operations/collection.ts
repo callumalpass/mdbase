@@ -1642,7 +1642,7 @@ export class Collection {
   private updateWikilink(
     _linkValue: string,
     parsed: ParsedLink,
-    _oldPath: string,
+    oldPath: string,
     newPath: string,
     _oldBase: string,
     newBase: string,
@@ -1655,8 +1655,16 @@ export class Collection {
       // Path-style wikilink: use the new path without extension
       newTarget = newPath.replace(/\.(md|markdown)$/, "");
     } else {
-      // Simple name wikilink: use just the new basename
-      newTarget = newBase;
+      // Simple name wikilink: check if file moved to a different folder
+      const oldDir = path.dirname(oldPath);
+      const newDir = path.dirname(newPath);
+      if (oldDir !== newDir) {
+        // Cross-folder move: upgrade to path-based wikilink
+        newTarget = newPath.replace(/\.(md|markdown)$/, "");
+      } else {
+        // Same folder: use just the new basename
+        newTarget = newBase;
+      }
     }
 
     // Rebuild wikilink with anchor and alias preserved
@@ -1945,7 +1953,7 @@ export class Collection {
               // Structural/deterministic errors abort the query
               const abortCodes = new Set([
                 "invalid_expression", "unknown_function", "wrong_argument_count",
-                "expression_depth_exceeded", "type_error",
+                "expression_depth_exceeded",
               ]);
               if (abortCodes.has(e.code)) {
                 return {
