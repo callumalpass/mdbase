@@ -7,3 +7,8 @@
 
 export { MdbaseOperationError } from "./errors.js";
 export type { MdbaseError, ValidationResult, ErrorSeverity } from "./errors.js";
+export { loadConfig } from "./config/loader.js";
+export type { MdbaseConfig, MdbaseSettings, ConfigLoadResult } from "./config/loader.js";
+export { loadTypes, getType } from "./types/loader.js";
+export type { TypeDefinition, FieldDefinition, TypeLoadResult, GetTypeResult } from "./types/loader.js";
+export { Collection } from "./operations/collection.js";
