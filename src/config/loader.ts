@@ -16,6 +16,7 @@ export interface MdbaseSettings {
   default_validation: "off" | "warn" | "error";
   default_strict: boolean | "warn";
   id_field: string;
+  id_field_explicit?: boolean;
   write_nulls: "omit" | "explicit";
   write_empty_lists: boolean;
   rename_update_refs: boolean;
@@ -373,6 +374,7 @@ function parseSettings(
       };
     }
     settings.id_field = raw.id_field;
+    settings.id_field_explicit = true;
   }
 
   // write_nulls

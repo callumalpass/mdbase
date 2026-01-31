@@ -1455,6 +1455,13 @@ export class Collection {
           if (value === null || value === undefined) continue;
 
           if (fieldDef.type === "link" && typeof value === "string") {
+            // ID-based link stability: if id_field is explicitly configured,
+            // the link field has a target constraint, and the link is a simple-name
+            // wikilink matching the renamed file's ID, skip the update (§12.5 rule 3)
+            const fieldTarget = (fieldDef as unknown as Record<string, unknown>).target as string | undefined;
+            if (fieldTarget && renamedFileId && this.config.settings.id_field_explicit && this.isIdStableLink(value, renamedFileId)) {
+              continue;
+            }
             const result = this.updateLinkValue(value, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
             if (result.warning) {
               warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
@@ -1464,11 +1471,16 @@ export class Collection {
               fmUpdatedFields.push(fieldName);
             }
           } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
+            const itemTarget = (fieldDef.items as unknown as Record<string, unknown>).target as string | undefined;
             const newList = [...value];
             let listUpdated = false;
             for (let i = 0; i < newList.length; i++) {
               const item = newList[i];
               if (typeof item !== "string") continue;
+              // ID-based link stability for list items
+              if (itemTarget && renamedFileId && this.config.settings.id_field_explicit && this.isIdStableLink(item, renamedFileId)) {
+                continue;
+              }
               const result = this.updateLinkValue(item, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
               if (result.warning) {
                 warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
@@ -1552,6 +1564,23 @@ export class Collection {
     }
 
     return result;
+  }
+
+  /**
+   * Check if a link is a simple-name wikilink that matches an ID value.
+   * Used for ID-based link stability during rename (§12.5 rule 3).
+   */
+  private isIdStableLink(linkValue: string, idValue: string): boolean {
+    try {
+      const parsed = parseLink(linkValue);
+      if (!parsed || parsed.format !== "wikilink") return false;
+      const target = parsed.target;
+      // Must be a simple name (no path separators, no relative prefixes)
+      if (target.includes("/") || target.startsWith("./") || target.startsWith("../")) return false;
+      return target === idValue;
+    } catch {
+      return false;
+    }
   }
 
   /**
