@@ -86,15 +86,41 @@ interface YamlTestFile {
 /**
  * Merge two test setups. Per-test setup overrides group setup.
  */
-function mergeSetup(group?: TestSetup, test?: TestSetup): TestSetup {
+function mergeSetup(group?: TestSetup, test?: TestSetup, testCase?: Record<string, unknown>): TestSetup {
   if (!group && !test) return {};
   if (!group) return test!;
   if (!test) return group;
 
+  // For files: if the test defines files that overlap with group files (same key),
+  // the test intends to define its own file set — use test files, plus any group
+  // files that are directly referenced in the test's operation input/verify_after.
+  // If no overlap, merge additively (test adds new files to group files).
+  let files: Record<string, unknown>;
+  const groupFiles = group.files ?? {};
+  const testFiles = test.files ?? {};
+  const hasOverlap = Object.keys(testFiles).some(k => k in groupFiles);
+  if (hasOverlap) {
+    files = { ...testFiles };
+    // Keep group-only files that are referenced in the test case
+    if (testCase) {
+      const testStr = JSON.stringify(testCase);
+      for (const [key, value] of Object.entries(groupFiles)) {
+        if (key in testFiles) continue; // already overridden
+        // Check if this file path (or its basename without extension) appears in the test
+        const basename = key.replace(/.*\//, "").replace(/\.[^.]+$/, "");
+        if (testStr.includes(key) || testStr.includes(basename)) {
+          files[key] = value;
+        }
+      }
+    }
+  } else {
+    files = { ...groupFiles, ...testFiles };
+  }
+
   return {
     config: test.config !== undefined ? test.config : group.config,
     types: { ...(group.types ?? {}), ...(test.types ?? {}) },
-    files: { ...(group.files ?? {}), ...(test.files ?? {}) },
+    files,
   };
 }
 
@@ -1824,6 +1850,7 @@ if (allTests.size === 0) {
                       const merged = mergeSetup(
                         mergeSetup(data.setup, group.setup),
                         testCase.setup,
+                        testCase as Record<string, unknown>,
                       );
                       testRoot = materializeSetup(merged);
                       root = testRoot;
@@ -1892,7 +1919,7 @@ if (allTests.size === 0) {
                 let root: string;
 
                 if (testCase.setup) {
-                  const merged = mergeSetup(data.setup, testCase.setup);
+                  const merged = mergeSetup(data.setup, testCase.setup, testCase as Record<string, unknown>);
                   testRoot = materializeSetup(merged);
                   root = testRoot;
                 } else if (sharedRoot) {
