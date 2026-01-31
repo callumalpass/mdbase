@@ -369,11 +369,21 @@ class ExprParser {
             ? d.toISOString().replace(/\.000Z$/, "Z")
             : d.toISOString().slice(0, 10);
         }
+        // Null propagation: null + anything = null
+        else if (left === null || left === undefined || right === null || right === undefined) {
+          left = null;
+        }
         // String concatenation and type mismatches
         else if (typeof left === "string" || typeof right === "string") {
-          if (typeof left === "string" && typeof right === "string" &&
-              !isDateString(left) && !isDateString(right)) {
+          const leftIsPlainStr = typeof left === "string" && !isDateString(left);
+          const rightIsPlainStr = typeof right === "string" && !isDateString(right);
+          if (leftIsPlainStr && rightIsPlainStr) {
             left = left + right;
+          } else if (this.ctx.strictArithmetic &&
+                     (leftIsPlainStr || rightIsPlainStr) &&
+                     (typeof left === "number" || typeof right === "number")) {
+            // Strict mode: string + number → string concatenation (for formulas)
+            left = String(left) + String(right);
           } else if (this.ctx.strictArithmetic) {
             throw new ExpressionError("type_error", "Cannot add mismatched string and number");
           } else {
@@ -381,12 +391,7 @@ class ExprParser {
             left = null;
           }
         } else {
-          // Null propagation: null + anything = null
-          if (left === null || left === undefined || right === null || right === undefined) {
-            left = null;
-          } else {
-            left = toNum(left) + toNum(right);
-          }
+          left = toNum(left) + toNum(right);
         }
       } else {
         // Date - duration string → calendar-aware subtraction
@@ -414,7 +419,7 @@ class ExprParser {
         } else if (isDateString(left) && isDateString(right)) {
           left = new Date(String(left)).getTime() - new Date(String(right)).getTime();
         } else if ((typeof left === "string" && !isDateString(left)) || (typeof right === "string" && !isDateString(right))) {
-          throw new ExpressionError("type_error", "Cannot subtract strings");
+          throw new ExpressionError("type_error", `Cannot subtract strings: left=${JSON.stringify(left)} (${typeof left}), right=${JSON.stringify(right)} (${typeof right})`);
         } else if (typeof left === "boolean" || typeof right === "boolean") {
           throw new ExpressionError("type_error", "Cannot subtract booleans");
         } else if (Array.isArray(left) || Array.isArray(right)) {

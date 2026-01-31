@@ -1,6 +1,6 @@
 # mdbase
 
-TypeScript implementation of the mdbase spec: a structured markdown collection with typed frontmatter, validation, queries, links, and watch/caching semantics.
+TypeScript implementation of the [mdbase spec](https://mdbase.dev): a structured markdown collection with typed frontmatter, validation, queries, links, and watch/caching semantics.
 
 This repo is a reference implementation used to run the conformance suite in `~/projects/mdbase-spec/tests`.
 
@@ -118,8 +118,4 @@ The conformance runner is in `test/conformance.test.ts`. It reads YAML test file
 - `src/types/` type loading and validation helpers
 - `src/cache/` async cache store + worker
 - `test/` conformance test runner
-
-## Notes
-
-Implementation notes and spec discrepancies are tracked in `SPEC-NOTES.md`.
 
