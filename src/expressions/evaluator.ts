@@ -674,11 +674,6 @@ class ExprParser {
       case "today": {
         return new Date().toISOString().slice(0, 10);
       }
-      case "len": {
-        const val = args[0];
-        if (typeof val === "string" || Array.isArray(val)) return val.length;
-        return 0;
-      }
       case "abs": {
         return Math.abs(toNum(args[0]));
       }
