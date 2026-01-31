@@ -76,20 +76,29 @@ const MAX_TYPE_NAME_LENGTH = 64;
 /**
  * Load all type definitions from the types folder.
  */
-export function loadTypes(
+export async function loadTypes(
   collectionRoot: string,
   config: MdbaseConfig,
-): TypeLoadResult {
+): Promise<TypeLoadResult> {
+  return await loadTypesAsync(collectionRoot, config);
+}
+
+export async function loadTypesAsync(
+  collectionRoot: string,
+  config: MdbaseConfig,
+): Promise<TypeLoadResult> {
   const warnings: string[] = [];
   const typesFolder = path.join(collectionRoot, config.settings.types_folder);
   const rawTypes = new Map<string, TypeDefinition>();
 
-  if (!fs.existsSync(typesFolder)) {
+  try {
+    await fs.promises.access(typesFolder);
+  } catch {
     return { valid: true, types: new Map(), warnings };
   }
 
   // Read all .md files from the types folder (recursively)
-  const typeFiles = findMarkdownFiles(typesFolder);
+  const typeFiles = await findMarkdownFilesAsync(typesFolder);
 
   for (const filePath of typeFiles) {
     const relativeName = path.relative(typesFolder, filePath);
@@ -97,7 +106,7 @@ export function loadTypes(
 
     let content: string;
     try {
-      content = fs.readFileSync(filePath, "utf-8");
+      content = await fs.promises.readFile(filePath, "utf-8");
     } catch {
       return {
         valid: false,
@@ -304,12 +313,20 @@ export function loadTypes(
 /**
  * Get a single resolved type by name.
  */
-export function getType(
+export async function getType(
   collectionRoot: string,
   config: MdbaseConfig,
   typeName: string,
-): GetTypeResult {
-  const result = loadTypes(collectionRoot, config);
+): Promise<GetTypeResult> {
+  return await getTypeAsync(collectionRoot, config, typeName);
+}
+
+export async function getTypeAsync(
+  collectionRoot: string,
+  config: MdbaseConfig,
+  typeName: string,
+): Promise<GetTypeResult> {
+  const result = await loadTypesAsync(collectionRoot, config);
   if (!result.valid) {
     return {
       valid: false,
@@ -337,7 +354,7 @@ export function getType(
 }
 
 function validateTypeName(name: string): { code: string; message: string } | null {
-  if (name.length >= MAX_TYPE_NAME_LENGTH) {
+  if (name.length > MAX_TYPE_NAME_LENGTH) {
     return {
       code: "invalid_type_definition",
       message: `Type name "${name}" exceeds maximum length of ${MAX_TYPE_NAME_LENGTH}`,
@@ -368,14 +385,19 @@ function validateTypeName(name: string): { code: string; message: string } | nul
   return null;
 }
 
-function findMarkdownFiles(dir: string): string[] {
+async function findMarkdownFilesAsync(dir: string): Promise<string[]> {
   const files: string[] = [];
-  if (!fs.existsSync(dir)) return files;
+  try {
+    await fs.promises.access(dir);
+  } catch {
+    return files;
+  }
 
-  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+  const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {
-      files.push(...findMarkdownFiles(fullPath));
+      files.push(...await findMarkdownFilesAsync(fullPath));
     } else if (entry.name.endsWith(".md") || entry.name.endsWith(".markdown")) {
       files.push(fullPath);
     }

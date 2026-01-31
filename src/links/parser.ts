@@ -283,12 +283,14 @@ export function extractBodyLinks(body: string): ParsedLink[] {
       continue;
     }
     if (inFencedCode) continue;
+    // Skip indented code blocks (4+ spaces or a tab)
+    if (/^(?:\t| {4,})/.test(line)) continue;
 
     // Remove inline code spans before scanning for links
     const cleaned = removeInlineCode(line);
 
     // Find wikilinks: [[...]] and embeds ![[...]]
-    const wikiRegex = /(!?\[\[([^\]\n]+)\]\])/g;
+    const wikiRegex = /(?<!\\)(!?\[\[([^\]\n]+)\]\])/g;
     let match;
     while ((match = wikiRegex.exec(cleaned)) !== null) {
       try {
@@ -335,6 +337,8 @@ export function extractBodyTags(body: string): string[] {
       continue;
     }
     if (inFencedCode) continue;
+    // Skip indented code blocks (4+ spaces or a tab)
+    if (/^(?:\t| {4,})/.test(line)) continue;
 
     // Remove inline code spans before scanning
     const cleaned = removeInlineCode(line);

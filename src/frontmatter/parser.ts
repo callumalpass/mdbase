@@ -66,8 +66,7 @@ function extractFrontmatter(raw: string): { yamlStr: string; body: string } | nu
 /**
  * Parse a markdown file's frontmatter and body.
  */
-export function parseFile(filePath: string): ParsedFile {
-  const rawBuffer = fs.readFileSync(filePath);
+function parseContent(rawBuffer: Buffer): ParsedFile {
   // Validate UTF-8: check for invalid sequences (bytes that don't match UTF-8 patterns)
   if (!isValidUtf8(rawBuffer)) {
     return {
@@ -182,6 +181,13 @@ export function parseFile(filePath: string): ParsedFile {
     raw,
   };
 }
+
+export async function parseFileAsync(filePath: string): Promise<ParsedFile> {
+  const rawBuffer = await fs.promises.readFile(filePath);
+  return parseContent(rawBuffer);
+}
+
+export const parseFile = parseFileAsync;
 
 /**
  * Serialize frontmatter and body back to a markdown string.

@@ -7,14 +7,15 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import picomatch from "picomatch";
 import { ulid } from "ulid";
-import { loadConfig, MdbaseConfig } from "../config/loader.js";
-import { loadTypes, getType, TypeDefinition, FieldDefinition, MatchRules } from "../types/loader.js";
-import { parseFile, serializeFile } from "../frontmatter/parser.js";
+import { loadConfigAsync, MdbaseConfig } from "../config/loader.js";
+import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../types/loader.js";
+import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateWhere, evaluateExpression, ExpressionError } from "../expressions/evaluator.js";
 import { parseLink, extractBodyLinks, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
+import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 
 function toBoolExternal(val: unknown): boolean {
   if (typeof val === "boolean") return val;
@@ -31,6 +32,7 @@ export interface ReadResult {
   rawFrontmatter?: Record<string, unknown>;
   body?: string;
   types?: string[];
+  warnings?: Array<{ code: string; message: string }>;
   error?: { code: string; message: string };
 }
 
@@ -93,10 +95,16 @@ export interface BatchResult {
   error?: { code: string; message: string };
 }
 
+export interface CacheOpResult {
+  success: boolean;
+  error?: { code: string; message: string };
+}
+
 export class Collection {
   private config: MdbaseConfig;
   private typeDefs: Map<string, TypeDefinition>;
   private excludeMatchers: ((str: string) => boolean)[];
+  private cache: CacheStoreAsync | null;
 
   /**
    * Hook called after reading a file but before writing.
@@ -137,26 +145,31 @@ export class Collection {
       }
       return [picomatch(pattern, { dot: true })];
     });
+    this.cache = null;
   }
 
-  static open(collectionRoot: string): { collection?: Collection; error?: { code: string; message: string } } {
-    const configResult = loadConfig(collectionRoot);
+  static async open(collectionRoot: string): Promise<{ collection?: Collection; error?: { code: string; message: string } }> {
+    const configResult = await loadConfigAsync(collectionRoot);
     if (!configResult.valid || !configResult.config) {
       return { error: configResult.error };
     }
 
-    const typesResult = loadTypes(collectionRoot, configResult.config);
+    const typesResult = await loadTypesAsync(collectionRoot, configResult.config);
     if (!typesResult.valid) {
       return { error: typesResult.error };
     }
 
-    return {
-      collection: new Collection(
-        collectionRoot,
-        configResult.config,
-        typesResult.types!,
-      ),
-    };
+    const collection = new Collection(
+      collectionRoot,
+      configResult.config,
+      typesResult.types!,
+    );
+    await collection.initCache();
+    return { collection };
+  }
+
+  private async initCache(): Promise<void> {
+    this.cache = await CacheStoreAsync.open(this.root, this.config.settings.cache_folder);
   }
 
   /**
@@ -187,6 +200,15 @@ export class Collection {
     const ext = path.extname(filePath).slice(1); // remove dot
     if (ext === "md") return true;
     return this.config.settings.extensions.includes(ext);
+  }
+
+  private async fileExists(fullPath: string): Promise<boolean> {
+    try {
+      await fs.promises.access(fullPath);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -382,7 +404,17 @@ export class Collection {
   /**
    * Read a file from the collection.
    */
-  read(relativePath: string): ReadResult {
+  async read(relativePath: string): Promise<ReadResult> {
+    const normalizedPath = relativePath.replace(/\\/g, "/");
+    if (normalizedPath.includes("\0") ||
+        path.isAbsolute(relativePath) ||
+        normalizedPath.startsWith("/") ||
+        normalizedPath.split("/").includes("..")) {
+      return {
+        error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
+      };
+    }
+
     // Check if excluded
     if (this.isExcluded(relativePath)) {
       return {
@@ -405,7 +437,10 @@ export class Collection {
     }
 
     const fullPath = path.join(this.root, relativePath);
-    if (!fs.existsSync(fullPath)) {
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(fullPath);
+    } catch {
       return {
         error: { code: "file_not_found", message: `File not found: ${relativePath}` },
       };
@@ -415,10 +450,13 @@ export class Collection {
     const parts = relativePath.split("/");
     for (let i = 1; i < parts.length; i++) {
       const subdir = path.join(this.root, ...parts.slice(0, i));
-      if (fs.existsSync(path.join(subdir, "mdbase.yaml"))) {
+      try {
+        await fs.promises.access(path.join(subdir, "mdbase.yaml"));
         return {
           error: { code: "file_not_found", message: `File is inside nested collection: ${relativePath}` },
         };
+      } catch {
+        // ok
       }
     }
 
@@ -430,13 +468,25 @@ export class Collection {
     }
 
     let parsed: ReturnType<typeof parseFile>;
-    try {
-      parsed = parseFile(fullPath);
-    } catch (e: unknown) {
-      // YAML parse errors are always errors regardless of validation level
-      return {
-        error: { code: "invalid_frontmatter", message: (e as Error).message },
+    let cached: CachedFile | null = null;
+    if (this.cache) {
+      cached = await this.cache.getFile(relativePath, stat);
+    }
+    if (cached) {
+      parsed = {
+        frontmatter: cached.frontmatter,
+        body: cached.body,
+        raw: "",
       };
+    } else {
+      try {
+        parsed = await parseFileAsync(fullPath);
+      } catch (e: unknown) {
+        // YAML parse errors are always errors regardless of validation level
+        return {
+          error: { code: "invalid_frontmatter", message: (e as Error).message },
+        };
+      }
     }
 
     // Handle parse errors
@@ -447,7 +497,6 @@ export class Collection {
       }
       if (this.config.settings.default_validation === "off") {
         // At "off" level: treat as empty frontmatter, return valid
-        const stat = fs.statSync(fullPath);
         const file = {
           name: path.basename(relativePath),
           folder: path.dirname(relativePath) === "." ? "" : path.dirname(relativePath),
@@ -465,7 +514,6 @@ export class Collection {
       }
       if (this.config.settings.default_validation === "warn") {
         // At "warn" level: treat as empty with warning
-        const stat = fs.statSync(fullPath);
         const file = {
           name: path.basename(relativePath),
           folder: path.dirname(relativePath) === "." ? "" : path.dirname(relativePath),
@@ -520,6 +568,10 @@ export class Collection {
       }
     }
 
+    if (!cached && this.cache) {
+      await this.cache.upsertFile(relativePath, stat, parsed.frontmatter, parsed.body ?? "");
+    }
+
     // Coerce remaining Date objects not handled by type definitions
     for (const [key, value] of Object.entries(frontmatter)) {
       if (value instanceof Date) {
@@ -531,7 +583,6 @@ export class Collection {
     this.evaluateComputedFields(frontmatter, types, relativePath, parsed.body);
 
     // Get file metadata
-    const stat = fs.statSync(fullPath);
     const file = {
       name: path.basename(relativePath),
       folder: path.dirname(relativePath) === "." ? "" : path.dirname(relativePath),
@@ -608,15 +659,15 @@ export class Collection {
   /**
    * Validate a single file or the entire collection.
    */
-  validate(relativePath?: string): ValidateResult {
+  async validate(relativePath?: string): Promise<ValidateResult> {
     if (relativePath) {
-      return this.validateFile(relativePath);
+      return await this.validateFile(relativePath);
     }
-    return this.validateCollection();
+    return await this.validateCollection();
   }
 
-  private validateFile(relativePath: string): ValidateResult {
-    const readResult = this.read(relativePath);
+  private async validateFile(relativePath: string): Promise<ValidateResult> {
+    const readResult = await this.read(relativePath);
     if (readResult.error) {
       return {
         valid: false,
@@ -679,7 +730,7 @@ export class Collection {
     }
 
     // Check link fields: validate_exists, target constraint, ambiguous_link
-    this.validateLinkFields(typeDefs, frontmatter, relativePath, result);
+    await this.validateLinkFields(typeDefs, frontmatter, relativePath, result);
 
     // Check cross-file uniqueness for this file
     const uniqueFields = new Set<string>();
@@ -690,13 +741,13 @@ export class Collection {
       }
     }
     if (uniqueFields.size > 0) {
-      const files = this.scanFiles();
+      const files = await this.scanFiles();
       for (const fieldName of uniqueFields) {
         const myValue = frontmatter[fieldName];
         if (myValue === null || myValue === undefined) continue;
         for (const otherPath of files) {
           if (otherPath === relativePath) continue;
-          const otherResult = this.read(otherPath);
+          const otherResult = await this.read(otherPath);
           if (otherResult.frontmatter) {
             const otherValue = otherResult.frontmatter[fieldName];
             if (otherValue !== null && otherValue !== undefined &&
@@ -719,14 +770,14 @@ export class Collection {
     return result;
   }
 
-  private validateCollection(): ValidateResult {
+  private async validateCollection(): Promise<ValidateResult> {
     const allIssues: MdbaseError[] = [];
     const allFiles = new Map<string, Record<string, unknown>>();
 
     // Scan all files
-    const files = this.scanFiles();
+    const files = await this.scanFiles();
     for (const relativePath of files) {
-      const readResult = this.read(relativePath);
+      const readResult = await this.read(relativePath);
       if (readResult.frontmatter) {
         allFiles.set(relativePath, readResult.frontmatter);
       }
@@ -822,13 +873,13 @@ export class Collection {
   /**
    * Create a new file in the collection.
    */
-  create(input: {
+  async create(input: {
     type?: string;
     types?: string[];
     path?: string;
     frontmatter?: Record<string, unknown>;
     body?: string;
-  }): CreateResult {
+  }): Promise<CreateResult> {
     // Determine types from input parameters or frontmatter
     const typeNames: string[] = [];
     if (input.type) typeNames.push(input.type.toLowerCase());
@@ -881,7 +932,7 @@ export class Collection {
 
     // Check if file already exists
     const fullPath = path.join(this.root, relativePath);
-    if (fs.existsSync(fullPath)) {
+    if (await this.fileExists(fullPath)) {
       return {
         error: { code: "path_conflict", message: `File already exists: ${relativePath}` },
       };
@@ -999,14 +1050,15 @@ export class Collection {
     }
 
     // Check if file appeared concurrently after initial check
-    if (fs.existsSync(fullPath)) {
+    if (await this.fileExists(fullPath)) {
       return {
         error: { code: "path_conflict", message: `File appeared concurrently: ${relativePath}` },
       } as unknown as CreateResult;
     }
 
-    fs.mkdirSync(path.dirname(fullPath), { recursive: true });
-    fs.writeFileSync(fullPath, content);
+    await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
+    await fs.promises.writeFile(fullPath, content);
+    await this.updateCacheForPath(relativePath);
 
     const result: Record<string, unknown> = {
       valid: true,
@@ -1024,24 +1076,24 @@ export class Collection {
   /**
    * Update an existing file in the collection.
    */
-  update(input: {
+  async update(input: {
     path: string;
     fields?: Record<string, unknown>;
     body?: string;
-  }): UpdateResult {
+  }): Promise<UpdateResult> {
     const relativePath = input.path;
     const fullPath = path.join(this.root, relativePath);
 
-    if (!fs.existsSync(fullPath)) {
+    if (!await this.fileExists(fullPath)) {
       return {
         error: { code: "file_not_found", message: `File not found: ${relativePath}` },
       };
     }
 
     // Record mtime for concurrency check
-    const readMtime = fs.statSync(fullPath).mtimeMs;
+    const readMtime = (await fs.promises.stat(fullPath)).mtimeMs;
 
-    const existing = parseFile(fullPath);
+    const existing = await parseFileAsync(fullPath);
     const frontmatter: Record<string, unknown> = { ...existing.frontmatter };
 
     // Apply field updates
@@ -1090,7 +1142,7 @@ export class Collection {
       }
 
       // Check cross-file uniqueness constraints on update
-      const uniqueIssues = this.checkUpdateUniqueness(relativePath, frontmatter, types);
+      const uniqueIssues = await this.checkUpdateUniqueness(relativePath, frontmatter, types);
       if (uniqueIssues.length > 0 && this.config.settings.default_validation === "error") {
         return {
           error: { code: "validation_failed", message: "Uniqueness constraint violated on update" },
@@ -1155,14 +1207,15 @@ export class Collection {
     }
 
     // Concurrency check: verify mtime hasn't changed since read
-    const writeMtime = fs.statSync(fullPath).mtimeMs;
+    const writeMtime = (await fs.promises.stat(fullPath)).mtimeMs;
     if (writeMtime !== readMtime) {
       return {
         error: { code: "concurrent_modification", message: `File "${relativePath}" was modified externally during update` },
       } as unknown as UpdateResult;
     }
 
-    fs.writeFileSync(fullPath, content);
+    await fs.promises.writeFile(fullPath, content);
+    await this.updateCacheForPath(relativePath);
 
     // Evaluate computed fields on the effective frontmatter for the return value
     this.evaluateComputedFields(effectiveFrontmatter, types, relativePath, body);
@@ -1181,19 +1234,19 @@ export class Collection {
   /**
    * Delete a file from the collection.
    */
-  delete(relativePath: string, input?: { check_backlinks?: boolean }): DeleteResult {
+  async delete(relativePath: string, input?: { check_backlinks?: boolean }): Promise<DeleteResult> {
     const fullPath = path.join(this.root, relativePath);
-    if (!fs.existsSync(fullPath)) {
+    if (!await this.fileExists(fullPath)) {
       return {
         error: { code: "file_not_found", message: `File not found: ${relativePath}` },
       };
     }
 
     const checkBacklinks = input?.check_backlinks !== false;
-    const brokenLinks = checkBacklinks ? this.findBacklinks([relativePath]) : [];
+    const brokenLinks = checkBacklinks ? await this.findBacklinks([relativePath]) : [];
 
     // Record mtime for concurrency check
-    const readMtime = fs.statSync(fullPath).mtimeMs;
+    const readMtime = (await fs.promises.stat(fullPath)).mtimeMs;
 
     // Call pre-write hook (for testing concurrent modifications)
     if (this.preWriteHook) {
@@ -1201,14 +1254,17 @@ export class Collection {
     }
 
     // Concurrency check
-    const writeMtime = fs.statSync(fullPath).mtimeMs;
+    const writeMtime = (await fs.promises.stat(fullPath)).mtimeMs;
     if (writeMtime !== readMtime) {
       return {
         error: { code: "concurrent_modification", message: `File "${relativePath}" was modified externally during delete` },
       };
     }
 
-    fs.unlinkSync(fullPath);
+    await fs.promises.unlink(fullPath);
+    if (this.cache) {
+      await this.cache.deleteFile(relativePath);
+    }
     const result: DeleteResult = { valid: true };
     if (checkBacklinks) {
       result.broken_links = brokenLinks.map((entry) => ({ path: entry.referrer }));
@@ -1219,7 +1275,7 @@ export class Collection {
   /**
    * Create a new type definition file.
    */
-  createType(input: {
+  async createType(input: {
     name: string;
     description?: string;
     extends?: string;
@@ -1227,7 +1283,7 @@ export class Collection {
     strict?: boolean | "warn";
     fields?: Record<string, unknown>;
     path_pattern?: string;
-  }): { valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> } {
+  }): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
     const name = input.name.toLowerCase();
 
     // Validate type name
@@ -1251,7 +1307,7 @@ export class Collection {
       };
     }
     const TYPE_NAME_REGEX = /^[a-z][a-z0-9_-]*$/;
-    if (!TYPE_NAME_REGEX.test(name) || name.length >= 64) {
+    if (!TYPE_NAME_REGEX.test(name) || name.length > 64) {
       return {
         valid: false,
         error: {
@@ -1305,10 +1361,10 @@ export class Collection {
 
     // Write the type file
     const typesFolder = path.join(this.root, this.config.settings.types_folder);
-    fs.mkdirSync(typesFolder, { recursive: true });
+    await fs.promises.mkdir(typesFolder, { recursive: true });
     const typeFilePath = path.join(typesFolder, `${name}.md`);
 
-    if (fs.existsSync(typeFilePath)) {
+    if (await this.fileExists(typeFilePath)) {
       return {
         valid: false,
         error: {
@@ -1319,7 +1375,8 @@ export class Collection {
     }
 
     const content = serializeFile(typeFrontmatter, "", "omit", true);
-    fs.writeFileSync(typeFilePath, content);
+    await fs.promises.mkdir(typesFolder, { recursive: true });
+    await fs.promises.writeFile(typeFilePath, content);
 
     return {
       valid: true,
@@ -1335,21 +1392,21 @@ export class Collection {
   /**
    * Rename/move a file in the collection, optionally updating references.
    */
-  rename(input: {
+  async rename(input: {
     from: string;
     to: string;
     update_refs?: boolean;
-  }): Record<string, unknown> {
+  }): Promise<Record<string, unknown>> {
     const fromPath = path.join(this.root, input.from);
     const toPath = path.join(this.root, input.to);
 
-    if (!fs.existsSync(fromPath)) {
+    if (!await this.fileExists(fromPath)) {
       return {
         error: { code: "file_not_found", message: `Source not found: ${input.from}` },
       };
     }
 
-    if (fs.existsSync(toPath)) {
+    if (await this.fileExists(toPath)) {
       return {
         error: { code: "path_conflict", message: `Target exists: ${input.to}` },
       };
@@ -1363,7 +1420,7 @@ export class Collection {
     }
 
     // Record mtime for concurrency check
-    const readMtime = fs.statSync(fromPath).mtimeMs;
+    const readMtime = (await fs.promises.stat(fromPath)).mtimeMs;
 
     // Call pre-write hook (for testing concurrent modifications)
     if (this.preWriteHook) {
@@ -1371,7 +1428,7 @@ export class Collection {
     }
 
     // Concurrency check: source file modified?
-    const writeMtime = fs.statSync(fromPath).mtimeMs;
+    const writeMtime = (await fs.promises.stat(fromPath)).mtimeMs;
     if (writeMtime !== readMtime) {
       return {
         error: { code: "concurrent_modification", message: `Source file "${input.from}" was modified externally during rename` },
@@ -1379,14 +1436,18 @@ export class Collection {
     }
 
     // Check if target appeared concurrently
-    if (fs.existsSync(toPath)) {
+    if (await this.fileExists(toPath)) {
       return {
         error: { code: "path_conflict", message: `Target appeared concurrently: ${input.to}` },
       };
     }
 
-    fs.mkdirSync(path.dirname(toPath), { recursive: true });
-    fs.renameSync(fromPath, toPath);
+    await fs.promises.mkdir(path.dirname(toPath), { recursive: true });
+    await fs.promises.rename(fromPath, toPath);
+    if (this.cache) {
+      await this.cache.deleteFile(input.from);
+      await this.updateCacheForPath(input.to);
+    }
 
     // Determine if we should update references
     const shouldUpdateRefs = input.update_refs !== undefined
@@ -1398,17 +1459,20 @@ export class Collection {
     }
 
     // Update references across the collection
-    return this.updateReferencesAfterRename(input.from, input.to);
+    return await this.updateReferencesAfterRename(input.from, input.to);
   }
 
   /**
    * After a file has been renamed, find and update all references to it.
    */
-  private updateReferencesAfterRename(
+  private async updateReferencesAfterRename(
     oldPath: string,
     newPath: string,
-  ): Record<string, unknown> {
-    const files = this.scanFiles();
+  ): Promise<Record<string, unknown>> {
+    const files = await this.scanFiles();
+    const fileCache = await this.buildFileCache(files);
+    const allFiles = await this.scanAllFiles();
+    const nonMdSet = this.buildNonMarkdownSet(allFiles);
     const referencesUpdated: Array<{ path: string; field?: string; location?: string }> = [];
     const warnings: Array<{ path: string; message_contains?: string; message?: string }> = [];
     const partialFailures: Array<{ path: string; reason: string }> = [];
@@ -1424,8 +1488,8 @@ export class Collection {
     const idField = this.config.settings.id_field;
     let renamedFileId: string | undefined;
     if (idField) {
-      const readResult = this.read(newPath);
-      if (!readResult.error && readResult.frontmatter) {
+      const readResult = fileCache.get(newPath);
+      if (readResult && !readResult.error && readResult.frontmatter) {
         const idVal = readResult.frontmatter[idField];
         if (typeof idVal === "string") {
           renamedFileId = idVal;
@@ -1435,8 +1499,8 @@ export class Collection {
 
     for (const filePath of files) {
       const fullPath = path.join(this.root, filePath);
-      const readResult = this.read(filePath);
-      if (readResult.error) continue;
+      const readResult = fileCache.get(filePath);
+      if (!readResult || readResult.error) continue;
       const frontmatter = readResult.frontmatter ?? {};
       const types = readResult.types ?? [];
       const body = readResult.body ?? "";
@@ -1462,7 +1526,7 @@ export class Collection {
             if (fieldTarget && renamedFileId && this.config.settings.id_field_explicit && this.isIdStableLink(value, renamedFileId)) {
               continue;
             }
-            const result = this.updateLinkValue(value, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
+            const result = this.updateLinkValue(value, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
             if (result.warning) {
               warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
             } else if (result.updated && result.newValue !== value) {
@@ -1481,7 +1545,7 @@ export class Collection {
               if (itemTarget && renamedFileId && this.config.settings.id_field_explicit && this.isIdStableLink(item, renamedFileId)) {
                 continue;
               }
-              const result = this.updateLinkValue(item, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
+              const result = this.updateLinkValue(item, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
               if (result.warning) {
                 warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
               } else if (result.updated && result.newValue !== item) {
@@ -1499,7 +1563,7 @@ export class Collection {
       }
 
       // Check body links
-      const newBody = this.updateBodyLinks(body, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId);
+      const newBody = this.updateBodyLinks(body, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
       if (newBody !== body) {
         bodyUpdated = true;
       }
@@ -1507,7 +1571,7 @@ export class Collection {
       // Write updates if needed
       if (fmUpdated || bodyUpdated) {
         // Record mtime before potential hook
-        const beforeHookMtime = fs.statSync(fullPath).mtimeMs;
+        const beforeHookMtime = (await fs.promises.stat(fullPath)).mtimeMs;
 
         // Call pre-ref-update hook (for concurrent modification simulation)
         if (this.preRefUpdateHook) {
@@ -1515,7 +1579,7 @@ export class Collection {
         }
 
         // Concurrency check on referring file
-        const currentMtime = fs.statSync(fullPath).mtimeMs;
+        const currentMtime = (await fs.promises.stat(fullPath)).mtimeMs;
         if (currentMtime !== beforeHookMtime) {
           // File was modified externally during ref update
           partialFailures.push({ path: filePath, reason: "concurrent_modification" });
@@ -1530,7 +1594,8 @@ export class Collection {
             this.config.settings.write_nulls,
             this.config.settings.write_empty_lists,
           );
-          fs.writeFileSync(fullPath, updatedContent);
+          await fs.promises.writeFile(fullPath, updatedContent);
+          await this.updateCacheForPath(filePath);
 
           for (const field of fmUpdatedFields) {
             referencesUpdated.push({ path: filePath, field });
@@ -1597,6 +1662,9 @@ export class Collection {
     newNoExt: string,
     fromFile: string,
     renamedFileId?: string,
+    knownFiles?: string[],
+    knownFileCache?: Map<string, ReadResult>,
+    nonMarkdownFiles?: Set<string>,
   ): { updated: boolean; newValue: string; warning?: string } {
     let parsed: ParsedLink;
     try {
@@ -1606,7 +1674,7 @@ export class Collection {
     }
 
     // Determine if this link references the old path
-    const resolution = this.resolveLinkFull(linkValue, fromFile);
+    const resolution = this.resolveLinkFullWithFiles(linkValue, fromFile, knownFiles ?? [], undefined, knownFileCache, nonMarkdownFiles);
 
     // Check if the link references the old path
     const target = parsed.target;
@@ -1646,7 +1714,7 @@ export class Collection {
     // Check if the link is ambiguous because other files also match the same simple name
     // (the original link was ambiguous before the rename)
     if (parsed.format === "wikilink" && !target.includes("/") && !target.startsWith("./") && !target.startsWith("../")) {
-      const files = this.scanFiles();
+      const files = knownFiles ?? [];
       const matchingFiles = files.filter((f) => {
         const base = path.basename(f, path.extname(f));
         return base === normalizedTarget && f !== newPath;
@@ -1765,6 +1833,9 @@ export class Collection {
     newNoExt: string,
     fromFile: string,
     renamedFileId?: string,
+    knownFiles?: string[],
+    knownFileCache?: Map<string, ReadResult>,
+    nonMarkdownFiles?: Set<string>,
   ): string {
     if (!body) return body;
 
@@ -1783,6 +1854,10 @@ export class Collection {
         result.push(line);
         continue;
       }
+      if (/^(?:\t| {4,})/.test(line)) {
+        result.push(line);
+        continue;
+      }
 
       // Process line: find inline code spans and protect them
       let processed = "";
@@ -1796,7 +1871,7 @@ export class Collection {
       }
 
       // Process wikilinks and markdown links outside code spans
-      const linkRegex = /(!?\[\[([^\]\n]+)\]\])|(!?\[([^\]]*)\]\(([^)]+)\))/g;
+      const linkRegex = /(?<!\\)(!?\[\[([^\]\n]+)\]\])|(!?\[([^\]]*)\]\(([^)]+)\))/g;
       let linkMatch;
       let lastEnd = 0;
 
@@ -1811,7 +1886,7 @@ export class Collection {
         // Determine what kind of link this is and try to update it
         const raw = linkMatch[0];
         const updateResult = this.updateLinkValue(
-          raw, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, fromFile, renamedFileId,
+          raw, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, fromFile, renamedFileId, knownFiles, knownFileCache, nonMarkdownFiles,
         );
 
         if (updateResult.updated && updateResult.newValue !== raw) {
@@ -1834,7 +1909,7 @@ export class Collection {
   /**
    * Query the collection.
    */
-  query(input: {
+  async query(input: {
     types?: string[];
     where?: string | Record<string, unknown>;
     order_by?: Array<{ field: string; direction?: string }>;
@@ -1844,11 +1919,11 @@ export class Collection {
     include_body?: boolean;
     context_file?: string;
     formulas?: Record<string, string>;
-  }): QueryResult & { error?: { code: string; message: string } } {
+  }): Promise<QueryResult & { error?: { code: string; message: string } }> {
     // Build thisContext if context_file is provided
     let thisContext: { frontmatter: Record<string, unknown>; path: string; file?: Record<string, unknown> } | undefined;
     if (input.context_file) {
-      const ctxResult = this.read(input.context_file);
+      const ctxResult = await this.read(input.context_file);
       if (!ctxResult.error && ctxResult.frontmatter) {
         thisContext = {
           frontmatter: ctxResult.frontmatter,
@@ -1858,7 +1933,16 @@ export class Collection {
       }
     }
 
-    const files = this.scanFiles();
+    const files = await this.scanFiles();
+    const allFiles = await this.scanAllFiles();
+    const nonMdSet = this.buildNonMarkdownSet(allFiles);
+    const fileCache = new Map<string, ReadResult>();
+    for (const relativePath of files) {
+      const readResult = await this.read(relativePath);
+      if (!readResult.error) {
+        fileCache.set(relativePath, readResult);
+      }
+    }
     let results: Array<{
       path: string;
       frontmatter: Record<string, unknown>;
@@ -1868,8 +1952,64 @@ export class Collection {
       formulas?: Record<string, unknown>;
     }> = [];
 
+    const backlinksCache = new Map<string, BacklinkEntry[]>();
+    const computeBacklinks = (targetPath: string): BacklinkEntry[] => {
+      const existing = backlinksCache.get(targetPath);
+      if (existing) return existing;
+      const backlinks: BacklinkEntry[] = [];
+      const seenSources = new Set<string>();
+      for (const [sourcePath, sourceRead] of fileCache) {
+        if (sourcePath === targetPath) continue;
+        const frontmatter = sourceRead.frontmatter ?? {};
+        const types = sourceRead.types ?? [];
+        const body = sourceRead.body ?? "";
+
+        const allLinkValues: string[] = [];
+        for (const typeName of types) {
+          const typeDef = this.typeDefs.get(typeName);
+          if (!typeDef?.fields) continue;
+          for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+            const value = frontmatter[fieldName];
+            if (value === null || value === undefined) continue;
+            if (fieldDef.type === "link" && typeof value === "string") {
+              allLinkValues.push(value);
+            } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
+              for (const item of value) {
+                if (typeof item === "string") allLinkValues.push(item);
+              }
+            }
+          }
+        }
+        const bodyLinks = extractBodyLinks(body);
+        for (const bl of bodyLinks) {
+          allLinkValues.push(bl.raw);
+        }
+
+        for (const linkValue of allLinkValues) {
+          if (seenSources.has(sourcePath)) break;
+          const resolution = this.resolveLinkFullWithFiles(linkValue, sourcePath, files, undefined, fileCache, nonMdSet);
+          if (resolution.resolved === targetPath) {
+            seenSources.add(sourcePath);
+            const name = sourcePath.split("/").pop() ?? "";
+            backlinks.push({
+              file: {
+                path: sourcePath,
+                name,
+                basename: name.replace(/\.[^.]+$/, ""),
+                folder: path.dirname(sourcePath) === "." ? "" : path.dirname(sourcePath),
+                extension: path.extname(sourcePath).slice(1),
+              },
+            });
+          }
+        }
+      }
+      backlinksCache.set(targetPath, backlinks);
+      return backlinks;
+    };
+
     for (const relativePath of files) {
-      const readResult = this.read(relativePath);
+      const readResult = fileCache.get(relativePath);
+      if (!readResult) continue;
       if (readResult.error) continue;
 
       const fileTypes = readResult.types ?? [];
@@ -1960,9 +2100,16 @@ export class Collection {
         if (typeof input.where === "string") {
           const fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
           const resolveFile = (linkTarget: string) => {
-            return this.resolveLink(linkTarget, relativePath, files);
+            const resolution = this.resolveLinkFullWithFiles(linkTarget, relativePath, files, undefined, fileCache, nonMdSet);
+            if (!resolution.resolved) return null;
+            const target = fileCache.get(resolution.resolved);
+            if (!target || target.error) return null;
+            return {
+              frontmatter: target.frontmatter ?? {},
+              path: resolution.resolved,
+              types: target.types ?? [],
+            };
           };
-          const computeBacklinks = (fp: string) => this.computeBacklinksForFile(fp);
           const ctx = {
             frontmatter: { ...frontmatterWithFormulas, formula: formulaValues ?? {} },
             rawFrontmatter: readResult.rawFrontmatter,
@@ -2009,6 +2156,7 @@ export class Collection {
       const fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
       results.push({
         path: relativePath,
+        ...(readResult.frontmatter ?? {}),
         frontmatter: readResult.frontmatter ?? {},
         types: fileTypes,
         body: readResult.body,
@@ -2046,7 +2194,7 @@ export class Collection {
             if (prop === "path") { va = a.path; vb = b.path; }
             else if (prop.includes(".")) {
               // Complex file property like file.embeds.length — evaluate as expression
-              const backlinksCb = (fp: string) => this.computeBacklinksForFile(fp);
+              const backlinksCb = (fp: string) => computeBacklinks(fp);
               try {
                 va = evaluateExpression(field, {
                   frontmatter: a.frontmatter, path: a.path, types: a.types,
@@ -2220,19 +2368,19 @@ export class Collection {
    * Check uniqueness constraints when updating a file.
    * Returns issues for any violations.
    */
-  private checkUpdateUniqueness(
+  private async checkUpdateUniqueness(
     updatingPath: string,
     frontmatter: Record<string, unknown>,
     types: string[],
-  ): MdbaseError[] {
+  ): Promise<MdbaseError[]> {
     const issues: MdbaseError[] = [];
-    const files = this.scanFiles();
+    const files = await this.scanFiles();
 
     // Collect all file frontmatter except the updating file
     const otherFiles = new Map<string, Record<string, unknown>>();
     for (const relativePath of files) {
       if (relativePath === updatingPath) continue;
-      const readResult = this.read(relativePath);
+      const readResult = await this.read(relativePath);
       if (readResult.frontmatter) {
         otherFiles.set(relativePath, readResult.frontmatter);
       }
@@ -2289,18 +2437,19 @@ export class Collection {
   /**
    * Batch delete: delete all files matching a where expression.
    */
-  batchDelete(input: {
+  async batchDelete(input: {
     where: string;
     dry_run?: boolean;
     check_backlinks?: boolean;
-  }): BatchResult {
+  }): Promise<BatchResult> {
     // Find matching files
-    const files = this.scanFiles();
+    const files = await this.scanFiles();
+    const fileCache = await this.buildFileCache(files);
     const matchingPaths: string[] = [];
 
     for (const relativePath of files) {
-      const readResult = this.read(relativePath);
-      if (readResult.error) continue;
+      const readResult = fileCache.get(relativePath);
+      if (!readResult || readResult.error) continue;
       const ctx = {
         frontmatter: readResult.frontmatter ?? {},
         path: relativePath,
@@ -2324,7 +2473,7 @@ export class Collection {
     }
 
     const checkBacklinks = input.check_backlinks !== false;
-    const brokenLinks = checkBacklinks ? this.findBacklinks(matchingPaths) : [];
+    const brokenLinks = checkBacklinks ? await this.findBacklinks(matchingPaths) : [];
 
     // Dry run: return what would be deleted without actually deleting
     if (input.dry_run) {
@@ -2357,7 +2506,10 @@ export class Collection {
       }
       try {
         const fullPath = path.join(this.root, relativePath);
-        fs.unlinkSync(fullPath);
+        await fs.promises.unlink(fullPath);
+        if (this.cache) {
+          await this.cache.deleteFile(relativePath);
+        }
         succeeded++;
         details.push({ path: relativePath, status: "success" });
       } catch {
@@ -2383,15 +2535,15 @@ export class Collection {
    *   1. where + fields: update all matching files with the same fields
    *   2. updates[]: array of {path, fields} for per-file updates
    */
-  batchUpdate(input: {
+  async batchUpdate(input: {
     where?: string;
     fields?: Record<string, unknown>;
     updates?: Array<{ path: string; fields: Record<string, unknown> }>;
     dry_run?: boolean;
-  }): BatchResult {
+  }): Promise<BatchResult> {
     // Mode 1: updates array (pre-validation all-or-nothing)
     if (input.updates) {
-      return this.batchUpdateByList(input.updates, input.dry_run);
+      return await this.batchUpdateByList(input.updates, input.dry_run);
     }
 
     // Mode 2: where + fields
@@ -2403,11 +2555,11 @@ export class Collection {
     }
 
     // Find matching files
-    const files = this.scanFiles();
+    const files = await this.scanFiles();
     const matchingPaths: string[] = [];
 
     for (const relativePath of files) {
-      const readResult = this.read(relativePath);
+      const readResult = await this.read(relativePath);
       if (readResult.error) continue;
       const ctx = {
         frontmatter: readResult.frontmatter ?? {},
@@ -2429,7 +2581,7 @@ export class Collection {
     // Pre-validate all files when validation is "error"
     if (this.config.settings.default_validation === "error") {
       for (const relativePath of matchingPaths) {
-        const existing = parseFile(path.join(this.root, relativePath));
+        const existing = await parseFileAsync(path.join(this.root, relativePath));
         const merged = { ...existing.frontmatter, ...input.fields };
         const types = this.getFileTypes(merged);
         const typeDefs = types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
@@ -2482,7 +2634,7 @@ export class Collection {
       // Check if this file depends on a failed file (skip_dependents)
       if (this.skipDependents && failedPaths.size > 0) {
         const fullPath = path.join(this.root, relativePath);
-        const parsed = parseFile(fullPath);
+        const parsed = await parseFileAsync(fullPath);
         const typeNames = this.getTypesForFile(relativePath, parsed.frontmatter);
         let dependsOnFailed = false;
         // Collect title→path mappings from failed files for link resolution
@@ -2490,7 +2642,7 @@ export class Collection {
         for (const fp of failedPaths) {
           const fpFull = path.join(this.root, fp);
           try {
-            const fpParsed = parseFile(fpFull);
+            const fpParsed = await parseFileAsync(fpFull);
             if (fpParsed.frontmatter.title) {
               failedTitles.set(String(fpParsed.frontmatter.title), fp);
             }
@@ -2513,9 +2665,8 @@ export class Collection {
               // Also try full link resolution
               if (!dependsOnFailed) {
                 try {
-                  const allFiles = this.scanFiles();
-                  const resolved = this.resolveLinkFull(linkVal, relativePath, allFiles);
-                  if (resolved && failedPaths.has(resolved)) {
+                  const resolved = this.resolveLinkFullWithFiles(linkVal, relativePath, files, undefined, fileCache, nonMdSet);
+                  if (resolved.resolved && failedPaths.has(resolved.resolved)) {
                     dependsOnFailed = true;
                   }
                 } catch { /* skip */ }
@@ -2540,7 +2691,7 @@ export class Collection {
         continue;
       }
       try {
-        const result = this.update({
+        const result = await this.update({
           path: relativePath,
           fields: input.fields,
         });
@@ -2573,21 +2724,21 @@ export class Collection {
   /**
    * Batch update by explicit list of file updates. All-or-nothing validation.
    */
-  private batchUpdateByList(
+  private async batchUpdateByList(
     updates: Array<{ path: string; fields: Record<string, unknown> }>,
     dryRun?: boolean,
-  ): BatchResult {
+  ): Promise<BatchResult> {
     // Pre-validate all files when validation is "error"
     if (this.config.settings.default_validation === "error") {
       for (const upd of updates) {
         const fullPath = path.join(this.root, upd.path);
-        if (!fs.existsSync(fullPath)) {
+        if (!await this.fileExists(fullPath)) {
           return {
             batch_result: { total: updates.length, succeeded: 0, failed: updates.length, details: [] },
             error: { code: "file_not_found", message: `File not found: ${upd.path}` },
           };
         }
-        const existing = parseFile(fullPath);
+        const existing = await parseFileAsync(fullPath);
         const merged = { ...existing.frontmatter, ...upd.fields };
         const types = this.getFileTypes(merged);
         const typeDefs = types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
@@ -2634,7 +2785,7 @@ export class Collection {
 
     for (const upd of updates) {
       try {
-        const result = this.update({ path: upd.path, fields: upd.fields });
+        const result = await this.update({ path: upd.path, fields: upd.fields });
         if (result.error) {
           failed++;
           details.push({ path: upd.path, status: "failed", error: result.error });
@@ -2656,6 +2807,38 @@ export class Collection {
         details,
       },
     };
+  }
+
+  /**
+   * Rebuild cache from disk.
+   */
+  async cacheRebuild(): Promise<CacheOpResult> {
+    if (!this.cache) {
+      return { success: false, error: { code: "cache_unavailable", message: "Cache store is unavailable" } };
+    }
+    const cacheRoot = this.config.settings.cache_folder;
+    await this.cache.clear();
+    this.cache = await CacheStoreAsync.open(this.root, cacheRoot);
+    if (!this.cache) {
+      return { success: false, error: { code: "cache_unavailable", message: "Cache store is unavailable" } };
+    }
+    const files = await this.scanFiles();
+    for (const relativePath of files) {
+      await this.updateCacheForPath(relativePath);
+    }
+    return { success: true };
+  }
+
+  /**
+   * Clear cache from disk.
+   */
+  async cacheClear(): Promise<CacheOpResult> {
+    if (!this.cache) {
+      return { success: true };
+    }
+    await this.cache.clear();
+    this.cache = null;
+    return { success: true };
   }
 
   private generateValue(
@@ -2696,35 +2879,35 @@ export class Collection {
   /**
    * Validate link fields in frontmatter: validate_exists, target constraint, ambiguous_link.
    */
-  private validateLinkFields(
+  private async validateLinkFields(
     typeDefs: TypeDefinition[],
     frontmatter: Record<string, unknown>,
     relativePath: string,
     result: { valid: boolean; issues: MdbaseError[] },
-  ): void {
+  ): Promise<void> {
     for (const typeDef of typeDefs) {
       if (!typeDef.fields) continue;
       for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
         if (fieldDef.type === "link") {
-          this.validateSingleLink(fieldName, fieldDef, frontmatter[fieldName], relativePath, result);
+          await this.validateSingleLink(fieldName, fieldDef, frontmatter[fieldName], relativePath, result);
         } else if (fieldDef.type === "list" && fieldDef.items?.type === "link") {
           const value = frontmatter[fieldName];
           if (!Array.isArray(value)) continue;
           for (const item of value) {
-            this.validateSingleLink(fieldName, fieldDef.items, item, relativePath, result);
+            await this.validateSingleLink(fieldName, fieldDef.items, item, relativePath, result);
           }
         }
       }
     }
   }
 
-  private validateSingleLink(
+  private async validateSingleLink(
     fieldName: string,
     fieldDef: FieldDefinition,
     value: unknown,
     fromPath: string,
     result: { valid: boolean; issues: MdbaseError[] },
-  ): void {
+  ): Promise<void> {
     if (value === null || value === undefined) return;
     if (typeof value !== "string") return; // type_mismatch handled by validator
 
@@ -2785,7 +2968,7 @@ export class Collection {
     if (!validateExists && !targetConstraint) return;
 
     // Resolve the link
-    const resolution = this.resolveLinkFull(value, fromPath, targetConstraint);
+    const resolution = await this.resolveLinkFull(value, fromPath, targetConstraint);
 
     if (resolution.ambiguous) {
       result.issues.push({
@@ -2831,10 +3014,25 @@ export class Collection {
    * - Filename matching with tiebreakers
    * - Target type constraint
    */
-  private resolveLinkFull(
+  private async resolveLinkFull(
     linkValue: string,
     fromPath: string,
     targetType?: string,
+  ): Promise<{ resolved: string | null; ambiguous?: boolean; wrongType?: boolean }> {
+    const files = await this.scanFiles();
+    const fileCache = await this.buildFileCache(files);
+    const allFiles = await this.scanAllFiles();
+    const nonMdSet = this.buildNonMarkdownSet(allFiles);
+    return this.resolveLinkFullWithFiles(linkValue, fromPath, files, targetType, fileCache, nonMdSet);
+  }
+
+  private resolveLinkFullWithFiles(
+    linkValue: string,
+    fromPath: string,
+    files: string[],
+    targetType?: string,
+    fileCache?: Map<string, ReadResult>,
+    nonMarkdownFiles?: Set<string>,
   ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
     // Parse the link to get the target
     let parsed: ParsedLink | null;
@@ -2845,10 +3043,9 @@ export class Collection {
     }
 
     const target = parsed ? parsed.target : linkValue;
-    const format = parsed ? parsed.format : "path";
+    const format = parsed ? parsed.format : "wikilink";
     const isRelative = parsed ? parsed.is_relative : false;
 
-    const files = this.scanFiles();
     const fromDir = path.dirname(fromPath);
 
     // Strip anchor from target for resolution
@@ -2857,9 +3054,7 @@ export class Collection {
     // Helper to check if a file exists (markdown files in scan list, or any file on disk)
     const fileExists = (p: string): boolean => {
       if (files.includes(p)) return true;
-      // Check on disk for non-markdown files
-      const fullPath = path.join(this.root, p);
-      try { return fs.statSync(fullPath).isFile(); } catch { return false; }
+      return nonMarkdownFiles ? nonMarkdownFiles.has(p) : false;
     };
 
     // Step 1: Path-based resolution
@@ -2879,12 +3074,12 @@ export class Collection {
 
       // Check if file exists
       if (fileExists(resolved)) {
-        return this.checkTargetType(resolved, targetType);
+        return this.checkTargetType(resolved, targetType, fileCache);
       }
       // Try with extensions
       for (const ext of this.getExtensions()) {
         if (fileExists(resolved + ext)) {
-          return this.checkTargetType(resolved + ext, targetType);
+          return this.checkTargetType(resolved + ext, targetType, fileCache);
         }
       }
       return { resolved: null };
@@ -2897,11 +3092,11 @@ export class Collection {
         let resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
         resolved = resolved.replace(/\\/g, "/");
         if (fileExists(resolved)) {
-          return this.checkTargetType(resolved, targetType);
+          return this.checkTargetType(resolved, targetType, fileCache);
         }
         for (const ext of this.getExtensions()) {
           if (files.includes(resolved + ext)) {
-            return this.checkTargetType(resolved + ext, targetType);
+            return this.checkTargetType(resolved + ext, targetType, fileCache);
           }
         }
         return { resolved: null };
@@ -2911,11 +3106,11 @@ export class Collection {
       if (resolveTarget.startsWith("/")) {
         const resolved = resolveTarget.slice(1);
         if (fileExists(resolved)) {
-          return this.checkTargetType(resolved, targetType);
+          return this.checkTargetType(resolved, targetType, fileCache);
         }
         for (const ext of this.getExtensions()) {
           if (files.includes(resolved + ext)) {
-            return this.checkTargetType(resolved + ext, targetType);
+            return this.checkTargetType(resolved + ext, targetType, fileCache);
           }
         }
         return { resolved: null };
@@ -2924,22 +3119,22 @@ export class Collection {
       // Contains slash (absolute from root)
       if (resolveTarget.includes("/")) {
         if (fileExists(resolveTarget)) {
-          return this.checkTargetType(resolveTarget, targetType);
+          return this.checkTargetType(resolveTarget, targetType, fileCache);
         }
         for (const ext of this.getExtensions()) {
           if (fileExists(resolveTarget + ext)) {
-            return this.checkTargetType(resolveTarget + ext, targetType);
+            return this.checkTargetType(resolveTarget + ext, targetType, fileCache);
           }
         }
         return { resolved: null };
       }
 
       // Simple name resolution
-      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType);
+      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache);
     }
 
     // Fallback: try as simple name
-    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType);
+    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache);
   }
 
   /**
@@ -2950,6 +3145,7 @@ export class Collection {
     fromPath: string,
     files: string[],
     targetType?: string,
+    fileCache?: Map<string, ReadResult>,
   ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
     const fromDir = path.dirname(fromPath);
 
@@ -2957,8 +3153,8 @@ export class Collection {
     let scopeFiles = files;
     if (targetType) {
       scopeFiles = files.filter((f) => {
-        const readResult = this.read(f);
-        if (!readResult.types) return false;
+        const readResult = fileCache?.get(f);
+        if (!readResult?.types) return false;
         return readResult.types.includes(targetType);
       });
     }
@@ -2968,8 +3164,8 @@ export class Collection {
     const idMatches: string[] = [];
     if (idField) {
       for (const filePath of scopeFiles) {
-        const readResult = this.read(filePath);
-        if (!readResult.frontmatter) continue;
+        const readResult = fileCache?.get(filePath);
+        if (!readResult?.frontmatter) continue;
         const idValue = readResult.frontmatter[idField];
         if (idValue !== null && idValue !== undefined && String(idValue) === name) {
           idMatches.push(filePath);
@@ -2978,7 +3174,7 @@ export class Collection {
     }
 
     if (idMatches.length === 1) {
-      return this.checkTargetType(idMatches[0], targetType);
+      return this.checkTargetType(idMatches[0], targetType, fileCache);
     }
     if (idMatches.length > 1) {
       return { resolved: null, ambiguous: true };
@@ -3007,8 +3203,8 @@ export class Collection {
         // Also check ID match outside scope
         if (idField) {
           for (const filePath of allFiles) {
-            const readResult = this.read(filePath);
-            if (!readResult.frontmatter) continue;
+            const readResult = fileCache?.get(filePath);
+            if (!readResult?.frontmatter) continue;
             const idValue = readResult.frontmatter[idField];
             if (idValue !== null && idValue !== undefined && String(idValue) === name) {
               return { resolved: null, wrongType: true };
@@ -3020,7 +3216,7 @@ export class Collection {
     }
 
     if (filenameMatches.length === 1) {
-      return this.checkTargetType(filenameMatches[0], targetType);
+      return this.checkTargetType(filenameMatches[0], targetType, fileCache);
     }
 
     // Apply tiebreakers
@@ -3044,10 +3240,10 @@ export class Collection {
     const shortestPaths = sorted.filter((f) => f.split("/").length === shortestDepth);
     if (shortestPaths.length > 1) {
       // Alphabetical tiebreaker
-      return this.checkTargetType(shortestPaths.sort()[0], targetType);
+      return this.checkTargetType(shortestPaths.sort()[0], targetType, fileCache);
     }
 
-    return this.checkTargetType(sorted[0], targetType);
+    return this.checkTargetType(sorted[0], targetType, fileCache);
   }
 
   /**
@@ -3056,13 +3252,14 @@ export class Collection {
   private checkTargetType(
     resolvedPath: string,
     targetType?: string,
+    fileCache?: Map<string, ReadResult>,
   ): { resolved: string; wrongType?: boolean } {
     if (!targetType) {
       return { resolved: resolvedPath };
     }
 
-    const readResult = this.read(resolvedPath);
-    if (!readResult.types || !readResult.types.includes(targetType)) {
+    const readResult = fileCache?.get(resolvedPath);
+    if (!readResult?.types || !readResult.types.includes(targetType)) {
       return { resolved: resolvedPath, wrongType: true };
     }
     return { resolved: resolvedPath };
@@ -3082,8 +3279,8 @@ export class Collection {
    * Check if a link target exists in the collection.
    * Searches for files matching the target by filename (without extension) or by path.
    */
-  private linkTargetExists(target: string, fromPath: string): boolean {
-    const resolution = this.resolveLinkFull(target, fromPath);
+  private async linkTargetExists(target: string, fromPath: string): Promise<boolean> {
+    const resolution = await this.resolveLinkFull(target, fromPath);
     return resolution.resolved !== null;
   }
 
@@ -3131,16 +3328,16 @@ export class Collection {
     return targets;
   }
 
-  private findBacklinks(targetPaths: string[]): Array<{ target: string; referrer: string }> {
+  private async findBacklinks(targetPaths: string[]): Promise<Array<{ target: string; referrer: string }>> {
     if (targetPaths.length === 0) return [];
     const targetSet = new Set(targetPaths);
     const results: Array<{ target: string; referrer: string }> = [];
     const seen = new Set<string>();
 
-    const files = this.scanFiles();
+    const files = await this.scanFiles();
     for (const relativePath of files) {
       if (targetSet.has(relativePath)) continue;
-      const readResult = this.read(relativePath);
+      const readResult = await this.read(relativePath);
       if (readResult.error) continue;
       const frontmatter = readResult.frontmatter ?? {};
       const types = readResult.types ?? [];
@@ -3173,13 +3370,13 @@ export class Collection {
    * Scans all files in the collection for links (frontmatter, body, embeds) that resolve to targetPath.
    * Returns one entry per source file (deduplicated).
    */
-  computeBacklinksForFile(targetPath: string): BacklinkEntry[] {
-    const files = this.scanFiles();
+  async computeBacklinksForFile(targetPath: string): Promise<BacklinkEntry[]> {
+    const files = await this.scanFiles();
     const seenSources = new Set<string>();
     const backlinks: BacklinkEntry[] = [];
 
     for (const sourcePath of files) {
-      const readResult = this.read(sourcePath);
+      const readResult = await this.read(sourcePath);
       if (readResult.error) continue;
       const frontmatter = readResult.frontmatter ?? {};
       const types = readResult.types ?? [];
@@ -3215,7 +3412,7 @@ export class Collection {
       for (const linkValue of allLinkValues) {
         if (seenSources.has(sourcePath)) break;
         try {
-          const resolution = this.resolveLinkFull(linkValue, sourcePath);
+          const resolution = await this.resolveLinkFull(linkValue, sourcePath);
           if (resolution.resolved === targetPath) {
             seenSources.add(sourcePath);
             const name = sourcePath.split("/").pop() ?? "";
@@ -3242,11 +3439,11 @@ export class Collection {
    * Resolve a link target to a file in the collection.
    * Tries: exact path, path + .md, basename match, basename + .md.
    */
-  private resolveLink(
+  private async resolveLink(
     linkTarget: string,
     fromPath: string,
     _knownFiles: string[],
-  ): { frontmatter: Record<string, unknown>; path: string; types: string[] } | null {
+  ): Promise<{ frontmatter: Record<string, unknown>; path: string; types: string[] } | null> {
     // Use the full link resolution system
     // Wrap as wikilink if not already a link format
     let linkValue = linkTarget;
@@ -3255,9 +3452,9 @@ export class Collection {
         !linkTarget.startsWith("/") && !linkTarget.includes("/")) {
       linkValue = `[[${linkTarget}]]`;
     }
-    const resolution = this.resolveLinkFull(linkValue, fromPath);
+    const resolution = await this.resolveLinkFull(linkValue, fromPath);
     if (!resolution.resolved) return null;
-    const result = this.read(resolution.resolved);
+    const result = await this.read(resolution.resolved);
     if (result.error) return null;
     return {
       frontmatter: result.frontmatter ?? {},
@@ -3266,14 +3463,50 @@ export class Collection {
     };
   }
 
+  private async buildFileCache(files: string[]): Promise<Map<string, ReadResult>> {
+    const fileCache = new Map<string, ReadResult>();
+    for (const filePath of files) {
+      const readResult = await this.read(filePath);
+      if (!readResult.error) {
+        fileCache.set(filePath, readResult);
+      }
+    }
+    return fileCache;
+  }
+
+  private async updateCacheForPath(relativePath: string): Promise<void> {
+    if (!this.cache) return;
+    const fullPath = path.join(this.root, relativePath);
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(fullPath);
+    } catch {
+      await this.cache.deleteFile(relativePath);
+      return;
+    }
+    const parsed = await parseFileAsync(fullPath);
+    if (parsed.error) {
+      await this.cache.deleteFile(relativePath);
+      return;
+    }
+    await this.cache.upsertFile(relativePath, stat, parsed.frontmatter, parsed.body ?? "");
+  }
+
   /**
    * Scan all markdown files in the collection.
    */
-  private scanFiles(dir?: string): string[] {
+  private async scanFiles(dir?: string): Promise<string[]> {
     const scanDir = dir ?? this.root;
     const files: string[] = [];
 
-    for (const entry of fs.readdirSync(scanDir, { withFileTypes: true })) {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
+    } catch {
+      return files;
+    }
+
+    for (const entry of entries) {
       const fullPath = path.join(scanDir, entry.name);
       const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
 
@@ -3282,11 +3515,11 @@ export class Collection {
       // Nested collection boundary
       if (entry.isDirectory()) {
         const nestedConfig = path.join(fullPath, "mdbase.yaml");
-        if (fs.existsSync(nestedConfig) && fullPath !== this.root) {
+        if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
           continue;
         }
         if (this.config.settings.include_subfolders) {
-          files.push(...this.scanFiles(fullPath));
+          files.push(...await this.scanFiles(fullPath));
         }
       } else if (this.isMarkdownFile(entry.name)) {
         // Skip mdbase.yaml
@@ -3296,6 +3529,51 @@ export class Collection {
     }
 
     return files;
+  }
+
+  private async scanAllFiles(dir?: string): Promise<string[]> {
+    const scanDir = dir ?? this.root;
+    const files: string[] = [];
+
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
+    } catch {
+      return files;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(scanDir, entry.name);
+      const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
+
+      if (this.isExcluded(relativePath)) continue;
+
+      // Nested collection boundary
+      if (entry.isDirectory()) {
+        const nestedConfig = path.join(fullPath, "mdbase.yaml");
+        if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
+          continue;
+        }
+        if (this.config.settings.include_subfolders) {
+          files.push(...await this.scanAllFiles(fullPath));
+        }
+      } else {
+        if (entry.name === "mdbase.yaml") continue;
+        files.push(relativePath);
+      }
+    }
+
+    return files;
+  }
+
+  private buildNonMarkdownSet(allFiles: string[]): Set<string> {
+    const nonMd = new Set<string>();
+    for (const filePath of allFiles) {
+      if (!this.isMarkdownFile(filePath)) {
+        nonMd.add(filePath);
+      }
+    }
+    return nonMd;
   }
 }
 

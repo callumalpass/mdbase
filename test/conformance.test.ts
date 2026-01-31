@@ -12,12 +12,12 @@ import * as yaml from "js-yaml";
 import * as os from "node:os";
 
 import matter from "gray-matter";
-import { loadConfig } from "../src/config/loader.js";
-import { loadTypes, getType } from "../src/types/loader.js";
+import { loadConfig, loadConfigAsync } from "../src/config/loader.js";
+import { loadTypesAsync, getTypeAsync } from "../src/types/loader.js";
 import { Collection } from "../src/operations/collection.js";
-import { parseFile } from "../src/frontmatter/parser.js";
+import { parseFile, parseFileAsync } from "../src/frontmatter/parser.js";
 import { evaluateWhere, evaluateExpression, ExpressionError } from "../src/expressions/evaluator.js";
-import { parseLink } from "../src/links/parser.js";
+import { parseLink, extractBodyLinks } from "../src/links/parser.js";
 
 // Path to the spec's test files
 const SPEC_TESTS_DIR = path.resolve(
@@ -252,11 +252,11 @@ function discoverTests(): Map<number, Array<{ file: string; data: YamlTestFile }
 /**
  * Apply simulation settings to a Collection instance for testing.
  */
-function applySimulate(
+async function applySimulate(
   collection: InstanceType<typeof Collection>,
   collectionRoot: string,
   simulate?: Record<string, unknown>,
-): void {
+): Promise<void> {
   if (!simulate) return;
 
   // Set up I/O error simulation
@@ -324,10 +324,10 @@ function applySimulate(
  * Apply immediate simulations (external file changes) before the operation runs.
  * Used for staleness tests where the operation (query, read, validate) should see the changes.
  */
-function applyImmediateSimulate(
+async function applyImmediateSimulate(
   collectionRoot: string,
   simulate?: Record<string, unknown>,
-): void {
+): Promise<void> {
   if (!simulate) return;
 
   // External modify: write new content to a file immediately
@@ -375,7 +375,7 @@ function applyImmediateSimulate(
     // Find types_folder from config
     let typesFolder = "_types";
     try {
-      const configResult = loadConfig(collectionRoot);
+      const configResult = await loadConfig(collectionRoot);
       if (configResult.config) {
         typesFolder = configResult.config.settings.types_folder;
       }
@@ -396,14 +396,14 @@ async function executeOperation(
 ): Promise<unknown> {
   switch (operation) {
     case "load_config":
-      return loadConfig(collectionRoot);
+      return await loadConfigAsync(collectionRoot);
 
     case "load_types": {
-      const configResult = loadConfig(collectionRoot);
+      const configResult = await loadConfigAsync(collectionRoot);
       if (!configResult.valid || !configResult.config) {
         return { valid: false, error: configResult.error };
       }
-      const typesResult = loadTypes(collectionRoot, configResult.config);
+      const typesResult = await loadTypesAsync(collectionRoot, configResult.config);
       return {
         valid: typesResult.valid,
         types: typesResult.types ? Object.fromEntries(typesResult.types) : undefined,
@@ -413,11 +413,11 @@ async function executeOperation(
     }
 
     case "get_type": {
-      const configResult = loadConfig(collectionRoot);
+      const configResult = await loadConfigAsync(collectionRoot);
       if (!configResult.valid || !configResult.config) {
         return { valid: false, error: configResult.error };
       }
-      const typeResult = getType(
+      const typeResult = await getTypeAsync(
         collectionRoot,
         configResult.config,
         input.type as string,
@@ -426,16 +426,16 @@ async function executeOperation(
     }
 
     case "read": {
-      applyImmediateSimulate(collectionRoot, simulate);
-      const opened = Collection.open(collectionRoot);
+      await applyImmediateSimulate(collectionRoot, simulate);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      return opened.collection!.read(input.path as string);
+      return await opened.collection!.read(input.path as string);
     }
 
     case "validate": {
-      applyImmediateSimulate(collectionRoot, simulate);
+      await applyImmediateSimulate(collectionRoot, simulate);
       // If frontmatter is provided inline, create the file first
       if (input.frontmatter && input.path) {
         const filePath = path.join(collectionRoot, input.path as string);
@@ -443,27 +443,27 @@ async function executeOperation(
         const content = matter.stringify("", input.frontmatter as Record<string, unknown>);
         fs.writeFileSync(filePath, content);
       }
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { valid: false, error: opened.error };
       }
       // validate: false means just read, don't validate
       if (input.validate === false) {
-        const readResult = opened.collection!.read(input.path as string);
+        const readResult = await opened.collection!.read(input.path as string);
         return readResult;
       }
       // collection_only: true means validate the collection, not a specific file
       const filePath = input.collection_only ? undefined : (input.path as string | undefined);
-      return opened.collection!.validate(filePath);
+      return await opened.collection!.validate(filePath);
     }
 
     case "create": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      applySimulate(opened.collection!, collectionRoot, simulate);
-      return opened.collection!.create({
+      await applySimulate(opened.collection!, collectionRoot, simulate);
+      return await opened.collection!.create({
         type: input.type as string | undefined,
         types: input.types as string[] | undefined,
         path: input.path as string,
@@ -473,12 +473,12 @@ async function executeOperation(
     }
 
     case "update": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      applySimulate(opened.collection!, collectionRoot, simulate);
-      return opened.collection!.update({
+      await applySimulate(opened.collection!, collectionRoot, simulate);
+      return await opened.collection!.update({
         path: input.path as string,
         fields: (input.fields ?? input.frontmatter) as Record<string, unknown> | undefined,
         body: input.body as string | undefined,
@@ -486,22 +486,22 @@ async function executeOperation(
     }
 
     case "delete": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      applySimulate(opened.collection!, collectionRoot, simulate);
-      return opened.collection!.delete(input.path as string, {
+      await applySimulate(opened.collection!, collectionRoot, simulate);
+      return await opened.collection!.delete(input.path as string, {
         check_backlinks: input.check_backlinks as boolean | undefined,
       });
     }
 
     case "create_type": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      return opened.collection!.createType({
+      return await opened.collection!.createType({
         name: input.name as string,
         description: input.description as string | undefined,
         extends: input.extends as string | undefined,
@@ -513,17 +513,17 @@ async function executeOperation(
     }
 
     case "rename": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      applySimulate(opened.collection!, collectionRoot, simulate);
+      await applySimulate(opened.collection!, collectionRoot, simulate);
       const from = (input.from ?? input.path) as string | undefined;
       const to = (input.to ?? input.new_path) as string | undefined;
       if (!from || !to) {
         return { error: { code: "path_required", message: "Both source and destination paths are required for rename" } };
       }
-      return opened.collection!.rename({
+      return await opened.collection!.rename({
         from,
         to,
         update_refs: input.update_refs as boolean | undefined,
@@ -532,14 +532,14 @@ async function executeOperation(
 
     case "query": {
       // Apply immediate simulations (external file changes) before query
-      applyImmediateSimulate(collectionRoot, simulate);
-      const opened = Collection.open(collectionRoot);
+      await applyImmediateSimulate(collectionRoot, simulate);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
       // Handle input.query wrapper (some tests nest it)
       const queryInput = (input.query ?? input) as Record<string, unknown>;
-      return opened.collection!.query({
+      return await opened.collection!.query({
         types: queryInput.types as string[] | undefined,
         where: queryInput.where as string | Record<string, unknown> | undefined,
         order_by: queryInput.order_by as Array<{ field: string; direction?: string }> | undefined,
@@ -566,11 +566,11 @@ async function executeOperation(
       let fileInfo: Record<string, unknown> | undefined;
       const readPath = (input.path ?? input.context_path) as string | undefined;
       if (readPath) {
-        const opened = Collection.open(collectionRoot);
+        const opened = await Collection.open(collectionRoot);
         if (opened.error) {
           return { error: opened.error };
         }
-        const readResult = opened.collection!.read(readPath);
+        const readResult = await opened.collection!.read(readPath);
         if (readResult.error) {
           return { error: readResult.error };
         }
@@ -589,15 +589,74 @@ async function executeOperation(
       let resolveFile: ((target: string) => { frontmatter: Record<string, unknown>; path: string; types: string[] } | null) | undefined;
       let computeBacklinks: ((fp: string) => import("../src/expressions/evaluator.js").BacklinkEntry[]) | undefined;
       if (readPath) {
-        const opened2 = Collection.open(collectionRoot);
+        const opened2 = await Collection.open(collectionRoot);
         if (!opened2.error && opened2.collection) {
-          const coll = opened2.collection;
-          const files = (coll as any).scanFiles();
+          const coll = opened2.collection as any;
+          const files: string[] = await coll.scanFiles();
+          const allFiles: string[] = await coll.scanAllFiles();
+          const nonMdSet: Set<string> = coll.buildNonMarkdownSet(allFiles);
+          const fileCache: Map<string, unknown> = await coll.buildFileCache(files);
           resolveFile = (target: string) => {
-            return (coll as any).resolveLink(target, readPath, files);
+            const resolution = coll.resolveLinkFullWithFiles(target, readPath, files, undefined, fileCache, nonMdSet);
+            if (!resolution.resolved) return null;
+            const targetRead = fileCache.get(resolution.resolved) as any;
+            if (!targetRead || targetRead.error) return null;
+            return {
+              frontmatter: targetRead.frontmatter ?? {},
+              path: resolution.resolved,
+              types: targetRead.types ?? [],
+            };
           };
-          computeBacklinks = (fp: string) => {
-            return coll.computeBacklinksForFile(fp);
+          computeBacklinks = (targetPath: string) => {
+            const backlinks: Array<{ file: { path: string; name: string; basename: string; folder: string; extension: string } }> = [];
+            const seenSources = new Set<string>();
+            for (const [sourcePath, sourceRead] of fileCache.entries()) {
+              const read = sourceRead as any;
+              if (read.error) continue;
+              const frontmatter = read.frontmatter ?? {};
+              const types = read.types ?? [];
+              const body = read.body ?? "";
+
+              const allLinkValues: string[] = [];
+              for (const typeName of types) {
+                const typeDef = coll.typeDefs.get(typeName);
+                if (!typeDef?.fields) continue;
+                for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+                  const value = frontmatter[fieldName];
+                  if (value === null || value === undefined) continue;
+                  if (fieldDef.type === "link" && typeof value === "string") {
+                    allLinkValues.push(value);
+                  } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
+                    for (const item of value) {
+                      if (typeof item === "string") allLinkValues.push(item);
+                    }
+                  }
+                }
+              }
+              const bodyLinks = extractBodyLinks(body);
+              for (const bl of bodyLinks) {
+                allLinkValues.push(bl.raw);
+              }
+
+              for (const linkValue of allLinkValues) {
+                if (seenSources.has(sourcePath)) break;
+                const resolution = coll.resolveLinkFullWithFiles(linkValue, sourcePath, files, undefined, fileCache, nonMdSet);
+                if (resolution.resolved === targetPath) {
+                  seenSources.add(sourcePath);
+                  const name = sourcePath.split("/").pop() ?? "";
+                  backlinks.push({
+                    file: {
+                      path: sourcePath,
+                      name,
+                      basename: name.replace(/\.[^.]+$/, ""),
+                      folder: path.dirname(sourcePath) === "." ? "" : path.dirname(sourcePath),
+                      extension: path.extname(sourcePath).slice(1),
+                    },
+                  });
+                }
+              }
+            }
+            return backlinks;
           };
         }
       }
@@ -621,12 +680,12 @@ async function executeOperation(
     }
 
     case "batch_delete": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      applySimulate(opened.collection!, collectionRoot, simulate);
-      return opened.collection!.batchDelete({
+      await applySimulate(opened.collection!, collectionRoot, simulate);
+      return await opened.collection!.batchDelete({
         where: input.where as string,
         dry_run: input.dry_run as boolean | undefined,
         check_backlinks: input.check_backlinks as boolean | undefined,
@@ -634,12 +693,12 @@ async function executeOperation(
     }
 
     case "batch_update": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
-      applySimulate(opened.collection!, collectionRoot, simulate);
-      return opened.collection!.batchUpdate({
+      await applySimulate(opened.collection!, collectionRoot, simulate);
+      return await opened.collection!.batchUpdate({
         where: input.where as string | undefined,
         fields: input.fields as Record<string, unknown> | undefined,
         updates: input.updates as Array<{ path: string; fields: Record<string, unknown> }> | undefined,
@@ -648,7 +707,7 @@ async function executeOperation(
     }
 
     case "get_types": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
@@ -661,14 +720,14 @@ async function executeOperation(
         return { error: { code: "file_not_found", message: `File not found: ${filePath}` } };
       }
       // Parse the file frontmatter
-      const parsed = parseFile(fullPath);
+      const parsed = await parseFile(fullPath);
       const frontmatter = parsed.frontmatter ?? {};
       const types = opened.collection!.getTypesForFile(filePath, frontmatter);
       return { types };
     }
 
     case "resolve_link": {
-      const opened = Collection.open(collectionRoot);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { error: opened.error };
       }
@@ -676,7 +735,7 @@ async function executeOperation(
       const field = input.field as string;
 
       // Read the file to get the field value
-      const readResult = opened.collection!.read(filePath);
+      const readResult = await opened.collection!.read(filePath);
       if (readResult.error) {
         return { error: readResult.error };
       }
@@ -698,7 +757,7 @@ async function executeOperation(
       }
 
       // Use the collection's resolveLink method
-      const resolution = (opened.collection! as any).resolveLinkFull(
+      const resolution = await (opened.collection! as any).resolveLinkFull(
         String(linkValue),
         filePath,
         targetType,
@@ -734,22 +793,20 @@ async function executeOperation(
     case "cache_rebuild": {
       // Cache rebuild: since our implementation always reads from disk,
       // this is effectively a no-op that returns success.
-      applyImmediateSimulate(collectionRoot, simulate);
-      const opened = Collection.open(collectionRoot);
+      await applyImmediateSimulate(collectionRoot, simulate);
+      const opened = await Collection.open(collectionRoot);
       if (opened.error) {
         return { success: false, error: opened.error };
       }
-      return { success: true };
+      return await opened.collection!.cacheRebuild();
     }
 
     case "cache_clear": {
-      // Cache clear: remove any .mdbase cache directory if it exists.
-      // Since we don't use a persistent cache, this is mostly a no-op.
-      const cacheDir = path.join(collectionRoot, ".mdbase");
-      if (fs.existsSync(cacheDir)) {
-        fs.rmSync(cacheDir, { recursive: true, force: true });
+      const opened = await Collection.open(collectionRoot);
+      if (opened.error) {
+        return { success: false, error: opened.error };
       }
-      return { success: true };
+      return await opened.collection!.cacheClear();
     }
 
     case "watch": {
@@ -760,7 +817,7 @@ async function executeOperation(
       }
 
       // Load config and types for event generation
-      const configResult = loadConfig(collectionRoot);
+      const configResult = await loadConfigAsync(collectionRoot);
       if (!configResult.valid || !configResult.config) {
         return { events: [], error: configResult.error };
       }
@@ -768,12 +825,12 @@ async function executeOperation(
       const extensions = new Set(["md", ...(config.settings.extensions || [])]);
 
       // Snapshot existing files before changes
-      const opened = Collection.open(collectionRoot);
-      const files = opened.collection ? opened.collection.scanFiles() : [];
+      const opened = await Collection.open(collectionRoot);
+      const files = opened.collection ? await (opened.collection as any).scanFiles() : [];
       const beforeState = new Map<string, { frontmatter: Record<string, unknown>; body: string; types: string[] }>();
       for (const f of files) {
         try {
-          const parsed = parseFile(path.join(collectionRoot, f));
+          const parsed = await parseFileAsync(path.join(collectionRoot, f));
           const types = opened.collection!.getTypesForFile(f, parsed.frontmatter);
           beforeState.set(f, { frontmatter: { ...parsed.frontmatter }, body: parsed.body, types });
         } catch { /* skip */ }
@@ -810,12 +867,12 @@ async function executeOperation(
       }
 
       // Helper: read file and compute state
-      function readFileState(filePath: string) {
+      async function readFileState(filePath: string) {
         const fullPath = path.join(collectionRoot, filePath);
         if (!fs.existsSync(fullPath)) return null;
         try {
-          const parsed = parseFile(fullPath);
-          const reopened = Collection.open(collectionRoot);
+          const parsed = await parseFileAsync(fullPath);
+          const reopened = await Collection.open(collectionRoot);
           const types = reopened.collection ? reopened.collection.getTypesForFile(filePath, parsed.frontmatter) : [];
           // Apply defaults from type definitions
           const frontmatter = { ...parsed.frontmatter };
@@ -851,10 +908,10 @@ async function executeOperation(
       }
 
       // Helper: validate file and return issues
-      function validateFile(filePath: string): Array<{ code: string; field?: string }> {
-        const reopened = Collection.open(collectionRoot);
+      async function validateFile(filePath: string): Promise<Array<{ code: string; field?: string }>> {
+        const reopened = await Collection.open(collectionRoot);
         if (!reopened.collection) return [];
-        const valResult = reopened.collection.validate(filePath);
+        const valResult = await reopened.collection.validate(filePath);
         if (valResult && typeof valResult === "object" && "issues" in valResult) {
           const issues = (valResult as { issues?: Array<{ code: string; field?: string }> }).issues;
           return issues || [];
@@ -894,7 +951,7 @@ async function executeOperation(
           fs.writeFileSync(filePath, lastChange.content);
           // Only emit one event for the final state
           if (isWatchedExtension(rapidChanges.path) && !isExcluded(rapidChanges.path)) {
-            const newState = readFileState(rapidChanges.path);
+            const newState = await readFileState(rapidChanges.path);
             const oldState = beforeState.get(rapidChanges.path);
             if (newState && oldState) {
               const changedFields = getChangedFields(oldState.frontmatter, newState.frontmatter);
@@ -916,7 +973,7 @@ async function executeOperation(
             fs.mkdirSync(path.dirname(stepPath), { recursive: true });
             fs.writeFileSync(stepPath, step.content ?? "---\n---\n");
             if (isWatchedExtension(step.path) && !isExcluded(step.path)) {
-              const newState = readFileState(step.path);
+              const newState = await readFileState(step.path);
               if (newState) {
                 emitEvent({
                   event: "file_created",
@@ -927,10 +984,10 @@ async function executeOperation(
               }
             }
           } else if (step.action === "modify") {
-            const oldState = readFileState(step.path) || beforeState.get(step.path);
+            const oldState = await readFileState(step.path) || beforeState.get(step.path);
             fs.writeFileSync(stepPath, step.content ?? "");
             if (isWatchedExtension(step.path) && !isExcluded(step.path)) {
-              const newState = readFileState(step.path);
+              const newState = await readFileState(step.path);
               if (newState) {
                 const changedFields = oldState ? getChangedFields(oldState.frontmatter, newState.frontmatter) : [];
                 emitEvent({
@@ -943,7 +1000,7 @@ async function executeOperation(
               }
             }
             // Update beforeState for next iteration
-            const updatedState = readFileState(step.path);
+            const updatedState = await readFileState(step.path);
             if (updatedState) beforeState.set(step.path, updatedState);
           } else if (step.action === "delete") {
             const oldState = beforeState.get(step.path);
@@ -968,7 +1025,7 @@ async function executeOperation(
             fs.writeFileSync(createPath, extCreate.content ?? "---\n---\n");
           }
           if (isWatchedExtension(extCreate.path!) && !isExcluded(extCreate.path!)) {
-            const newState = readFileState(extCreate.path!);
+            const newState = await readFileState(extCreate.path!);
             if (newState) {
               emitEvent({
                 event: "file_created",
@@ -978,7 +1035,7 @@ async function executeOperation(
               });
               // Check for validation errors
               if (config.settings.default_validation === "error") {
-                const issues = validateFile(extCreate.path!);
+                const issues = await validateFile(extCreate.path!);
                 if (issues.length > 0) {
                   emitEvent({
                     event: "validation_error",
@@ -995,7 +1052,7 @@ async function executeOperation(
           const modPath = path.join(collectionRoot, extModify.path!);
           fs.writeFileSync(modPath, extModify.content ?? "");
           if (isWatchedExtension(extModify.path!) && !isExcluded(extModify.path!)) {
-            const newState = readFileState(extModify.path!);
+            const newState = await readFileState(extModify.path!);
             if (newState) {
               const changedFields = oldState ? getChangedFields(oldState.frontmatter, newState.frontmatter) : [];
               emitEvent({
@@ -1007,7 +1064,7 @@ async function executeOperation(
               });
               // Check for validation errors
               if (config.settings.default_validation === "error") {
-                const issues = validateFile(extModify.path!);
+                const issues = await validateFile(extModify.path!);
                 if (issues.length > 0) {
                   emitEvent({
                     event: "validation_error",
@@ -1049,7 +1106,7 @@ async function executeOperation(
                   last_known_types: oldState.types,
                 });
               }
-              const newState = readFileState(extRename.to!);
+              const newState = await readFileState(extRename.to!);
               if (newState) {
                 emitEvent({
                   event: "file_created",
@@ -1060,7 +1117,7 @@ async function executeOperation(
               }
             } else {
               // Rename detected
-              const newState = readFileState(extRename.to!);
+              const newState = await readFileState(extRename.to!);
               emitEvent({
                 event: "file_renamed",
                 from: extRename.from!,

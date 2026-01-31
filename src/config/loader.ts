@@ -74,15 +74,14 @@ const KNOWN_SETTINGS_KEYS = new Set([
   "cache_folder",
 ]);
 
-/**
- * Load and validate an mdbase.yaml configuration file.
- */
-export function loadConfig(collectionRoot: string): ConfigLoadResult {
+export async function loadConfigAsync(collectionRoot: string): Promise<ConfigLoadResult> {
   const configPath = path.join(collectionRoot, "mdbase.yaml");
   const warnings: string[] = [];
 
   // Check file exists
-  if (!fs.existsSync(configPath)) {
+  try {
+    await fs.promises.access(configPath);
+  } catch {
     return {
       valid: false,
       error: { code: "missing_config", message: "mdbase.yaml not found" },
@@ -92,7 +91,7 @@ export function loadConfig(collectionRoot: string): ConfigLoadResult {
   // Read and parse YAML
   let raw: unknown;
   try {
-    const content = fs.readFileSync(configPath, "utf-8");
+    const content = await fs.promises.readFile(configPath, "utf-8");
     raw = yaml.load(content);
   } catch {
     return {
@@ -211,6 +210,8 @@ export function loadConfig(collectionRoot: string): ConfigLoadResult {
     warnings: warnings.length > 0 ? warnings : undefined,
   };
 }
+
+export const loadConfig = loadConfigAsync;
 
 interface SettingsParseResult {
   valid: boolean;
