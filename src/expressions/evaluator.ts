@@ -35,7 +35,7 @@ export interface EvalContext {
   rawFrontmatter?: Record<string, unknown>;
   path?: string;
   types?: string[];
-  body?: string;
+  body?: string | null;
   file?: Record<string, unknown>;
   computedFields?: Map<string, unknown>;
   strictArithmetic?: boolean; // Throw on division by zero instead of returning null

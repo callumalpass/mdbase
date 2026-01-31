@@ -107,4 +107,8 @@ export class CollectionAsync {
   cacheClear(): Promise<CacheOpResult> {
     return this.inner.cacheClear();
   }
+
+  close(): Promise<void> {
+    return this.inner.close();
+  }
 }

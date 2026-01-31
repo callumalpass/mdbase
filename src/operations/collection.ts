@@ -30,8 +30,9 @@ export interface ReadResult {
   valid?: boolean;
   frontmatter?: Record<string, unknown>;
   rawFrontmatter?: Record<string, unknown>;
-  body?: string;
+  body?: string | null;
   types?: string[];
+  file?: Record<string, unknown>;
   warnings?: Array<{ code: string; message: string }>;
   error?: { code: string; message: string };
 }
@@ -69,7 +70,7 @@ export interface QueryResult {
     path: string;
     frontmatter: Record<string, unknown>;
     types: string[];
-    body?: string;
+    body?: string | null;
   }>;
   meta?: {
     total_count: number;
@@ -467,7 +468,7 @@ export class Collection {
       };
     }
 
-    let parsed: ReturnType<typeof parseFile>;
+    let parsed: Awaited<ReturnType<typeof parseFileAsync>>;
     let cached: CachedFile | null = null;
     if (this.cache) {
       cached = await this.cache.getFile(relativePath, stat);
@@ -1666,10 +1667,13 @@ export class Collection {
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
   ): { updated: boolean; newValue: string; warning?: string } {
-    let parsed: ParsedLink;
+    let parsed: ParsedLink | null;
     try {
       parsed = parseLink(linkValue);
     } catch {
+      return { updated: false, newValue: linkValue };
+    }
+    if (!parsed) {
       return { updated: false, newValue: linkValue };
     }
 
@@ -1947,7 +1951,7 @@ export class Collection {
       path: string;
       frontmatter: Record<string, unknown>;
       types: string[];
-      body?: string;
+      body?: string | null;
       _file?: Record<string, unknown>;
       formulas?: Record<string, unknown>;
     }> = [];
@@ -2329,7 +2333,7 @@ export class Collection {
     frontmatter: Record<string, unknown>,
     filePath: string,
     types: string[],
-    body?: string,
+    body?: string | null,
   ): boolean {
     // String expression
     if (typeof where === "string") {
@@ -2629,6 +2633,8 @@ export class Collection {
     let skipped = 0;
     const details: BatchResultDetail[] = [];
     const failedPaths = new Set<string>();
+    const fileCache = this.skipDependents ? await this.buildFileCache(files) : undefined;
+    const nonMdSet = this.skipDependents ? this.buildNonMarkdownSet(await this.scanAllFiles()) : undefined;
 
     for (const relativePath of matchingPaths) {
       // Check if this file depends on a failed file (skip_dependents)
@@ -2839,6 +2845,15 @@ export class Collection {
     await this.cache.clear();
     this.cache = null;
     return { success: true };
+  }
+
+  async close(): Promise<void> {
+    if (!this.cache) return;
+    try {
+      await this.cache.close();
+    } finally {
+      this.cache = null;
+    }
   }
 
   private generateValue(

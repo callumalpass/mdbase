@@ -13,6 +13,9 @@ type CacheRequest =
   | { id: number; op: "delete"; path: string }
   | { id: number; op: "close" };
 
+type CacheRequestNoId<T> = T extends { id: number } ? Omit<T, "id"> : T;
+type CacheRequestPayload = CacheRequestNoId<CacheRequest>;
+
 type CacheResponse =
   | { id: number; ok: true; result?: unknown }
   | { id: number; ok: false; error: string };
@@ -77,7 +80,7 @@ export class CacheStoreAsync {
     }
   }
 
-  private request<T>(payload: Omit<CacheRequest, "id">): Promise<T> {
+  private request<T>(payload: CacheRequestPayload): Promise<T> {
     const id = ++this.seq;
     const msg: CacheRequest = { id, ...payload } as CacheRequest;
     return new Promise((resolve, reject) => {

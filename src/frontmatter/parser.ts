@@ -25,7 +25,7 @@ const timestampAsString = new yaml.Type("tag:yaml.org,2002:timestamp", {
     return data;
   },
   instanceOf: String,
-  represent: (data: string) => data,
+  represent: (data: unknown) => String(data),
 });
 
 const MDBASE_YAML_SCHEMA = yaml.DEFAULT_SCHEMA.extend({ implicit: [timestampAsString] });

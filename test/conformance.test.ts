@@ -431,7 +431,11 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      return await opened.collection!.read(input.path as string);
+      try {
+        return await opened.collection!.read(input.path as string);
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "validate": {
@@ -447,14 +451,18 @@ async function executeOperation(
       if (opened.error) {
         return { valid: false, error: opened.error };
       }
-      // validate: false means just read, don't validate
-      if (input.validate === false) {
-        const readResult = await opened.collection!.read(input.path as string);
-        return readResult;
+      try {
+        // validate: false means just read, don't validate
+        if (input.validate === false) {
+          const readResult = await opened.collection!.read(input.path as string);
+          return readResult;
+        }
+        // collection_only: true means validate the collection, not a specific file
+        const filePath = input.collection_only ? undefined : (input.path as string | undefined);
+        return await opened.collection!.validate(filePath);
+      } finally {
+        await opened.collection!.close();
       }
-      // collection_only: true means validate the collection, not a specific file
-      const filePath = input.collection_only ? undefined : (input.path as string | undefined);
-      return await opened.collection!.validate(filePath);
     }
 
     case "create": {
@@ -462,14 +470,18 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      await applySimulate(opened.collection!, collectionRoot, simulate);
-      return await opened.collection!.create({
-        type: input.type as string | undefined,
-        types: input.types as string[] | undefined,
-        path: input.path as string,
-        frontmatter: (input.frontmatter ?? input.fields) as Record<string, unknown> | undefined,
-        body: input.body as string | undefined,
-      });
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.create({
+          type: input.type as string | undefined,
+          types: input.types as string[] | undefined,
+          path: input.path as string,
+          frontmatter: (input.frontmatter ?? input.fields) as Record<string, unknown> | undefined,
+          body: input.body as string | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "update": {
@@ -477,12 +489,16 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      await applySimulate(opened.collection!, collectionRoot, simulate);
-      return await opened.collection!.update({
-        path: input.path as string,
-        fields: (input.fields ?? input.frontmatter) as Record<string, unknown> | undefined,
-        body: input.body as string | undefined,
-      });
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.update({
+          path: input.path as string,
+          fields: (input.fields ?? input.frontmatter) as Record<string, unknown> | undefined,
+          body: input.body as string | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "delete": {
@@ -490,10 +506,14 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      await applySimulate(opened.collection!, collectionRoot, simulate);
-      return await opened.collection!.delete(input.path as string, {
-        check_backlinks: input.check_backlinks as boolean | undefined,
-      });
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.delete(input.path as string, {
+          check_backlinks: input.check_backlinks as boolean | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "create_type": {
@@ -501,15 +521,19 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      return await opened.collection!.createType({
-        name: input.name as string,
-        description: input.description as string | undefined,
-        extends: input.extends as string | undefined,
-        parent: input.parent as string | undefined,
-        strict: input.strict as boolean | "warn" | undefined,
-        fields: input.fields as Record<string, unknown> | undefined,
-        path_pattern: input.path_pattern as string | undefined,
-      });
+      try {
+        return await opened.collection!.createType({
+          name: input.name as string,
+          description: input.description as string | undefined,
+          extends: input.extends as string | undefined,
+          parent: input.parent as string | undefined,
+          strict: input.strict as boolean | "warn" | undefined,
+          fields: input.fields as Record<string, unknown> | undefined,
+          path_pattern: input.path_pattern as string | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "rename": {
@@ -517,17 +541,21 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      await applySimulate(opened.collection!, collectionRoot, simulate);
-      const from = (input.from ?? input.path) as string | undefined;
-      const to = (input.to ?? input.new_path) as string | undefined;
-      if (!from || !to) {
-        return { error: { code: "path_required", message: "Both source and destination paths are required for rename" } };
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        const from = (input.from ?? input.path) as string | undefined;
+        const to = (input.to ?? input.new_path) as string | undefined;
+        if (!from || !to) {
+          return { error: { code: "path_required", message: "Both source and destination paths are required for rename" } };
+        }
+        return await opened.collection!.rename({
+          from,
+          to,
+          update_refs: input.update_refs as boolean | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
       }
-      return await opened.collection!.rename({
-        from,
-        to,
-        update_refs: input.update_refs as boolean | undefined,
-      });
     }
 
     case "query": {
@@ -539,17 +567,21 @@ async function executeOperation(
       }
       // Handle input.query wrapper (some tests nest it)
       const queryInput = (input.query ?? input) as Record<string, unknown>;
-      return await opened.collection!.query({
-        types: queryInput.types as string[] | undefined,
-        where: queryInput.where as string | Record<string, unknown> | undefined,
-        order_by: queryInput.order_by as Array<{ field: string; direction?: string }> | undefined,
-        folder: queryInput.folder as string | undefined,
-        limit: queryInput.limit as number | undefined,
-        offset: queryInput.offset as number | undefined,
-        include_body: queryInput.include_body as boolean | undefined,
-        context_file: (queryInput.context_file ?? input.context_file) as string | undefined,
-        formulas: queryInput.formulas as Record<string, string> | undefined,
-      });
+      try {
+        return await opened.collection!.query({
+          types: queryInput.types as string[] | undefined,
+          where: queryInput.where as string | Record<string, unknown> | undefined,
+          order_by: queryInput.order_by as Array<{ field: string; direction?: string }> | undefined,
+          folder: queryInput.folder as string | undefined,
+          limit: queryInput.limit as number | undefined,
+          offset: queryInput.offset as number | undefined,
+          include_body: queryInput.include_body as boolean | undefined,
+          context_file: (queryInput.context_file ?? input.context_file) as string | undefined,
+          formulas: queryInput.formulas as Record<string, string> | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "evaluate": {
@@ -570,16 +602,20 @@ async function executeOperation(
         if (opened.error) {
           return { error: opened.error };
         }
-        const readResult = await opened.collection!.read(readPath);
-        if (readResult.error) {
-          return { error: readResult.error };
+        try {
+          const readResult = await opened.collection!.read(readPath);
+          if (readResult.error) {
+            return { error: readResult.error };
+          }
+          frontmatter = readResult.frontmatter ?? {};
+          rawFrontmatter = (readResult as Record<string, unknown>).rawFrontmatter as Record<string, unknown> | undefined;
+          filePath = readPath;
+          body = readResult.body ?? undefined;
+          types = readResult.types ?? [];
+          fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
+        } finally {
+          await opened.collection!.close();
         }
-        frontmatter = readResult.frontmatter ?? {};
-        rawFrontmatter = (readResult as Record<string, unknown>).rawFrontmatter as Record<string, unknown> | undefined;
-        filePath = readPath;
-        body = readResult.body;
-        types = readResult.types ?? [];
-        fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
       }
       // Apply inline context (overrides/provides frontmatter directly)
       if (input.context && typeof input.context === "object") {
@@ -591,73 +627,77 @@ async function executeOperation(
       if (readPath) {
         const opened2 = await Collection.open(collectionRoot);
         if (!opened2.error && opened2.collection) {
-          const coll = opened2.collection as any;
-          const files: string[] = await coll.scanFiles();
-          const allFiles: string[] = await coll.scanAllFiles();
-          const nonMdSet: Set<string> = coll.buildNonMarkdownSet(allFiles);
-          const fileCache: Map<string, unknown> = await coll.buildFileCache(files);
-          resolveFile = (target: string) => {
-            const resolution = coll.resolveLinkFullWithFiles(target, readPath, files, undefined, fileCache, nonMdSet);
-            if (!resolution.resolved) return null;
-            const targetRead = fileCache.get(resolution.resolved) as any;
-            if (!targetRead || targetRead.error) return null;
-            return {
-              frontmatter: targetRead.frontmatter ?? {},
-              path: resolution.resolved,
-              types: targetRead.types ?? [],
+          try {
+            const coll = opened2.collection as any;
+            const files: string[] = await coll.scanFiles();
+            const allFiles: string[] = await coll.scanAllFiles();
+            const nonMdSet: Set<string> = coll.buildNonMarkdownSet(allFiles);
+            const fileCache: Map<string, unknown> = await coll.buildFileCache(files);
+            resolveFile = (target: string) => {
+              const resolution = coll.resolveLinkFullWithFiles(target, readPath, files, undefined, fileCache, nonMdSet);
+              if (!resolution.resolved) return null;
+              const targetRead = fileCache.get(resolution.resolved) as any;
+              if (!targetRead || targetRead.error) return null;
+              return {
+                frontmatter: targetRead.frontmatter ?? {},
+                path: resolution.resolved,
+                types: targetRead.types ?? [],
+              };
             };
-          };
-          computeBacklinks = (targetPath: string) => {
-            const backlinks: Array<{ file: { path: string; name: string; basename: string; folder: string; extension: string } }> = [];
-            const seenSources = new Set<string>();
-            for (const [sourcePath, sourceRead] of fileCache.entries()) {
-              const read = sourceRead as any;
-              if (read.error) continue;
-              const frontmatter = read.frontmatter ?? {};
-              const types = read.types ?? [];
-              const body = read.body ?? "";
+            computeBacklinks = (targetPath: string) => {
+              const backlinks: Array<{ file: { path: string; name: string; basename: string; folder: string; extension: string } }> = [];
+              const seenSources = new Set<string>();
+              for (const [sourcePath, sourceRead] of fileCache.entries()) {
+                const read = sourceRead as any;
+                if (read.error) continue;
+                const frontmatter = read.frontmatter ?? {};
+                const types = read.types ?? [];
+                const body = read.body ?? "";
 
-              const allLinkValues: string[] = [];
-              for (const typeName of types) {
-                const typeDef = coll.typeDefs.get(typeName);
-                if (!typeDef?.fields) continue;
-                for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-                  const value = frontmatter[fieldName];
-                  if (value === null || value === undefined) continue;
-                  if (fieldDef.type === "link" && typeof value === "string") {
-                    allLinkValues.push(value);
-                  } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
-                    for (const item of value) {
-                      if (typeof item === "string") allLinkValues.push(item);
+                const allLinkValues: string[] = [];
+                for (const typeName of types) {
+                  const typeDef = coll.typeDefs.get(typeName);
+                  if (!typeDef?.fields) continue;
+                  for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+                    const value = frontmatter[fieldName];
+                    if (value === null || value === undefined) continue;
+                    if (fieldDef.type === "link" && typeof value === "string") {
+                      allLinkValues.push(value);
+                    } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
+                      for (const item of value) {
+                        if (typeof item === "string") allLinkValues.push(item);
+                      }
                     }
                   }
                 }
-              }
-              const bodyLinks = extractBodyLinks(body);
-              for (const bl of bodyLinks) {
-                allLinkValues.push(bl.raw);
-              }
+                const bodyLinks = extractBodyLinks(body);
+                for (const bl of bodyLinks) {
+                  allLinkValues.push(bl.raw);
+                }
 
-              for (const linkValue of allLinkValues) {
-                if (seenSources.has(sourcePath)) break;
-                const resolution = coll.resolveLinkFullWithFiles(linkValue, sourcePath, files, undefined, fileCache, nonMdSet);
-                if (resolution.resolved === targetPath) {
-                  seenSources.add(sourcePath);
-                  const name = sourcePath.split("/").pop() ?? "";
-                  backlinks.push({
-                    file: {
-                      path: sourcePath,
-                      name,
-                      basename: name.replace(/\.[^.]+$/, ""),
-                      folder: path.dirname(sourcePath) === "." ? "" : path.dirname(sourcePath),
-                      extension: path.extname(sourcePath).slice(1),
-                    },
-                  });
+                for (const linkValue of allLinkValues) {
+                  if (seenSources.has(sourcePath)) break;
+                  const resolution = coll.resolveLinkFullWithFiles(linkValue, sourcePath, files, undefined, fileCache, nonMdSet);
+                  if (resolution.resolved === targetPath) {
+                    seenSources.add(sourcePath);
+                    const name = sourcePath.split("/").pop() ?? "";
+                    backlinks.push({
+                      file: {
+                        path: sourcePath,
+                        name,
+                        basename: name.replace(/\.[^.]+$/, ""),
+                        folder: path.dirname(sourcePath) === "." ? "" : path.dirname(sourcePath),
+                        extension: path.extname(sourcePath).slice(1),
+                      },
+                    });
+                  }
                 }
               }
-            }
-            return backlinks;
-          };
+              return backlinks;
+            };
+          } finally {
+            await opened2.collection.close();
+          }
         }
       }
       try {
@@ -684,12 +724,16 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      await applySimulate(opened.collection!, collectionRoot, simulate);
-      return await opened.collection!.batchDelete({
-        where: input.where as string,
-        dry_run: input.dry_run as boolean | undefined,
-        check_backlinks: input.check_backlinks as boolean | undefined,
-      });
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.batchDelete({
+          where: input.where as string,
+          dry_run: input.dry_run as boolean | undefined,
+          check_backlinks: input.check_backlinks as boolean | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "batch_update": {
@@ -697,13 +741,17 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      await applySimulate(opened.collection!, collectionRoot, simulate);
-      return await opened.collection!.batchUpdate({
-        where: input.where as string | undefined,
-        fields: input.fields as Record<string, unknown> | undefined,
-        updates: input.updates as Array<{ path: string; fields: Record<string, unknown> }> | undefined,
-        dry_run: input.dry_run as boolean | undefined,
-      });
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.batchUpdate({
+          where: input.where as string | undefined,
+          fields: input.fields as Record<string, unknown> | undefined,
+          updates: input.updates as Array<{ path: string; fields: Record<string, unknown> }> | undefined,
+          dry_run: input.dry_run as boolean | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "get_types": {
@@ -711,19 +759,23 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      const filePath = input.path as string;
-      if (!filePath) {
-        return { error: { code: "invalid_input", message: "get_types requires a path" } };
+      try {
+        const filePath = input.path as string;
+        if (!filePath) {
+          return { error: { code: "invalid_input", message: "get_types requires a path" } };
+        }
+        const fullPath = path.join(collectionRoot, filePath);
+        if (!fs.existsSync(fullPath)) {
+          return { error: { code: "file_not_found", message: `File not found: ${filePath}` } };
+        }
+        // Parse the file frontmatter
+        const parsed = await parseFile(fullPath);
+        const frontmatter = parsed.frontmatter ?? {};
+        const types = opened.collection!.getTypesForFile(filePath, frontmatter);
+        return { types };
+      } finally {
+        await opened.collection!.close();
       }
-      const fullPath = path.join(collectionRoot, filePath);
-      if (!fs.existsSync(fullPath)) {
-        return { error: { code: "file_not_found", message: `File not found: ${filePath}` } };
-      }
-      // Parse the file frontmatter
-      const parsed = await parseFile(fullPath);
-      const frontmatter = parsed.frontmatter ?? {};
-      const types = opened.collection!.getTypesForFile(filePath, frontmatter);
-      return { types };
     }
 
     case "resolve_link": {
@@ -731,38 +783,42 @@ async function executeOperation(
       if (opened.error) {
         return { error: opened.error };
       }
-      const filePath = input.path as string;
-      const field = input.field as string;
+      try {
+        const filePath = input.path as string;
+        const field = input.field as string;
 
-      // Read the file to get the field value
-      const readResult = await opened.collection!.read(filePath);
-      if (readResult.error) {
-        return { error: readResult.error };
-      }
-      const linkValue = readResult.frontmatter?.[field];
-      if (linkValue === null || linkValue === undefined) {
-        return { resolved_path: null };
-      }
-
-      // Look up the field's target constraint from type definitions
-      let targetType: string | undefined;
-      const fileTypes = readResult.types ?? [];
-      for (const typeName of fileTypes) {
-        const typeDef = (opened.collection! as any).typeDefs.get(typeName);
-        if (typeDef?.fields?.[field]) {
-          const fieldDef = typeDef.fields[field];
-          targetType = (fieldDef as any).target;
-          break;
+        // Read the file to get the field value
+        const readResult = await opened.collection!.read(filePath);
+        if (readResult.error) {
+          return { error: readResult.error };
         }
-      }
+        const linkValue = readResult.frontmatter?.[field];
+        if (linkValue === null || linkValue === undefined) {
+          return { resolved_path: null };
+        }
 
-      // Use the collection's resolveLink method
-      const resolution = await (opened.collection! as any).resolveLinkFull(
-        String(linkValue),
-        filePath,
-        targetType,
-      );
-      return { resolved_path: resolution.resolved ?? null };
+        // Look up the field's target constraint from type definitions
+        let targetType: string | undefined;
+        const fileTypes = readResult.types ?? [];
+        for (const typeName of fileTypes) {
+          const typeDef = (opened.collection! as any).typeDefs.get(typeName);
+          if (typeDef?.fields?.[field]) {
+            const fieldDef = typeDef.fields[field];
+            targetType = (fieldDef as any).target;
+            break;
+          }
+        }
+
+        // Use the collection's resolveLink method
+        const resolution = await (opened.collection! as any).resolveLinkFull(
+          String(linkValue),
+          filePath,
+          targetType,
+        );
+        return { resolved_path: resolution.resolved ?? null };
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "parse_link": {
@@ -798,7 +854,11 @@ async function executeOperation(
       if (opened.error) {
         return { success: false, error: opened.error };
       }
-      return await opened.collection!.cacheRebuild();
+      try {
+        return await opened.collection!.cacheRebuild();
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "cache_clear": {
@@ -806,7 +866,11 @@ async function executeOperation(
       if (opened.error) {
         return { success: false, error: opened.error };
       }
-      return await opened.collection!.cacheClear();
+      try {
+        return await opened.collection!.cacheClear();
+      } finally {
+        await opened.collection!.close();
+      }
     }
 
     case "watch": {
@@ -834,6 +898,9 @@ async function executeOperation(
           const types = opened.collection!.getTypesForFile(f, parsed.frontmatter);
           beforeState.set(f, { frontmatter: { ...parsed.frontmatter }, body: parsed.body, types });
         } catch { /* skip */ }
+      }
+      if (opened.collection) {
+        await opened.collection.close();
       }
 
       const events: Array<Record<string, unknown>> = [];
@@ -873,22 +940,28 @@ async function executeOperation(
         try {
           const parsed = await parseFileAsync(fullPath);
           const reopened = await Collection.open(collectionRoot);
-          const types = reopened.collection ? reopened.collection.getTypesForFile(filePath, parsed.frontmatter) : [];
-          // Apply defaults from type definitions
-          const frontmatter = { ...parsed.frontmatter };
-          if (reopened.collection) {
-            for (const typeName of types) {
-              const typeDef = (reopened.collection as unknown as { typeDefs: Map<string, { fields: Record<string, { default?: unknown }> }> }).typeDefs.get(typeName);
-              if (typeDef?.fields) {
-                for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-                  if (frontmatter[fieldName] === undefined && fieldDef.default !== undefined) {
-                    frontmatter[fieldName] = fieldDef.default;
+          try {
+            const types = reopened.collection ? reopened.collection.getTypesForFile(filePath, parsed.frontmatter) : [];
+            // Apply defaults from type definitions
+            const frontmatter = { ...parsed.frontmatter };
+            if (reopened.collection) {
+              for (const typeName of types) {
+                const typeDef = (reopened.collection as unknown as { typeDefs: Map<string, { fields: Record<string, { default?: unknown }> }> }).typeDefs.get(typeName);
+                if (typeDef?.fields) {
+                  for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+                    if (frontmatter[fieldName] === undefined && fieldDef.default !== undefined) {
+                      frontmatter[fieldName] = fieldDef.default;
+                    }
                   }
                 }
               }
             }
+            return { frontmatter, body: parsed.body, types };
+          } finally {
+            if (reopened.collection) {
+              await reopened.collection.close();
+            }
           }
-          return { frontmatter, body: parsed.body, types };
         } catch {
           return null;
         }
@@ -911,12 +984,16 @@ async function executeOperation(
       async function validateFile(filePath: string): Promise<Array<{ code: string; field?: string }>> {
         const reopened = await Collection.open(collectionRoot);
         if (!reopened.collection) return [];
-        const valResult = await reopened.collection.validate(filePath);
-        if (valResult && typeof valResult === "object" && "issues" in valResult) {
-          const issues = (valResult as { issues?: Array<{ code: string; field?: string }> }).issues;
-          return issues || [];
+        try {
+          const valResult = await reopened.collection.validate(filePath);
+          if (valResult && typeof valResult === "object" && "issues" in valResult) {
+            const issues = (valResult as { issues?: Array<{ code: string; field?: string }> }).issues;
+            return issues || [];
+          }
+          return [];
+        } finally {
+          await reopened.collection.close();
         }
-        return [];
       }
 
       // Process simulation actions
