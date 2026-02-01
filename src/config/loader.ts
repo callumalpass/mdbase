@@ -19,6 +19,7 @@ export interface MdbaseSettings {
   id_field_explicit?: boolean;
   write_nulls: "omit" | "explicit";
   write_empty_lists: boolean;
+  write_defaults: boolean;
   rename_update_refs: boolean;
   cache_folder: string;
 }
@@ -48,6 +49,7 @@ const DEFAULT_SETTINGS: MdbaseSettings = {
   id_field: "id",
   write_nulls: "omit",
   write_empty_lists: true,
+  write_defaults: true,
   rename_update_refs: true,
   cache_folder: ".mdbase",
 };
@@ -70,6 +72,7 @@ const KNOWN_SETTINGS_KEYS = new Set([
   "id_field",
   "write_nulls",
   "write_empty_lists",
+  "write_defaults",
   "rename_update_refs",
   "cache_folder",
 ]);
@@ -405,6 +408,20 @@ function parseSettings(
       };
     }
     settings.write_empty_lists = raw.write_empty_lists;
+  }
+
+  // write_defaults
+  if (raw.write_defaults !== undefined) {
+    if (typeof raw.write_defaults !== "boolean") {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: "settings.write_defaults must be a boolean",
+        },
+      };
+    }
+    settings.write_defaults = raw.write_defaults;
   }
 
   // rename_update_refs

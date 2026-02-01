@@ -900,66 +900,29 @@ export class Collection {
       }
     }
 
-    // Derive path from filename_pattern if not provided
-    let relativePath = input.path;
-    if (!relativePath) {
-      // Try filename_pattern from type definitions
-      let pattern: string | undefined;
-      for (const typeName of typeNames) {
-        const typeDef = this.typeDefs.get(typeName);
-        if (typeDef?.path_pattern) {
-          pattern = typeDef.path_pattern;
-          break;
-        }
-      }
-      if (!pattern) {
-        return {
-          error: { code: "path_required", message: "No path provided and no filename_pattern defined" },
-        };
-      }
-      // Simple template replacement
-      relativePath = pattern.replace(/\{(\w+)\}/g, (_, key) => {
-        const val = input.frontmatter?.[key];
-        return val != null ? String(val) : key;
-      });
-    }
-
-    // Path validation: traversal, null bytes, and invalid characters
-    if (relativePath.includes("..") || relativePath.includes("\0")) {
-      return {
-        error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
-      };
-    }
-
-    // Check if file already exists
-    const fullPath = path.join(this.root, relativePath);
-    if (await this.fileExists(fullPath)) {
-      return {
-        error: { code: "path_conflict", message: `File already exists: ${relativePath}` },
-      };
-    }
-
     // Build frontmatter
     const frontmatter: Record<string, unknown> = { ...(input.frontmatter ?? {}) };
 
-    // Set the type key
-    if (typeNames.length === 1) {
-      const typeKey = this.config.settings.explicit_type_keys[0] ?? "type";
-      if (!(typeKey in frontmatter)) {
-        frontmatter[typeKey] = typeNames[0];
-      }
-    } else if (typeNames.length > 1) {
-      const typesKey = this.config.settings.explicit_type_keys.find((k) => k.endsWith("s")) ??
-                       this.config.settings.explicit_type_keys[0] ?? "types";
-      if (!(typesKey in frontmatter)) {
-        frontmatter[typesKey] = typeNames;
+    // Set the type key (only if explicit_type_keys is configured)
+    if (this.config.settings.explicit_type_keys.length > 0) {
+      if (typeNames.length === 1) {
+        const typeKey = this.config.settings.explicit_type_keys[0];
+        if (!(typeKey in frontmatter)) {
+          frontmatter[typeKey] = typeNames[0];
+        }
+      } else if (typeNames.length > 1) {
+        const typesKey = this.config.settings.explicit_type_keys.find((k) => k.endsWith("s")) ??
+                         this.config.settings.explicit_type_keys[0];
+        if (!(typesKey in frontmatter)) {
+          frontmatter[typesKey] = typeNames;
+        }
       }
     }
 
     // Track which fields are default-only (not user-provided, not generated)
     const defaultOnlyFields = new Set<string>();
 
-    // Apply generated fields and defaults
+    // Apply generated fields and defaults (before path derivation so generated values are available in path_pattern)
     for (const typeName of typeNames) {
       const typeDef = this.typeDefs.get(typeName);
       if (!typeDef?.fields) continue;
@@ -986,6 +949,55 @@ export class Collection {
       }
     }
 
+    // Derive path from filename_pattern if not provided
+    let relativePath = input.path;
+    if (!relativePath) {
+      // Try filename_pattern from type definitions
+      let pattern: string | undefined;
+      for (const typeName of typeNames) {
+        const typeDef = this.typeDefs.get(typeName);
+        if (typeDef?.path_pattern) {
+          pattern = typeDef.path_pattern;
+          break;
+        }
+      }
+      if (!pattern) {
+        return {
+          error: { code: "path_required", message: "No path provided and no filename_pattern defined" },
+        };
+      }
+      // Simple template replacement using enriched frontmatter (includes generated fields)
+      let unresolvedKey: string | undefined;
+      relativePath = pattern.replace(/\{(\w+)\}/g, (_, key) => {
+        const val = frontmatter[key];
+        if (val == null || String(val) === "") {
+          unresolvedKey ??= key;
+          return key; // placeholder, won't be used
+        }
+        return String(val);
+      });
+      if (unresolvedKey) {
+        return {
+          error: { code: "path_required", message: `Cannot derive path: field "${unresolvedKey}" has no value for path_pattern "${pattern}"` },
+        };
+      }
+    }
+
+    // Path validation: traversal, null bytes, and invalid characters
+    if (relativePath.includes("..") || relativePath.includes("\0")) {
+      return {
+        error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
+      };
+    }
+
+    // Check if file already exists
+    const fullPath = path.join(this.root, relativePath);
+    if (await this.fileExists(fullPath)) {
+      return {
+        error: { code: "path_conflict", message: `File already exists: ${relativePath}` },
+      };
+    }
+
     // Coerce values based on type definitions
     for (const typeName of typeNames) {
       const typeDef = this.typeDefs.get(typeName);
@@ -998,12 +1010,28 @@ export class Collection {
       }
     }
 
-    // Build the effective frontmatter (includes defaults) and the disk frontmatter (excludes default-only)
+    // Build the effective frontmatter (includes defaults) and the disk frontmatter
     const effectiveFrontmatter = { ...frontmatter };
     const diskFrontmatter: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(frontmatter)) {
-      if (!defaultOnlyFields.has(key)) {
-        diskFrontmatter[key] = value;
+    if (this.config.settings.write_defaults) {
+      Object.assign(diskFrontmatter, frontmatter);
+    } else {
+      for (const [key, value] of Object.entries(frontmatter)) {
+        if (!defaultOnlyFields.has(key)) {
+          diskFrontmatter[key] = value;
+        }
+      }
+    }
+
+    // Verify created file will satisfy match rules for explicit types
+    for (const typeName of typeNames) {
+      const typeDef = this.typeDefs.get(typeName);
+      if (typeDef?.match) {
+        if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef.match)) {
+          return {
+            error: { code: "match_failed", message: `Created file would not satisfy match rules for type "${typeName}"` },
+          };
+        }
       }
     }
 
