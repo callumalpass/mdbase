@@ -416,21 +416,20 @@ class ExprParser {
           left = (String(left) as string).includes("T")
             ? d.toISOString().replace(/\.000Z$/, "Z")
             : d.toISOString().slice(0, 10);
+        }
+        // Null propagation (before type checks)
+        else if (left === null || left === undefined || right === null || right === undefined) {
+          left = null;
         } else if (isDateString(left) && isDateString(right)) {
           left = new Date(String(left)).getTime() - new Date(String(right)).getTime();
         } else if ((typeof left === "string" && !isDateString(left)) || (typeof right === "string" && !isDateString(right))) {
-          throw new ExpressionError("type_error", `Cannot subtract strings: left=${JSON.stringify(left)} (${typeof left}), right=${JSON.stringify(right)} (${typeof right})`);
+          throw new ExpressionError("type_error", "Cannot subtract strings");
         } else if (typeof left === "boolean" || typeof right === "boolean") {
           throw new ExpressionError("type_error", "Cannot subtract booleans");
         } else if (Array.isArray(left) || Array.isArray(right)) {
           throw new ExpressionError("type_error", "Cannot subtract lists");
         } else {
-          // Null propagation
-          if (left === null || left === undefined || right === null || right === undefined) {
-            left = null;
-          } else {
-            left = toNum(left) - toNum(right);
-          }
+          left = toNum(left) - toNum(right);
         }
       }
     }
