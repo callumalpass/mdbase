@@ -137,7 +137,7 @@ function materializeSetup(setup: TestSetup): string {
       // undefined: write default
       fs.writeFileSync(
         path.join(tmpDir, "mdbase.yaml"),
-        'spec_version: "0.1.0"\n',
+        'spec_version: "0.2.0"\n',
       );
     }
   } else {
@@ -388,11 +388,27 @@ async function applyImmediateSimulate(
 /**
  * Execute a single test operation against the mdbase implementation.
  */
+async function readRawFile(collectionRoot: string, filePath: string): Promise<unknown> {
+  const fullPath = path.join(collectionRoot, filePath);
+  if (!fs.existsSync(fullPath)) {
+    return { error: { code: "file_not_found", message: `File not found: ${filePath}` } };
+  }
+  const content = fs.readFileSync(fullPath, "utf-8");
+  const parsed = matter(content);
+  return {
+    valid: true,
+    frontmatter: parsed.data as Record<string, unknown>,
+    body: parsed.content || "",
+    types: [],
+  };
+}
+
 async function executeOperation(
   collectionRoot: string,
   operation: string,
   input: Record<string, unknown>,
   simulate?: Record<string, unknown>,
+  options?: { allowTypeFileRead?: boolean },
 ): Promise<unknown> {
   switch (operation) {
     case "load_config":
@@ -429,10 +445,19 @@ async function executeOperation(
       await applyImmediateSimulate(collectionRoot, simulate);
       const opened = await Collection.open(collectionRoot);
       if (opened.error) {
+        // If collection can't open (e.g. no config) but we need raw file read
+        if (options?.allowTypeFileRead) {
+          return readRawFile(collectionRoot, input.path as string);
+        }
         return { error: opened.error };
       }
       try {
-        return await opened.collection!.read(input.path as string);
+        const readResult = await opened.collection!.read(input.path as string);
+        // Fallback for type files when allowed (e.g. verify_after for init)
+        if (readResult.error?.code === "file_not_found" && options?.allowTypeFileRead) {
+          return readRawFile(collectionRoot, input.path as string);
+        }
+        return readResult;
       } finally {
         await opened.collection!.close();
       }
@@ -495,6 +520,41 @@ async function executeOperation(
           path: input.path as string,
           fields: (input.fields ?? input.frontmatter) as Record<string, unknown> | undefined,
           body: input.body as string | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
+    }
+
+    case "backfill": {
+      const opened = await Collection.open(collectionRoot);
+      if (opened.error) {
+        return { error: opened.error };
+      }
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.backfill({
+          type: input.type as string | undefined,
+          where: input.where as string | Record<string, unknown> | undefined,
+          fields: Array.isArray(input.fields) ? (input.fields as string[]) : undefined,
+          apply: input.apply as { defaults?: boolean; generated?: boolean } | undefined,
+          dry_run: input.dry_run as boolean | undefined,
+        });
+      } finally {
+        await opened.collection!.close();
+      }
+    }
+
+    case "migrate": {
+      const opened = await Collection.open(collectionRoot);
+      if (opened.error) {
+        return { error: opened.error };
+      }
+      try {
+        await applySimulate(opened.collection!, collectionRoot, simulate);
+        return await opened.collection!.migrate({
+          id: input.id as string | undefined,
+          dry_run: input.dry_run as boolean | undefined,
         });
       } finally {
         await opened.collection!.close();
@@ -700,6 +760,15 @@ async function executeOperation(
           }
         }
       }
+      // Load typeDefs for display_name_key support
+      let typeDefs: Map<string, { display_name_key?: string; [key: string]: unknown }> | undefined;
+      if (readPath) {
+        const opened3 = await Collection.open(collectionRoot);
+        if (!opened3.error && opened3.collection) {
+          typeDefs = (opened3.collection as any).typeDefs;
+          await opened3.collection.close();
+        }
+      }
       try {
         const result = evaluateExpression(expression, {
           frontmatter,
@@ -710,6 +779,7 @@ async function executeOperation(
           file: fileInfo,
           resolveFile,
           computeBacklinks,
+          typeDefs,
         });
         return { result };
       } catch (e: unknown) {
@@ -726,8 +796,18 @@ async function executeOperation(
       }
       try {
         await applySimulate(opened.collection!, collectionRoot, simulate);
+        // Extract where from input.query if present
+        let batchDeleteWhere = input.where as string | undefined;
+        if (input.query) {
+          const q = input.query as { types?: string[]; where?: string };
+          const parts: string[] = [];
+          if (q.types?.length === 1) parts.push(`type == "${q.types[0]}"`);
+          else if (q.types?.length) parts.push(`type in [${q.types.map((t: string) => `"${t}"`).join(", ")}]`);
+          if (q.where) parts.push(q.where);
+          batchDeleteWhere = parts.join(" && ") || undefined;
+        }
         return await opened.collection!.batchDelete({
-          where: input.where as string,
+          where: batchDeleteWhere!,
           dry_run: input.dry_run as boolean | undefined,
           check_backlinks: input.check_backlinks as boolean | undefined,
         });
@@ -743,8 +823,18 @@ async function executeOperation(
       }
       try {
         await applySimulate(opened.collection!, collectionRoot, simulate);
+        // Extract where from input.query if present
+        let batchUpdateWhere = input.where as string | undefined;
+        if (input.query) {
+          const q = input.query as { types?: string[]; where?: string };
+          const parts: string[] = [];
+          if (q.types?.length === 1) parts.push(`type == "${q.types[0]}"`);
+          else if (q.types?.length) parts.push(`type in [${q.types.map((t: string) => `"${t}"`).join(", ")}]`);
+          if (q.where) parts.push(q.where);
+          batchUpdateWhere = parts.join(" && ") || undefined;
+        }
         return await opened.collection!.batchUpdate({
-          where: input.where as string | undefined,
+          where: batchUpdateWhere,
           fields: input.fields as Record<string, unknown> | undefined,
           updates: input.updates as Array<{ path: string; fields: Record<string, unknown> }> | undefined,
           dry_run: input.dry_run as boolean | undefined,
@@ -1242,6 +1332,11 @@ async function executeOperation(
       }
 
       return { events };
+    }
+
+    case "init": {
+      const result = await Collection.init(collectionRoot, input);
+      return result;
     }
 
     default:
@@ -1943,6 +2038,9 @@ if (allTests.size === 0) {
               describe(group.name, () => {
                 // Detect if group has mutating operations (batch, create, update, delete, rename)
                 const MUTATING_OPS = new Set(["create", "update", "delete", "rename", "batch_delete", "batch_update", "create_type", "cache_rebuild", "cache_clear"]);
+                // Detect if group contains init operations — reads in init groups
+                // need raw file access for verifying type files created by init
+                const groupHasInit = group.tests.some((t) => t.operation === "init");
                 const groupHasMutating = group.tests.some((t) => {
                   if (MUTATING_OPS.has(t.operation)) return true;
                   // Tests with simulate that contains external modifications are effectively mutating
@@ -1999,11 +2097,13 @@ if (allTests.size === 0) {
                     try {
                       const inputObj = testCase.input ?? {};
                       const simulate = (testCase.simulate ?? inputObj.simulate) as Record<string, unknown> | undefined;
+                      const execOptions = groupHasInit ? { allowTypeFileRead: true } : undefined;
                       const result = await executeOperation(
                         root,
                         testCase.operation,
                         inputObj,
                         simulate,
+                        execOptions,
                       );
                       if (testCase.expect) {
                         await assertExpectation(result, testCase.expect, testCase.name, root);
@@ -2019,6 +2119,8 @@ if (allTests.size === 0) {
                             root,
                             step.operation,
                             step.input ?? {},
+                            undefined,
+                            { allowTypeFileRead: true },
                           );
                           if (step.expect) {
                             await assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);
@@ -2086,6 +2188,8 @@ if (allTests.size === 0) {
                         root,
                         step.operation,
                         step.input ?? {},
+                        undefined,
+                        { allowTypeFileRead: true },
                       );
                       if (step.expect) {
                         await assertExpectation(verifyResult, step.expect, `${testCase.name} [verify_after: ${step.operation}]`, root);

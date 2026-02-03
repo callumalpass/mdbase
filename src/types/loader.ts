@@ -16,7 +16,7 @@ export interface FieldDefinition {
   default?: unknown;
   deprecated?: boolean;
   unique?: boolean;
-  generated?: string | { from: string; transform: string };
+  generated?: string | { from: string; transform: string } | { random: number } | { sequence: unknown };
   computed?: string;
   // String constraints
   min_length?: number;
@@ -53,6 +53,7 @@ export interface TypeDefinition {
   path_pattern?: string;
   validation?: string;
   match?: MatchRules;
+  display_name_key?: string;
 }
 
 export interface TypeLoadResult {
@@ -89,6 +90,7 @@ export async function loadTypesAsync(
 ): Promise<TypeLoadResult> {
   const warnings: string[] = [];
   const typesFolder = path.join(collectionRoot, config.settings.types_folder);
+  const migrationsFolder = path.resolve(collectionRoot, config.settings.migrations_folder);
   const rawTypes = new Map<string, TypeDefinition>();
 
   try {
@@ -98,7 +100,13 @@ export async function loadTypesAsync(
   }
 
   // Read all .md files from the types folder (recursively)
-  const typeFiles = await findMarkdownFilesAsync(typesFolder);
+  let typeFiles = await findMarkdownFilesAsync(typesFolder);
+  // Exclude migration manifests from type loading
+  typeFiles = typeFiles.filter((filePath) => {
+    const normalized = path.resolve(filePath);
+    if (normalized === migrationsFolder) return false;
+    return !normalized.startsWith(migrationsFolder + path.sep);
+  });
 
   for (const filePath of typeFiles) {
     const relativeName = path.relative(typesFolder, filePath);
@@ -187,8 +195,17 @@ export async function loadTypesAsync(
       typeDef.fields = data.fields as Record<string, FieldDefinition>;
       // Validate field definitions
       for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-        // Validate enum values are strings
+        // Validate enum values are strings and non-empty
         if (fieldDef.type === "enum" && fieldDef.values) {
+          if (fieldDef.values.length === 0) {
+            return {
+              valid: false,
+              error: {
+                code: "invalid_type_definition",
+                message: `Type "${typeName}" field "${fieldName}": enum values list must not be empty`,
+              },
+            };
+          }
           for (const val of fieldDef.values) {
             if (typeof val !== "string") {
               return {
@@ -245,6 +262,19 @@ export async function loadTypesAsync(
             };
           }
         }
+        // Validate random generation length
+        if (typeof fieldDef.generated === "object" && fieldDef.generated !== null && "random" in fieldDef.generated) {
+          const len = (fieldDef.generated as Record<string, unknown>).random;
+          if (typeof len !== "number" || len <= 0 || !Number.isInteger(len)) {
+            return { valid: false, error: { code: "invalid_type_definition", message: `Type "${typeName}" field "${fieldName}": random length must be a positive integer` } };
+          }
+        }
+        // Validate sequence requires integer type
+        if (fieldDef.generated === "sequence" || (typeof fieldDef.generated === "object" && fieldDef.generated !== null && "sequence" in fieldDef.generated)) {
+          if (fieldDef.type !== "integer") {
+            return { valid: false, error: { code: "invalid_type_definition", message: `Type "${typeName}" field "${fieldName}": sequence generation requires integer type` } };
+          }
+        }
       }
     }
     if (data.path_pattern !== undefined) {
@@ -268,8 +298,47 @@ export async function loadTypesAsync(
       }
       if (matchData.where !== undefined && typeof matchData.where === "object" && matchData.where !== null) {
         match.where = matchData.where as Record<string, unknown>;
+        // Reject match.where that references a computed field
+        if (typeDef.fields) {
+          for (const whereField of Object.keys(match.where)) {
+            const fieldDef = typeDef.fields[whereField];
+            if (fieldDef && fieldDef.computed) {
+              return { valid: false, error: { code: "invalid_type_definition", message: `Type "${typeName}": match.where references computed field "${whereField}"` } };
+            }
+          }
+        }
       }
       typeDef.match = match;
+    }
+
+    // Parse display_name_key
+    if (data.display_name_key !== undefined) {
+      typeDef.display_name_key = String(data.display_name_key);
+    }
+
+    // Warn about unknown field references in path_pattern, and reject circular deps
+    if (typeDef.path_pattern && typeDef.fields) {
+      const fieldNames = new Set(Object.keys(typeDef.fields));
+      const re = /\{(\w+)\}/g;
+      let m;
+      while ((m = re.exec(typeDef.path_pattern)) !== null) {
+        if (!fieldNames.has(m[1])) {
+          warnings.push(`Type "${typeName}": path_pattern references unknown field "${m[1]}"`);
+        } else {
+          const referencedField = typeDef.fields[m[1]];
+          // Reject if path_pattern references a field generated from file.* (circular)
+          if (referencedField && typeof referencedField.generated === "object" && referencedField.generated !== null) {
+            const genObj = referencedField.generated as Record<string, unknown>;
+            if ("from" in genObj && typeof genObj.from === "string" && genObj.from.startsWith("file.")) {
+              return { valid: false, error: { code: "invalid_type_definition", message: `Type "${typeName}": path_pattern references field "${m[1]}" which is generated from "${genObj.from}" (circular dependency)` } };
+            }
+          }
+          // Reject if path_pattern references a computed field (circular)
+          if (referencedField && referencedField.computed) {
+            return { valid: false, error: { code: "invalid_type_definition", message: `Type "${typeName}": path_pattern references computed field "${m[1]}"` } };
+          }
+        }
+      }
     }
 
     rawTypes.set(typeName, typeDef);
@@ -532,6 +601,10 @@ function resolveInheritance(types: Map<string, TypeDefinition>): InheritanceResu
     // Inherit match rules from parent if not set
     if (resolvedType.match === undefined && parent.match !== undefined) {
       resolvedType.match = parent.match;
+    }
+    // Inherit display_name_key from parent if not set
+    if (resolvedType.display_name_key === undefined && parent.display_name_key !== undefined) {
+      resolvedType.display_name_key = parent.display_name_key;
     }
     // Don't carry extends into the resolved type
     delete resolvedType.extends;

@@ -149,8 +149,57 @@ export class Collection {
     this.cache = null;
   }
 
+  static async init(collectionRoot: string, input?: Record<string, unknown>): Promise<Record<string, unknown>> {
+    // Extract types_folder from input config if provided
+    let typesFolder = "_types";
+    const inputConfig = input?.config as Record<string, unknown> | undefined;
+    if (inputConfig?.settings) {
+      const settings = inputConfig.settings as Record<string, unknown>;
+      if (settings.types_folder) {
+        typesFolder = String(settings.types_folder);
+      }
+    }
+    if (input?.types_folder) {
+      typesFolder = String(input.types_folder);
+    }
+
+    const configPath = path.join(collectionRoot, "mdbase.yaml");
+    const typesFolderPath = path.join(collectionRoot, typesFolder);
+    const metaTypePath = path.join(typesFolderPath, "meta.md");
+
+    // Create mdbase.yaml
+    await fs.promises.mkdir(collectionRoot, { recursive: true });
+    let configContent = 'spec_version: "0.2.0"\n';
+    if (inputConfig) {
+      // Serialize the provided config
+      const lines: string[] = [];
+      if (inputConfig.spec_version) lines.push(`spec_version: "${inputConfig.spec_version}"`);
+      else lines.push('spec_version: "0.2.0"');
+      if (inputConfig.settings) {
+        lines.push("settings:");
+        const settings = inputConfig.settings as Record<string, unknown>;
+        for (const [k, v] of Object.entries(settings)) {
+          lines.push(`  ${k}: ${typeof v === "string" ? `"${v}"` : v}`);
+        }
+      }
+      configContent = lines.join("\n") + "\n";
+    }
+    await fs.promises.writeFile(configPath, configContent);
+
+    // Create types folder and meta type with full schema
+    await fs.promises.mkdir(typesFolderPath, { recursive: true });
+    const metaContent = `---\nname: meta\nmatch:\n  path_glob: "${typesFolder}/**/*.md"\nstrict: false\nfields:\n  name:\n    type: string\n  fields:\n    type: any\n---\n`;
+    await fs.promises.writeFile(metaTypePath, metaContent);
+
+    return {
+      config_path: "mdbase.yaml",
+      types_folder: typesFolder,
+      meta_type_path: path.join(typesFolder, "meta.md"),
+    };
+  }
+
   static async open(collectionRoot: string): Promise<{ collection?: Collection; error?: { code: string; message: string } }> {
-    const configResult = await loadConfigAsync(collectionRoot);
+    const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
     if (!configResult.valid || !configResult.config) {
       return { error: configResult.error };
     }
@@ -188,6 +237,11 @@ export class Collection {
     // Cache folder excluded
     if (relativePath.startsWith(this.config.settings.cache_folder + "/") ||
         relativePath === this.config.settings.cache_folder) {
+      return true;
+    }
+    // Migrations folder excluded
+    if (relativePath.startsWith(this.config.settings.migrations_folder + "/") ||
+        relativePath === this.config.settings.migrations_folder) {
       return true;
     }
     // Nested collection boundary check: if a subdirectory has mdbase.yaml, don't scan into it
@@ -641,6 +695,7 @@ export class Collection {
             types,
             body,
             computedFields: resolved,
+            typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
           });
           resolved.set(fieldName, result);
           progress = true;
@@ -931,7 +986,24 @@ export class Collection {
         if (fieldName in frontmatter && frontmatter[fieldName] !== undefined) continue;
 
         if (fieldDef.generated) {
-          const generated = this.generateValue(fieldDef, frontmatter);
+          // Sequence generation needs collection scan — handle inline
+          if (fieldDef.generated === "sequence" || (typeof fieldDef.generated === "object" && fieldDef.generated !== null && "sequence" in fieldDef.generated)) {
+            const files = await this.scanFiles();
+            let max = -Infinity;
+            const startConfig = typeof fieldDef.generated === "object" ? (fieldDef.generated as Record<string, unknown>).sequence : undefined;
+            const start = (typeof startConfig === "object" && startConfig !== null) ? ((startConfig as Record<string, unknown>).start as number ?? 1) : 1;
+            for (const f of files) {
+              const r = await this.read(f);
+              if (r.error || !r.types?.includes(typeName)) continue;
+              const val = r.frontmatter?.[fieldName];
+              if (typeof val === "number" && Number.isFinite(val)) {
+                max = Math.max(max, val);
+              }
+            }
+            frontmatter[fieldName] = max === -Infinity ? start : max + 1;
+            continue;
+          }
+          const generated = this.generateValue(fieldDef, frontmatter, { typeName, fieldName, relativePath: input.path });
           if (generated !== undefined && generated !== null) {
             frontmatter[fieldName] = generated;
           } else if (fieldDef.default !== undefined) {
@@ -983,6 +1055,24 @@ export class Collection {
       }
     }
 
+    // Second pass: resolve file.*-sourced generated fields now that path is known
+    for (const typeName of typeNames) {
+      const typeDef = this.typeDefs.get(typeName);
+      if (!typeDef?.fields) continue;
+      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+        if (frontmatter[fieldName] !== null && frontmatter[fieldName] !== undefined) continue;
+        if (typeof fieldDef.generated === "object" && fieldDef.generated !== null && "from" in (fieldDef.generated as Record<string, unknown>)) {
+          const genObj = fieldDef.generated as { from: string; transform: string };
+          if (genObj.from && genObj.from.startsWith("file.")) {
+            const generated = this.generateValue(fieldDef, frontmatter, { typeName, fieldName, relativePath });
+            if (generated !== undefined && generated !== null) {
+              frontmatter[fieldName] = generated;
+            }
+          }
+        }
+      }
+    }
+
     // Path validation: traversal, null bytes, and invalid characters
     if (relativePath.includes("..") || relativePath.includes("\0")) {
       return {
@@ -1012,8 +1102,16 @@ export class Collection {
 
     // Build the effective frontmatter (includes defaults) and the disk frontmatter
     const effectiveFrontmatter = { ...frontmatter };
+
+    // Check if any type has generated fields — if so, suppress default-only fields from disk
+    // even when write_defaults is true (generated types handle defaults differently)
+    const typeHasGeneratedFields = typeNames.some((tn) => {
+      const td = this.typeDefs.get(tn);
+      return td?.fields && Object.values(td.fields).some((f) => f.generated);
+    });
+
     const diskFrontmatter: Record<string, unknown> = {};
-    if (this.config.settings.write_defaults) {
+    if (this.config.settings.write_defaults && !typeHasGeneratedFields) {
       Object.assign(diskFrontmatter, frontmatter);
     } else {
       for (const [key, value] of Object.entries(frontmatter)) {
@@ -1552,7 +1650,7 @@ export class Collection {
             // the link field has a target constraint, and the link is a simple-name
             // wikilink matching the renamed file's ID, skip the update (§12.5 rule 3)
             const fieldTarget = (fieldDef as unknown as Record<string, unknown>).target as string | undefined;
-            if (fieldTarget && renamedFileId && this.config.settings.id_field_explicit && this.isIdStableLink(value, renamedFileId)) {
+            if (this.config.settings.id_field_explicit && fieldTarget && renamedFileId && this.isIdStableLink(value, renamedFileId)) {
               continue;
             }
             const result = this.updateLinkValue(value, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
@@ -1571,7 +1669,7 @@ export class Collection {
               const item = newList[i];
               if (typeof item !== "string") continue;
               // ID-based link stability for list items
-              if (itemTarget && renamedFileId && this.config.settings.id_field_explicit && this.isIdStableLink(item, renamedFileId)) {
+              if (this.config.settings.id_field_explicit && itemTarget && renamedFileId && this.isIdStableLink(item, renamedFileId)) {
                 continue;
               }
               const result = this.updateLinkValue(item, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
@@ -1736,6 +1834,18 @@ export class Collection {
 
     if (!matchesOld && !resolvedOldTarget && !resolvesToNew) {
       return { updated: false, newValue: linkValue };
+    }
+
+    // ID-based link stability for links without field-level target constraint:
+    // If id_field is explicitly configured and the link matches the renamed file's id,
+    // but does NOT match the old filename (case-sensitive), the link resolves via id
+    // and is stable — don't rewrite it. (§12.5)
+    // Links that match both the id AND the old filename are ambiguous and get rewritten.
+    if (this.config.settings.id_field_explicit && renamedFileId && this.isIdStableLink(linkValue, renamedFileId)) {
+      const oldBasename = path.basename(oldPath, path.extname(oldPath));
+      if (parsed.target !== oldBasename) {
+        return { updated: false, newValue: linkValue };
+      }
     }
 
     // Check for ambiguous resolution
@@ -2095,6 +2205,7 @@ export class Collection {
                 file: fileInfo,
                 thisContext,
                 strictArithmetic: true,
+                typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
               };
               const val = evaluateExpression(expr, formulaCtx);
               resolved.set(name, val);
@@ -2152,6 +2263,7 @@ export class Collection {
             thisContext,
             resolveFile,
             computeBacklinks,
+            typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
           };
           try {
             const whereResult = evaluateExpression(input.where, ctx);
@@ -2232,6 +2344,7 @@ export class Collection {
                   frontmatter: a.frontmatter, path: a.path, types: a.types,
                   body: a.body ?? undefined, file: a._file,
                   computeBacklinks: backlinksCb,
+                  typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
                 });
               } catch { va = null; }
               try {
@@ -2239,6 +2352,7 @@ export class Collection {
                   frontmatter: b.frontmatter, path: b.path, types: b.types,
                   body: b.body ?? undefined, file: b._file,
                   computeBacklinks: backlinksCb,
+                  typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
                 });
               } catch { vb = null; }
             }
@@ -2263,6 +2377,29 @@ export class Collection {
             const ib = enumOrder.get(String(vb)) ?? Infinity;
             if (ia !== ib) return desc ? ib - ia : ia - ib;
             return 0;
+          }
+
+          // Non-scalar: lists sorted by length, objects by key count (§10.3)
+          const aIsArray = Array.isArray(va);
+          const bIsArray = Array.isArray(vb);
+          if (aIsArray || bIsArray) {
+            const la = aIsArray ? (va as unknown[]).length : 0;
+            const lb = bIsArray ? (vb as unknown[]).length : 0;
+            if (la !== lb) return desc ? lb - la : la - lb;
+            // Tie-breaker: file.path ascending
+            const pa = a._file?.path ?? a.path ?? "";
+            const pb = b._file?.path ?? b.path ?? "";
+            return pa < pb ? -1 : pa > pb ? 1 : 0;
+          }
+          const aIsObj = typeof va === "object" && va !== null;
+          const bIsObj = typeof vb === "object" && vb !== null;
+          if (aIsObj || bIsObj) {
+            const ka = aIsObj ? Object.keys(va as Record<string, unknown>).length : 0;
+            const kb = bIsObj ? Object.keys(vb as Record<string, unknown>).length : 0;
+            if (ka !== kb) return desc ? kb - ka : ka - kb;
+            const pa = a._file?.path ?? a.path ?? "";
+            const pb = b._file?.path ?? b.path ?? "";
+            return pa < pb ? -1 : pa > pb ? 1 : 0;
           }
 
           if (va < vb) return desc ? 1 : -1;
@@ -2844,6 +2981,415 @@ export class Collection {
   }
 
   /**
+   * Backfill defaults and/or generated fields for matching files.
+   */
+  async backfill(input: {
+    type?: string;
+    where?: string | Record<string, unknown>;
+    fields?: string[];
+    apply?: { defaults?: boolean; generated?: boolean };
+    dry_run?: boolean;
+  }): Promise<BatchResult> {
+    const applyDefaults = input.apply?.defaults !== false;
+    const applyGenerated = input.apply?.generated !== false;
+    const typeName = input.type ? String(input.type).toLowerCase() : undefined;
+
+    if (!typeName && !input.where) {
+      return {
+        error: { code: "invalid_request", message: "backfill requires type or where" },
+        batch_result: { total: 0, succeeded: 0, failed: 0, details: [] },
+      };
+    }
+
+    if (typeName && !this.typeDefs.has(typeName)) {
+      return {
+        error: { code: "unknown_type", message: `Unknown type "${typeName}"` },
+        batch_result: { total: 0, succeeded: 0, failed: 0, details: [] },
+      };
+    }
+
+    const files = await this.scanFiles();
+    const fileCache = await this.buildFileCache(files);
+
+    const candidates: Array<{
+      path: string;
+      rawFrontmatter: Record<string, unknown>;
+      frontmatter: Record<string, unknown>;
+      types: string[];
+      body?: string | null;
+    }> = [];
+
+    for (const relativePath of files) {
+      const readResult = fileCache.get(relativePath);
+      if (!readResult || readResult.error) continue;
+      const types = readResult.types ?? [];
+      if (typeName && !types.includes(typeName)) continue;
+      if (input.where) {
+        const ctx = {
+          frontmatter: readResult.frontmatter ?? {},
+          path: relativePath,
+          types,
+          body: readResult.body,
+        };
+        const matches = this.evaluateStructuredWhere(
+          input.where,
+          ctx.frontmatter,
+          ctx.path,
+          ctx.types,
+          ctx.body,
+        );
+        if (!matches) continue;
+      }
+      candidates.push({
+        path: relativePath,
+        rawFrontmatter: (readResult.rawFrontmatter ?? readResult.frontmatter ?? {}) as Record<string, unknown>,
+        frontmatter: (readResult.frontmatter ?? {}) as Record<string, unknown>,
+        types,
+        body: readResult.body,
+      });
+    }
+
+    if (candidates.length === 0) {
+      return {
+        batch_result: { total: 0, succeeded: 0, failed: 0, details: [] },
+      };
+    }
+
+    const fieldFilter = input.fields ? new Set(input.fields.map(String)) : null;
+
+    // Precompute sequence counters for generated sequence fields
+    const sequenceCounters = new Map<string, Map<string, number>>();
+    if (applyGenerated) {
+      const relevantTypes = typeName
+        ? [typeName]
+        : Array.from(new Set(candidates.flatMap((c) => c.types)));
+
+      for (const tName of relevantTypes) {
+        const typeDef = this.typeDefs.get(tName);
+        if (!typeDef?.fields) continue;
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          if (fieldFilter && !fieldFilter.has(fieldName)) continue;
+          const gen = fieldDef.generated;
+          const isSequence = gen === "sequence" || (typeof gen === "object" && gen !== null && "sequence" in gen);
+          if (!isSequence) continue;
+          const startConfig = typeof gen === "object" ? (gen as Record<string, unknown>).sequence : undefined;
+          const start = (typeof startConfig === "object" && startConfig !== null)
+            ? ((startConfig as Record<string, unknown>).start as number ?? 1)
+            : 1;
+          let max = -Infinity;
+          for (const [filePath, readResult] of fileCache) {
+            const fileTypes = readResult.types ?? [];
+            if (!fileTypes.includes(tName)) continue;
+            const rawFm = (readResult.rawFrontmatter ?? readResult.frontmatter ?? {}) as Record<string, unknown>;
+            const val = rawFm[fieldName];
+            if (typeof val === "number" && Number.isFinite(val)) {
+              max = Math.max(max, val);
+            }
+          }
+          const next = max === -Infinity ? start : max + 1;
+          if (!sequenceCounters.has(tName)) sequenceCounters.set(tName, new Map());
+          sequenceCounters.get(tName)!.set(fieldName, next);
+        }
+      }
+    }
+
+    const updates: Array<{
+      path: string;
+      body: string | null | undefined;
+      updated: Record<string, unknown>;
+      types: string[];
+    }> = [];
+    const details: BatchResultDetail[] = [];
+    const detailByPath = new Map<string, BatchResultDetail>();
+    let skipped = 0;
+    let noopSucceeded = 0;
+
+    // Deterministic order for sequence assignment
+    candidates.sort((a, b) => a.path.localeCompare(b.path));
+
+    for (const candidate of candidates) {
+      const updated: Record<string, unknown> = { ...candidate.rawFrontmatter };
+      let changed = false;
+      let sawExplicitNull = false;
+
+      const typeNamesToApply = typeName ? [typeName] : candidate.types;
+      for (const tName of typeNamesToApply) {
+        const typeDef = this.typeDefs.get(tName);
+        if (!typeDef?.fields) continue;
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          if (fieldFilter && !fieldFilter.has(fieldName)) continue;
+          if (fieldDef.computed) continue;
+          if (fieldName in updated) {
+            if (updated[fieldName] === null) {
+              sawExplicitNull = true;
+            }
+            continue; // treat null as present
+          }
+
+          if (applyGenerated && fieldDef.generated) {
+            let generated: unknown;
+            const gen = fieldDef.generated;
+            const isSequence = gen === "sequence" || (typeof gen === "object" && gen !== null && "sequence" in gen);
+            if (isSequence) {
+              const counter = sequenceCounters.get(tName)?.get(fieldName);
+              if (counter !== undefined) {
+                generated = counter;
+                sequenceCounters.get(tName)!.set(fieldName, counter + 1);
+              }
+            } else {
+              generated = this.generateValue(fieldDef, updated, {
+                typeName: tName,
+                fieldName,
+                relativePath: candidate.path,
+              });
+            }
+
+            if (generated === undefined || generated === null) {
+              if (applyDefaults && fieldDef.default !== undefined) {
+                updated[fieldName] = fieldDef.default;
+              } else {
+                updated[fieldName] = null;
+              }
+            } else {
+              updated[fieldName] = generated;
+            }
+            if (updated[fieldName] !== null && updated[fieldName] !== undefined) {
+              updated[fieldName] = coerceForRead(updated[fieldName], fieldDef);
+            }
+            changed = true;
+            continue;
+          }
+
+          if (applyDefaults && fieldDef.default !== undefined) {
+            updated[fieldName] = fieldDef.default;
+            if (updated[fieldName] !== null && updated[fieldName] !== undefined) {
+              updated[fieldName] = coerceForRead(updated[fieldName], fieldDef);
+            }
+            changed = true;
+          }
+        }
+      }
+
+      if (!changed) {
+        if (sawExplicitNull) {
+          skipped++;
+          const detail = { path: candidate.path, status: "skipped" as const };
+          details.push(detail);
+          detailByPath.set(candidate.path, detail);
+        } else {
+          noopSucceeded++;
+          const detail = { path: candidate.path, status: "success" as const };
+          details.push(detail);
+          detailByPath.set(candidate.path, detail);
+        }
+        continue;
+      }
+
+      updates.push({
+        path: candidate.path,
+        body: candidate.body,
+        updated,
+        types: candidate.types,
+      });
+      const detail = { path: candidate.path, status: "success" as const };
+      details.push(detail);
+      detailByPath.set(candidate.path, detail);
+    }
+
+    if (updates.length === 0) {
+      return {
+        batch_result: {
+          total: candidates.length,
+          succeeded: noopSucceeded,
+          failed: 0,
+          skipped: skipped > 0 ? skipped : undefined,
+          details,
+        },
+      };
+    }
+
+    // Pre-validate all updates when validation is "error"
+    if (this.config.settings.default_validation === "error") {
+      for (const upd of updates) {
+        const typeDefs = upd.types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
+        if (typeDefs.length > 0) {
+          const valResult = validateFrontmatter(upd.updated, typeDefs, this.config);
+          if (!valResult.valid) {
+            return {
+              error: { code: "validation_failed", message: "Validation failed on backfill" },
+              batch_result: { total: 0, succeeded: 0, failed: 0, details: [] },
+            };
+          }
+        }
+        const uniqueIssues = await this.checkUpdateUniqueness(upd.path, upd.updated, upd.types);
+        if (uniqueIssues.length > 0) {
+          return {
+            error: { code: "validation_failed", message: "Uniqueness constraint violated on backfill" },
+            batch_result: { total: 0, succeeded: 0, failed: 0, details: [] },
+          };
+        }
+      }
+    }
+
+    if (input.dry_run) {
+      return {
+        batch_result: {
+          total: candidates.length,
+          succeeded: updates.length + noopSucceeded,
+          failed: 0,
+          skipped: skipped > 0 ? skipped : undefined,
+          details,
+        },
+      };
+    }
+
+    // Apply updates
+    let succeeded = 0;
+    let failed = 0;
+
+    for (const upd of updates) {
+      if (this.ioErrorPaths?.has(upd.path)) {
+        failed++;
+        const detail = detailByPath.get(upd.path);
+        if (detail) {
+          detail.status = "failed";
+          detail.error = { code: "io_error", message: `I/O error updating ${upd.path}` };
+        }
+        continue;
+      }
+      try {
+        const diskFrontmatter = { ...upd.updated };
+        // Strip computed fields from disk frontmatter
+        for (const typeNameForStrip of upd.types) {
+          const typeDef = this.typeDefs.get(typeNameForStrip);
+          if (!typeDef?.fields) continue;
+          for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+            if (fieldDef.computed) {
+              delete diskFrontmatter[fieldName];
+            }
+          }
+        }
+        const content = serializeFile(
+          diskFrontmatter,
+          upd.body ?? "",
+          this.config.settings.write_nulls,
+          this.config.settings.write_empty_lists,
+        );
+        const fullPath = path.join(this.root, upd.path);
+        await fs.promises.writeFile(fullPath, content);
+        await this.updateCacheForPath(upd.path);
+        succeeded++;
+      } catch {
+        failed++;
+        const detail = detailByPath.get(upd.path);
+        if (detail) {
+          detail.status = "failed";
+          detail.error = { code: "io_error", message: `Failed to update ${upd.path}` };
+        }
+      }
+    }
+
+    return {
+      batch_result: {
+        total: candidates.length,
+        succeeded: succeeded + noopSucceeded,
+        failed,
+        skipped: skipped > 0 ? skipped : undefined,
+        details,
+      },
+    };
+  }
+
+  /**
+   * Run a migration manifest by id.
+   */
+  async migrate(input: { id?: string; dry_run?: boolean }): Promise<Record<string, unknown>> {
+    if (!input.id) {
+      return { error: { code: "invalid_request", message: "migrate requires id" } };
+    }
+
+    const migrationsRoot = path.join(this.root, this.config.settings.migrations_folder);
+    const manifest = await this.loadMigrationManifest(migrationsRoot, input.id);
+    if (!manifest) {
+      return { error: { code: "invalid_migration", message: `Migration "${input.id}" not found` } };
+    }
+
+    if (!Array.isArray(manifest.steps)) {
+      return { error: { code: "invalid_migration", message: "Migration manifest missing steps" } };
+    }
+
+    const stepsResult: Array<Record<string, unknown>> = [];
+    for (const step of manifest.steps) {
+      if (!step || typeof step !== "object") {
+        return { error: { code: "invalid_migration", message: "Invalid migration step" } };
+      }
+      const stepObj = step as Record<string, unknown>;
+      const op = String(stepObj.op ?? "");
+      const stepId = stepObj.id !== undefined ? String(stepObj.id) : undefined;
+
+      if (op === "add_field") {
+        stepsResult.push({ id: stepId, op, status: "manual" });
+        continue;
+      }
+
+      if (op === "backfill") {
+        const backfillResult = await this.backfill({
+          type: stepObj.type as string | undefined,
+          where: stepObj.where as string | Record<string, unknown> | undefined,
+          fields: Array.isArray(stepObj.fields) ? stepObj.fields.map(String) : undefined,
+          apply: stepObj.apply as { defaults?: boolean; generated?: boolean } | undefined,
+          dry_run: input.dry_run ?? false,
+        });
+        if (backfillResult.error) {
+          return { error: { code: "migration_failed", message: "Migration failed" } };
+        }
+        stepsResult.push({ id: stepId, op, status: "success" });
+        continue;
+      }
+
+      return { error: { code: "invalid_migration", message: `Unknown migration op "${op}"` } };
+    }
+
+    return {
+      migration_result: {
+        id: manifest.id,
+        steps: stepsResult,
+      },
+    };
+  }
+
+  private async loadMigrationManifest(
+    migrationsRoot: string,
+    migrationId: string,
+  ): Promise<Record<string, unknown> | null> {
+    let entries: fs.Dirent[];
+    try {
+      entries = await fs.promises.readdir(migrationsRoot, { withFileTypes: true });
+    } catch {
+      return null;
+    }
+
+    for (const entry of entries) {
+      const fullPath = path.join(migrationsRoot, entry.name);
+      if (entry.isDirectory()) {
+        const nested = await this.loadMigrationManifest(fullPath, migrationId);
+        if (nested) return nested;
+        continue;
+      }
+      if (!entry.name.endsWith(".md") && !entry.name.endsWith(".markdown")) continue;
+      const parsed = await parseFileAsync(fullPath);
+      if (parsed.error) continue;
+      const data = parsed.frontmatter as Record<string, unknown>;
+      if (!data || typeof data !== "object") continue;
+      if (data.id && String(data.id) === migrationId) {
+        return data;
+      }
+    }
+
+    return null;
+  }
+
+  /**
    * Rebuild cache from disk.
    */
   async cacheRebuild(): Promise<CacheOpResult> {
@@ -2887,6 +3433,7 @@ export class Collection {
   private generateValue(
     fieldDef: FieldDefinition,
     frontmatter: Record<string, unknown>,
+    context?: { typeName?: string; fieldName?: string; relativePath?: string },
   ): unknown {
     const gen = fieldDef.generated;
     if (typeof gen === "string") {
@@ -2899,22 +3446,50 @@ export class Collection {
           return new Date().toISOString();
         case "now_on_write":
           return new Date().toISOString();
+        case "sequence":
+          // Handled inline in create() flow
+          return undefined;
       }
     } else if (typeof gen === "object" && gen !== null) {
+      // Random strategy: { random: length }
+      if ("random" in gen) {
+        const length = (gen as Record<string, unknown>).random as number;
+        const charset = "abcdefghijklmnopqrstuvwxyz0123456789";
+        let result = "";
+        for (let i = 0; i < length; i++) {
+          result += charset[Math.floor(Math.random() * charset.length)];
+        }
+        return result;
+      }
+      // Sequence strategy: { sequence: ... } — handled inline in create()
+      if ("sequence" in gen) {
+        return undefined;
+      }
       // Derived field: { from: "field", transform: "slugify" }
-      const sourceValue = frontmatter[gen.from];
+      const genObj = gen as { from: string; transform: string };
+      let sourceValue: unknown;
+      if (genObj.from && genObj.from.startsWith("file.")) {
+        const prop = genObj.from.slice(5);
+        if ((prop === "name" || prop === "basename") && context?.relativePath) {
+          sourceValue = path.basename(context.relativePath, path.extname(context.relativePath));
+        }
+      } else if (genObj.from) {
+        sourceValue = frontmatter[genObj.from];
+      }
       if (sourceValue === null || sourceValue === undefined) {
         return null;
       }
-      if (gen.transform === "slugify") {
+      if (genObj.transform === "slugify") {
         return slugify(String(sourceValue));
       }
-      if (gen.transform === "lowercase") {
+      if (genObj.transform === "lowercase") {
         return String(sourceValue).toLowerCase();
       }
-      if (gen.transform === "uppercase") {
+      if (genObj.transform === "uppercase") {
         return String(sourceValue).toUpperCase();
       }
+      // No transform or unrecognized transform: return source value as-is
+      return String(sourceValue);
     }
     return undefined;
   }

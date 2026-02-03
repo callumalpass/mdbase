@@ -46,6 +46,7 @@ export interface EvalContext {
     path: string;
     file?: Record<string, unknown>;
   };
+  typeDefs?: Map<string, { display_name_key?: string; [key: string]: unknown }>;
 }
 
 // ── Token types ──
@@ -983,6 +984,7 @@ class ExprParser {
           });
         }
         case "reduce": {
+          if (args.length < 2) throw new ExpressionError("wrong_argument_count", `reduce() expects 2 arguments (expression, initial), got ${args.length}`);
           const reduceExpr = rawArgs?.[0] ?? String(args[0] ?? "");
           let acc: unknown = args[1] ?? null;
           for (let idx = 0; idx < obj.length; idx++) {
@@ -1314,10 +1316,24 @@ class ExprParser {
         ? this.ctx.computeBacklinks(this.ctx.path)
         : [];
 
+      // Compute display_name from type definition's display_name_key
+      const display_name = (() => {
+        for (const typeName of (this.ctx.types ?? [])) {
+          const td = this.ctx.typeDefs?.get(typeName);
+          if (td?.display_name_key) {
+            const val = this.ctx.frontmatter?.[td.display_name_key];
+            if (val != null && String(val) !== "") return String(val);
+          }
+        }
+        // Fallback to basename without extension
+        return fullName.replace(/\.[^.]+$/, "");
+      })();
+
       return {
         path: this.ctx.path ?? "",
         name: fullName,
         basename: fullName.replace(/\.[^.]+$/, ""),
+        display_name,
         folder: this.ctx.path ? (() => { const p = this.ctx.path!.split("/"); return p.length > 1 ? p.slice(0, -1).join("/") : ""; })() : "",
         extension: "md",
         ext: "md",
@@ -1335,9 +1351,9 @@ class ExprParser {
       };
     }
 
-    // Handle "note" namespace (alias for frontmatter access)
+    // Handle "note" namespace (alias for raw frontmatter access)
     if (name === "note") {
-      return this.ctx.frontmatter;
+      return this.ctx.rawFrontmatter ?? this.ctx.frontmatter;
     }
 
     // Special: "types" resolves to the file's type list from context

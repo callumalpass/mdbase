@@ -12,6 +12,7 @@ export interface MdbaseSettings {
   exclude: string[];
   include_subfolders: boolean;
   types_folder: string;
+  migrations_folder: string;
   explicit_type_keys: string[];
   default_validation: "off" | "warn" | "error";
   default_strict: boolean | "warn";
@@ -43,6 +44,7 @@ const DEFAULT_SETTINGS: MdbaseSettings = {
   exclude: [".git", "node_modules", ".mdbase"],
   include_subfolders: true,
   types_folder: "_types",
+  migrations_folder: "_types/_migrations",
   explicit_type_keys: ["type", "types"],
   default_validation: "warn",
   default_strict: false,
@@ -66,6 +68,7 @@ const KNOWN_SETTINGS_KEYS = new Set([
   "exclude",
   "include_subfolders",
   "types_folder",
+  "migrations_folder",
   "explicit_type_keys",
   "default_validation",
   "default_strict",
@@ -77,7 +80,10 @@ const KNOWN_SETTINGS_KEYS = new Set([
   "cache_folder",
 ]);
 
-export async function loadConfigAsync(collectionRoot: string): Promise<ConfigLoadResult> {
+export async function loadConfigAsync(
+  collectionRoot: string,
+  options?: { allowFutureMinor?: boolean },
+): Promise<ConfigLoadResult> {
   const configPath = path.join(collectionRoot, "mdbase.yaml");
   const warnings: string[] = [];
 
@@ -174,15 +180,23 @@ export async function loadConfigAsync(collectionRoot: string): Promise<ConfigLoa
     };
   }
 
-  // During 0.x, minor must match (we support 0.1.x)
-  if (minor !== 1) {
-    return {
-      valid: false,
-      error: {
-        code: "unsupported_version",
-        message: `Unsupported minor version: 0.${minor}`,
-      },
-    };
+  const supportedMinor = 2;
+
+  // During 0.x, minor must match (we support 0.2.x)
+  if (minor !== supportedMinor) {
+    if (options?.allowFutureMinor && minor > supportedMinor) {
+      warnings.push(
+        `spec_version "${specVersion}" is newer than supported 0.${supportedMinor}.x; attempting to proceed`,
+      );
+    } else {
+      return {
+        valid: false,
+        error: {
+          code: "unsupported_version",
+          message: `Unsupported minor version: 0.${minor}`,
+        },
+      };
+    }
   }
 
   // Parse settings
@@ -199,6 +213,20 @@ export async function loadConfigAsync(collectionRoot: string): Promise<ConfigLoa
     spec_version: specVersion,
     settings: settingsResult.settings!,
   };
+
+  // Support top-level id_field shorthand
+  if (rawConfig.id_field !== undefined && !(rawSettings && rawSettings.id_field !== undefined)) {
+    config.settings.id_field = String(rawConfig.id_field);
+    config.settings.id_field_explicit = true;
+  }
+
+  // Support top-level default_validation shorthand
+  if (rawConfig.default_validation !== undefined && !(rawSettings && rawSettings.default_validation !== undefined)) {
+    const val = String(rawConfig.default_validation);
+    if (["off", "warn", "error"].includes(val)) {
+      config.settings.default_validation = val as "off" | "warn" | "error";
+    }
+  }
 
   if (rawConfig.name !== undefined) {
     config.name = String(rawConfig.name);
@@ -227,6 +255,7 @@ function parseSettings(
   warnings: string[],
 ): SettingsParseResult {
   const settings: MdbaseSettings = { ...DEFAULT_SETTINGS };
+  let migrationsFolderExplicit = false;
 
   if (!raw) {
     return { valid: true, settings };
@@ -320,6 +349,26 @@ function parseSettings(
       };
     }
     settings.types_folder = raw.types_folder;
+  }
+
+  // migrations_folder
+  if (raw.migrations_folder !== undefined) {
+    if (typeof raw.migrations_folder !== "string") {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: "settings.migrations_folder must be a string",
+        },
+      };
+    }
+    settings.migrations_folder = raw.migrations_folder;
+    migrationsFolderExplicit = true;
+  }
+
+  // If types_folder changed and migrations_folder wasn't explicit, derive default from types_folder
+  if (!migrationsFolderExplicit && raw?.types_folder !== undefined) {
+    settings.migrations_folder = `${settings.types_folder}/_migrations`;
   }
 
   // explicit_type_keys

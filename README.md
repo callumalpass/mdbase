@@ -62,6 +62,8 @@ All operations are methods on `Collection`:
 - `query({ types?, where?, order_by?, limit?, offset?, include_body?, context_file?, formulas? })`
 - `batchDelete({ where, dry_run?, check_backlinks? })`
 - `batchUpdate({ where?, fields?, updates?, dry_run? })`
+- `backfill({ type?, where?, fields?, apply?, dry_run? })`
+- `migrate({ id, dry_run? })`
 - `cacheRebuild()`
 - `cacheClear()`
 - `close()`
@@ -73,9 +75,10 @@ See `src/operations/collection.ts` for the authoritative behavior.
 Collections are configured with `mdbase.yaml`:
 
 ```yaml
-spec_version: "0.1.0"
+spec_version: "0.2.0"
 settings:
   types_folder: "_types"
+  migrations_folder: "_types/_migrations"
   default_validation: "warn" # off | warn | error
   default_strict: false
   include_subfolders: true
@@ -118,4 +121,3 @@ The conformance runner is in `test/conformance.test.ts`. It reads YAML test file
 - `src/types/` type loading and validation helpers
 - `src/cache/` async cache store + worker
 - `test/` conformance test runner
-
