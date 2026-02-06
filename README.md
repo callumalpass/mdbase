@@ -112,6 +112,12 @@ Cache is async and backed by SQLite in a worker (`src/cache/worker.js`). It is u
 
 The conformance runner is in `test/conformance.test.ts`. It reads YAML test files from `~/projects/mdbase-spec/tests` and executes them against this implementation.
 
+## Example applications
+
+| Project | Description |
+|---------|-------------|
+| [mdbase-workouts](https://github.com/callumalpass/mdbase-workouts) | Workout tracker with chat interface, built on mdbase |
+
 ## Repository layout
 
 - `src/operations/collection.ts` main implementation
