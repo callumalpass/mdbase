@@ -1,10 +1,38 @@
 {
-  "name": "mdbase",
-  "version": "0.2.0",
+  "name": "@callumalpass/mdbase",
+  "version": "0.2.1",
   "description": "TypeScript implementation of the mdbase specification",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/callumalpass/mdbase.git"
+  },
+  "bugs": {
+    "url": "https://github.com/callumalpass/mdbase/issues"
+  },
+  "homepage": "https://github.com/callumalpass/mdbase#readme",
+  "keywords": [
+    "markdown",
+    "sqlite",
+    "obsidian",
+    "knowledge-base",
+    "frontmatter",
+    "mdbase"
+  ],
   "scripts": {
     "build": "tsc",
     "test": "vitest run",

@@ -188,7 +188,38 @@ export class Collection {
 
     // Create types folder and meta type with full schema
     await fs.promises.mkdir(typesFolderPath, { recursive: true });
-    const metaContent = `---\nname: meta\nmatch:\n  path_glob: "${typesFolder}/**/*.md"\nstrict: false\nfields:\n  name:\n    type: string\n  fields:\n    type: any\n---\n`;
+    const metaContent = `---
+name: meta
+description: Schema for type definition files
+
+match:
+  path_glob: "${typesFolder}/**/*.md"
+
+strict: false
+
+fields:
+  name:
+    type: string
+    required: true
+  description:
+    type: string
+  display_name_key:
+    type: string
+  extends:
+    type: string
+  strict:
+    type: enum
+    values: ["true", "false", "warn"]
+  match:
+    type: object
+  path_pattern:
+    type: string
+  filename_pattern:
+    type: string
+  fields:
+    type: any
+---
+`;
     await fs.promises.writeFile(metaTypePath, metaContent);
 
     return {
