@@ -65,13 +65,26 @@ export interface DeleteResult {
   error?: { code: string; message: string };
 }
 
-export interface QueryResult {
+export interface QueryGroupResult {
+  key: unknown;
   results: Array<{
     path: string;
     frontmatter: Record<string, unknown>;
     types: string[];
     body?: string | null;
   }>;
+  summaries?: Record<string, unknown>;
+}
+
+export interface QueryResult {
+  results?: Array<{
+    path: string;
+    frontmatter: Record<string, unknown>;
+    types: string[];
+    body?: string | null;
+  }>;
+  groups?: QueryGroupResult[];
+  summaries?: Record<string, unknown>;
   meta?: {
     total_count: number;
     has_more?: boolean;
@@ -147,6 +160,14 @@ export class Collection {
       return [picomatch(pattern, { dot: true })];
     });
     this.cache = null;
+  }
+
+  private isInvalidRelativePath(relativePath: string): boolean {
+    const normalizedPath = relativePath.replace(/\\/g, "/");
+    return normalizedPath.includes("\0") ||
+      path.isAbsolute(relativePath) ||
+      normalizedPath.startsWith("/") ||
+      normalizedPath.split("/").includes("..");
   }
 
   static async init(collectionRoot: string, input?: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -564,11 +585,7 @@ fields:
    * Read a file from the collection.
    */
   async read(relativePath: string): Promise<ReadResult> {
-    const normalizedPath = relativePath.replace(/\\/g, "/");
-    if (normalizedPath.includes("\0") ||
-        path.isAbsolute(relativePath) ||
-        normalizedPath.startsWith("/") ||
-        normalizedPath.split("/").includes("..")) {
+    if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
       };
@@ -1178,7 +1195,7 @@ fields:
     }
 
     // Path validation: traversal, null bytes, and invalid characters
-    if (relativePath.includes("..") || relativePath.includes("\0")) {
+    if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
       };
@@ -1313,6 +1330,11 @@ fields:
     body?: string;
   }): Promise<UpdateResult> {
     const relativePath = input.path;
+    if (this.isInvalidRelativePath(relativePath)) {
+      return {
+        error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
+      };
+    }
     const fullPath = path.join(this.root, relativePath);
 
     if (!await this.fileExists(fullPath)) {
@@ -1466,6 +1488,11 @@ fields:
    * Delete a file from the collection.
    */
   async delete(relativePath: string, input?: { check_backlinks?: boolean }): Promise<DeleteResult> {
+    if (this.isInvalidRelativePath(relativePath)) {
+      return {
+        error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
+      };
+    }
     const fullPath = path.join(this.root, relativePath);
     if (!await this.fileExists(fullPath)) {
       return {
@@ -1631,6 +1658,12 @@ fields:
     const fromPath = path.join(this.root, input.from);
     const toPath = path.join(this.root, input.to);
 
+    if (this.isInvalidRelativePath(input.from) || this.isInvalidRelativePath(input.to)) {
+      return {
+        error: { code: "invalid_path", message: `Invalid path: ${input.from} -> ${input.to}` },
+      };
+    }
+
     if (!await this.fileExists(fromPath)) {
       return {
         error: { code: "file_not_found", message: `Source not found: ${input.from}` },
@@ -1640,13 +1673,6 @@ fields:
     if (await this.fileExists(toPath)) {
       return {
         error: { code: "path_conflict", message: `Target exists: ${input.to}` },
-      };
-    }
-
-    // Path validation
-    if (input.to.includes("..") || input.to.includes("\0")) {
-      return {
-        error: { code: "invalid_path", message: `Invalid path: ${input.to}` },
       };
     }
 
@@ -2165,6 +2191,9 @@ fields:
     include_body?: boolean;
     context_file?: string;
     formulas?: Record<string, string>;
+    group_by?: { property: string; direction?: "asc" | "desc" | "ASC" | "DESC" };
+    property_summaries?: Record<string, string>;
+    summaries?: Record<string, string>;
   }): Promise<QueryResult & { error?: { code: string; message: string } }> {
     // Build thisContext if context_file is provided
     let thisContext: { frontmatter: Record<string, unknown>; path: string; file?: Record<string, unknown> } | undefined;
@@ -2512,7 +2541,65 @@ fields:
       }
     }
 
+    const summarySource = [...results];
     const totalCount = results.length;
+
+    // Grouping mode returns grouped output and bypasses pagination.
+    if (input.group_by) {
+      const property = input.group_by.property;
+      const direction = (input.group_by.direction ?? "ASC").toUpperCase();
+      const groupsByKey = new Map<string, { key: unknown; items: typeof results }>();
+
+      for (const result of results) {
+        const key = result.frontmatter[property] ?? null;
+        const keyString = key === null ? "\0null" : JSON.stringify(key);
+        const existing = groupsByKey.get(keyString);
+        if (existing) {
+          existing.items.push(result);
+        } else {
+          groupsByKey.set(keyString, { key, items: [result] });
+        }
+      }
+
+      const ordered = [...groupsByKey.values()].sort((a, b) => {
+        const aNull = a.key === null;
+        const bNull = b.key === null;
+        if (aNull && bNull) return 0;
+        if (aNull) return 1;
+        if (bNull) return -1;
+        const sa = typeof a.key === "string" ? a.key : JSON.stringify(a.key);
+        const sb = typeof b.key === "string" ? b.key : JSON.stringify(b.key);
+        return sa < sb ? -1 : sa > sb ? 1 : 0;
+      });
+
+      if (direction === "DESC") ordered.reverse();
+
+      const groups = ordered.map((group) => {
+        let groupResults = group.items.map(({ _file, ...rest }) => rest as typeof group.items[0]);
+        if (!input.include_body) {
+          groupResults = groupResults.map(({ body, ...rest }) => ({ ...rest, body: null }) as typeof groupResults[0]);
+        }
+        if (!input.formulas) {
+          groupResults = groupResults.map(({ formulas, ...rest }) => rest as typeof groupResults[0]);
+        }
+        const resultObj: QueryGroupResult = {
+          key: group.key,
+          results: groupResults,
+        };
+        if (input.property_summaries && Object.keys(input.property_summaries).length > 0) {
+          resultObj.summaries = this.computeQuerySummaries(group.items, input.property_summaries, input.summaries ?? {});
+        }
+        return resultObj;
+      });
+
+      return {
+        groups,
+        meta: {
+          total_count: totalCount,
+          has_more: false,
+        },
+      };
+    }
 
     // Apply offset and limit
     if (input.offset !== undefined && input.offset > 0) {
@@ -2537,13 +2624,100 @@ fields:
       results = results.map(({ formulas, ...rest }) => rest as typeof results[0]);
     }
 
-    return {
+    const out: QueryResult = {
       results,
       meta: {
         total_count: totalCount,
         has_more: hasMore,
       },
     };
+    if (input.property_summaries && Object.keys(input.property_summaries).length > 0) {
+      out.summaries = this.computeQuerySummaries(summarySource, input.property_summaries, input.summaries ?? {});
+    }
+    return out;
+  }
+
+  private computeQuerySummaries(
+    rows: Array<{ frontmatter: Record<string, unknown> }>,
+    propertySummaries: Record<string, string>,
+    customSummaries: Record<string, string>,
+  ): Record<string, unknown> {
+    const summary: Record<string, unknown> = {};
+    for (const [field, summaryType] of Object.entries(propertySummaries)) {
+      const values = rows.map((r) => r.frontmatter[field]).filter((v) => v !== undefined);
+
+      if (customSummaries[summaryType]) {
+        summary[field] = this.evaluateCustomSummary(customSummaries[summaryType], values);
+        continue;
+      }
+
+      switch (summaryType) {
+        case "Average": {
+          const nums = values.filter((v): v is number => typeof v === "number");
+          summary[field] = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
+          break;
+        }
+        case "Sum": {
+          const nums = values.filter((v): v is number => typeof v === "number");
+          summary[field] = nums.reduce((a, b) => a + b, 0);
+          break;
+        }
+        case "Min": {
+          const nums = values.filter((v): v is number => typeof v === "number");
+          summary[field] = nums.length ? Math.min(...nums) : null;
+          break;
+        }
+        case "Max": {
+          const nums = values.filter((v): v is number => typeof v === "number");
+          summary[field] = nums.length ? Math.max(...nums) : null;
+          break;
+        }
+        case "Earliest": {
+          const strings = values.filter((v): v is string => typeof v === "string");
+          summary[field] = strings.length ? [...strings].sort()[0] : null;
+          break;
+        }
+        case "Latest": {
+          const strings = values.filter((v): v is string => typeof v === "string");
+          summary[field] = strings.length ? [...strings].sort().at(-1) ?? null : null;
+          break;
+        }
+        case "Checked":
+          summary[field] = values.filter((v) => v === true).length;
+          break;
+        case "Unchecked":
+          summary[field] = values.filter((v) => v === false).length;
+          break;
+        case "Empty":
+          summary[field] = rows.filter((r) => {
+            const value = r.frontmatter[field];
+            return value === undefined || value === null || value === "";
+          }).length;
+          break;
+        case "Filled":
+          summary[field] = rows.filter((r) => {
+            const value = r.frontmatter[field];
+            return value !== undefined && value !== null && value !== "";
+          }).length;
+          break;
+        case "Unique":
+          summary[field] = new Set(values.map((v) => JSON.stringify(v))).size;
+          break;
+        default:
+          summary[field] = null;
+      }
+    }
+    return summary;
+  }
+
+  private evaluateCustomSummary(formula: string, values: unknown[]): unknown {
+    try {
+      return evaluateExpression(formula, {
+        frontmatter: { values },
+      });
+    } catch {
+      return null;
+    }
   }
 
   /**

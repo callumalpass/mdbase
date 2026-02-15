@@ -72,17 +72,18 @@ export class CollectionAsync {
   }
 
   query(input: {
-    where?: string;
+    types?: string[];
+    where?: string | Record<string, unknown>;
     order_by?: Array<{ field: string; direction?: "asc" | "desc" }>;
+    folder?: string;
     limit?: number;
     offset?: number;
     include_body?: boolean;
-    include_formulas?: boolean;
-    include_raw_frontmatter?: boolean;
     context_file?: string;
-    select?: string[];
-    group_by?: string;
-    having?: string;
+    formulas?: Record<string, string>;
+    group_by?: { property: string; direction?: "asc" | "desc" | "ASC" | "DESC" };
+    property_summaries?: Record<string, string>;
+    summaries?: Record<string, string>;
   }): Promise<QueryResult> {
     return this.inner.query(input);
   }
