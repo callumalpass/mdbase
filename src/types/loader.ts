@@ -463,6 +463,7 @@ async function findMarkdownFilesAsync(dir: string): Promise<string[]> {
   }
 
   const entries = await fs.promises.readdir(dir, { withFileTypes: true });
+  entries.sort((a, b) => a.name.localeCompare(b.name));
   for (const entry of entries) {
     const fullPath = path.join(dir, entry.name);
     if (entry.isDirectory()) {

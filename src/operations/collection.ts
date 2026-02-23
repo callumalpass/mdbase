@@ -3647,6 +3647,8 @@ fields:
       return null;
     }
 
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
     for (const entry of entries) {
       const fullPath = path.join(migrationsRoot, entry.name);
       if (entry.isDirectory()) {
@@ -4403,6 +4405,8 @@ fields:
       return files;
     }
 
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+
     for (const entry of entries) {
       const fullPath = path.join(scanDir, entry.name);
       const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
@@ -4438,6 +4442,8 @@ fields:
     } catch {
       return files;
     }
+
+    entries.sort((a, b) => a.name.localeCompare(b.name));
 
     for (const entry of entries) {
       const fullPath = path.join(scanDir, entry.name);
