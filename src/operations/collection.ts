@@ -3684,6 +3684,7 @@ fields:
     for (const relativePath of files) {
       await this.updateCacheForPath(relativePath);
     }
+    await this.cache.flush();
     return { success: true };
   }
 
