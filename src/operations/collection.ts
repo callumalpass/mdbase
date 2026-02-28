@@ -12,19 +12,12 @@ import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../
 import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
-import { evaluateWhere, evaluateExpression, ExpressionError } from "../expressions/evaluator.js";
-import { parseLink, extractBodyLinks, ParsedLink } from "../links/parser.js";
+import { evaluateWhere, evaluateExpression } from "../expressions/evaluator.js";
+import { parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
-
-function toBoolExternal(val: unknown): boolean {
-  if (typeof val === "boolean") return val;
-  if (val === null || val === undefined) return false;
-  if (typeof val === "number") return val !== 0;
-  if (typeof val === "string") return val !== "";
-  if (Array.isArray(val)) return val.length > 0;
-  return true;
-}
+import { QueryInput, runQuery } from "./query-engine.js";
+import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 
 export interface ReadResult {
   valid?: boolean;
@@ -114,11 +107,30 @@ export interface CacheOpResult {
   error?: { code: string; message: string };
 }
 
+interface BacklinkTokenIndex {
+  tokenToSources: Map<string, Set<string>>;
+  sourceToTokens: Map<string, Set<string>>;
+}
+
+interface LinkResolutionIndex {
+  fileSet: Set<string>;
+  basenameToFiles: Map<string, string[]>;
+  idToFiles: Map<string, string[]>;
+}
+
+const DEFAULT_SPEC_VERSION = "0.2.1";
+
 export class Collection {
   private config: MdbaseConfig;
   private typeDefs: Map<string, TypeDefinition>;
   private excludeMatchers: ((str: string) => boolean)[];
   private cache: CacheStoreAsync | null;
+  private cachedFiles: string[] | null;
+  private cachedAllFiles: string[] | null;
+  private cachedNonMarkdownFiles: Set<string> | null;
+  private cachedFileCache: Map<string, ReadResult> | null;
+  private cachedFileCacheFiles: string[] | null;
+  private cachedBacklinkTokenIndex: BacklinkTokenIndex | null;
 
   /**
    * Hook called after reading a file but before writing.
@@ -160,6 +172,12 @@ export class Collection {
       return [picomatch(pattern, { dot: true })];
     });
     this.cache = null;
+    this.cachedFiles = null;
+    this.cachedAllFiles = null;
+    this.cachedNonMarkdownFiles = null;
+    this.cachedFileCache = null;
+    this.cachedFileCacheFiles = null;
+    this.cachedBacklinkTokenIndex = null;
   }
 
   private isInvalidRelativePath(relativePath: string): boolean {
@@ -168,6 +186,42 @@ export class Collection {
       path.isAbsolute(relativePath) ||
       normalizedPath.startsWith("/") ||
       normalizedPath.split("/").includes("..");
+  }
+
+  private invalidateRuntimeCaches(options?: {
+    fileLists?: boolean;
+    fileCache?: boolean;
+    nonMarkdown?: boolean;
+    backlinks?: boolean;
+  }): void {
+    const fileLists = options?.fileLists ?? true;
+    const fileCache = options?.fileCache ?? true;
+    const nonMarkdown = options?.nonMarkdown ?? true;
+    const backlinks = options?.backlinks ?? true;
+
+    if (fileLists) {
+      this.cachedFiles = null;
+      this.cachedAllFiles = null;
+    }
+    if (fileCache) {
+      this.cachedFileCache = null;
+      this.cachedFileCacheFiles = null;
+    }
+    if (nonMarkdown) {
+      this.cachedNonMarkdownFiles = null;
+    }
+    if (backlinks) {
+      this.cachedBacklinkTokenIndex = null;
+    }
+  }
+
+  private areSamePathLists(a: string[], b: string[]): boolean {
+    if (a === b) return true;
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
   }
 
   static async init(collectionRoot: string, input?: Record<string, unknown>): Promise<Record<string, unknown>> {
@@ -190,12 +244,12 @@ export class Collection {
 
     // Create mdbase.yaml
     await fs.promises.mkdir(collectionRoot, { recursive: true });
-    let configContent = 'spec_version: "0.2.0"\n';
+    let configContent = `spec_version: "${DEFAULT_SPEC_VERSION}"\n`;
     if (inputConfig) {
       // Serialize the provided config
       const lines: string[] = [];
       if (inputConfig.spec_version) lines.push(`spec_version: "${inputConfig.spec_version}"`);
-      else lines.push('spec_version: "0.2.0"');
+      else lines.push(`spec_version: "${DEFAULT_SPEC_VERSION}"`);
       if (inputConfig.settings) {
         lines.push("settings:");
         const settings = inputConfig.settings as Record<string, unknown>;
@@ -1307,6 +1361,7 @@ fields:
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
     await fs.promises.writeFile(fullPath, content);
     await this.updateCacheForPath(relativePath);
+    this.invalidateRuntimeCaches();
 
     const result: Record<string, unknown> = {
       valid: true,
@@ -1347,6 +1402,7 @@ fields:
     const readMtime = (await fs.promises.stat(fullPath)).mtimeMs;
 
     const existing = await parseFileAsync(fullPath);
+    const originalFrontmatter: Record<string, unknown> = { ...existing.frontmatter };
     const frontmatter: Record<string, unknown> = { ...existing.frontmatter };
 
     // Apply field updates
@@ -1395,12 +1451,14 @@ fields:
       }
 
       // Check cross-file uniqueness constraints on update
-      const uniqueIssues = await this.checkUpdateUniqueness(relativePath, frontmatter, types);
-      if (uniqueIssues.length > 0 && this.config.settings.default_validation === "error") {
-        return {
-          error: { code: "validation_failed", message: "Uniqueness constraint violated on update" },
-          issues: uniqueIssues,
-        } as unknown as UpdateResult;
+      if (this.shouldCheckUniquenessOnUpdate(originalFrontmatter, frontmatter, types)) {
+        const uniqueIssues = await this.checkUpdateUniqueness(relativePath, frontmatter, types);
+        if (uniqueIssues.length > 0 && this.config.settings.default_validation === "error") {
+          return {
+            error: { code: "validation_failed", message: "Uniqueness constraint violated on update" },
+            issues: uniqueIssues,
+          } as unknown as UpdateResult;
+        }
       }
     }
 
@@ -1469,6 +1527,7 @@ fields:
 
     await fs.promises.writeFile(fullPath, content);
     await this.updateCacheForPath(relativePath);
+    this.invalidateRuntimeCaches({ fileLists: false });
 
     // Evaluate computed fields on the effective frontmatter for the return value
     this.evaluateComputedFields(effectiveFrontmatter, types, relativePath, body);
@@ -1523,6 +1582,8 @@ fields:
     if (this.cache) {
       await this.cache.deleteFile(relativePath);
     }
+    this.removeSourceFromBacklinkTokenIndex(relativePath);
+    this.invalidateRuntimeCaches({ backlinks: false });
     const result: DeleteResult = { valid: true };
     if (checkBacklinks) {
       result.broken_links = brokenLinks.map((entry) => ({ path: entry.referrer }));
@@ -1712,11 +1773,14 @@ fields:
       : this.config.settings.rename_update_refs;
 
     if (!shouldUpdateRefs) {
+      this.invalidateRuntimeCaches();
       return { valid: true, from: input.from, to: input.to };
     }
 
     // Update references across the collection
-    return await this.updateReferencesAfterRename(input.from, input.to);
+    const renameResult = await this.updateReferencesAfterRename(input.from, input.to);
+    this.invalidateRuntimeCaches();
+    return renameResult;
   }
 
   /**
@@ -1730,6 +1794,11 @@ fields:
     const fileCache = await this.buildFileCache(files);
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
+    const basenameCounts = new Map<string, number>();
+    for (const filePath of files) {
+      const basename = path.basename(filePath, path.extname(filePath));
+      basenameCounts.set(basename, (basenameCounts.get(basename) ?? 0) + 1);
+    }
     const referencesUpdated: Array<{ path: string; field?: string; location?: string }> = [];
     const warnings: Array<{ path: string; message_contains?: string; message?: string }> = [];
     const partialFailures: Array<{ path: string; reason: string }> = [];
@@ -1776,6 +1845,9 @@ fields:
           if (value === null || value === undefined) continue;
 
           if (fieldDef.type === "link" && typeof value === "string") {
+            if (!this.mightReferenceRenamedPath(value, oldPath, oldBase, oldNoExt)) {
+              continue;
+            }
             // ID-based link stability: if id_field is explicitly configured,
             // the link field has a target constraint, and the link is a simple-name
             // wikilink matching the renamed file's ID, skip the update (§12.5 rule 3)
@@ -1783,7 +1855,21 @@ fields:
             if (this.config.settings.id_field_explicit && fieldTarget && renamedFileId && this.isIdStableLink(value, renamedFileId)) {
               continue;
             }
-            const result = this.updateLinkValue(value, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
+            const result = this.updateLinkValue(
+              value,
+              oldPath,
+              newPath,
+              oldBase,
+              newBase,
+              oldNoExt,
+              newNoExt,
+              filePath,
+              renamedFileId,
+              files,
+              fileCache,
+              nonMdSet,
+              basenameCounts,
+            );
             if (result.warning) {
               warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
             } else if (result.updated && result.newValue !== value) {
@@ -1798,11 +1884,28 @@ fields:
             for (let i = 0; i < newList.length; i++) {
               const item = newList[i];
               if (typeof item !== "string") continue;
+              if (!this.mightReferenceRenamedPath(item, oldPath, oldBase, oldNoExt)) {
+                continue;
+              }
               // ID-based link stability for list items
               if (this.config.settings.id_field_explicit && itemTarget && renamedFileId && this.isIdStableLink(item, renamedFileId)) {
                 continue;
               }
-              const result = this.updateLinkValue(item, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
+              const result = this.updateLinkValue(
+                item,
+                oldPath,
+                newPath,
+                oldBase,
+                newBase,
+                oldNoExt,
+                newNoExt,
+                filePath,
+                renamedFileId,
+                files,
+                fileCache,
+                nonMdSet,
+                basenameCounts,
+              );
               if (result.warning) {
                 warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
               } else if (result.updated && result.newValue !== item) {
@@ -1820,39 +1923,53 @@ fields:
       }
 
       // Check body links
-      const newBody = this.updateBodyLinks(body, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, filePath, renamedFileId, files, fileCache, nonMdSet);
+      const newBody = this.mightReferenceRenamedPath(body, oldPath, oldBase, oldNoExt)
+        ? this.updateBodyLinks(
+          body,
+          oldPath,
+          newPath,
+          oldBase,
+          newBase,
+          oldNoExt,
+          newNoExt,
+          filePath,
+          renamedFileId,
+          files,
+          fileCache,
+          nonMdSet,
+          basenameCounts,
+        )
+        : body;
       if (newBody !== body) {
         bodyUpdated = true;
       }
 
       // Write updates if needed
       if (fmUpdated || bodyUpdated) {
-        // Record mtime before potential hook
-        const beforeHookMtime = (await fs.promises.stat(fullPath)).mtimeMs;
-
-        // Call pre-ref-update hook (for concurrent modification simulation)
         if (this.preRefUpdateHook) {
+          // Record mtime only when simulation hook is active.
+          const beforeHookMtime = (await fs.promises.stat(fullPath)).mtimeMs;
           this.preRefUpdateHook(filePath);
-        }
-
-        // Concurrency check on referring file
-        const currentMtime = (await fs.promises.stat(fullPath)).mtimeMs;
-        if (currentMtime !== beforeHookMtime) {
-          // File was modified externally during ref update
-          partialFailures.push({ path: filePath, reason: "concurrent_modification" });
-          continue;
+          const currentMtime = (await fs.promises.stat(fullPath)).mtimeMs;
+          if (currentMtime !== beforeHookMtime) {
+            // File was modified externally during ref update
+            partialFailures.push({ path: filePath, reason: "concurrent_modification" });
+            continue;
+          }
         }
 
         // Write the updated file
         try {
+          const nextFrontmatter = fmUpdated ? updatedFm : frontmatter;
+          const nextBody = bodyUpdated ? newBody : body;
           const updatedContent = serializeFile(
-            fmUpdated ? updatedFm : frontmatter,
-            bodyUpdated ? newBody : body,
+            nextFrontmatter,
+            nextBody,
             this.config.settings.write_nulls,
             this.config.settings.write_empty_lists,
           );
           await fs.promises.writeFile(fullPath, updatedContent);
-          await this.updateCacheForPath(filePath);
+          await this.upsertCacheFromData(filePath, nextFrontmatter, nextBody);
 
           for (const field of fmUpdatedFields) {
             referencesUpdated.push({ path: filePath, field });
@@ -1922,6 +2039,7 @@ fields:
     knownFiles?: string[],
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
+    basenameCounts?: Map<string, number>,
   ): { updated: boolean; newValue: string; warning?: string } {
     let parsed: ParsedLink | null;
     try {
@@ -1933,10 +2051,6 @@ fields:
       return { updated: false, newValue: linkValue };
     }
 
-    // Determine if this link references the old path
-    const resolution = this.resolveLinkFullWithFiles(linkValue, fromFile, knownFiles ?? [], undefined, knownFileCache, nonMarkdownFiles);
-
-    // Check if the link references the old path
     const target = parsed.target;
     const normalizedTarget = this.normalizeLinkTarget(target);
 
@@ -1959,10 +2073,7 @@ fields:
       }
     }
 
-    // Also check via resolution: if the link now resolves to the new path, it was referencing the old file
-    const resolvesToNew = resolution.resolved === newPath;
-
-    if (!matchesOld && !resolvedOldTarget && !resolvesToNew) {
+    if (!matchesOld && !resolvedOldTarget) {
       return { updated: false, newValue: linkValue };
     }
 
@@ -1978,22 +2089,24 @@ fields:
       }
     }
 
-    // Check for ambiguous resolution
-    if (resolution.ambiguous) {
-      return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
-    }
-
     // Check if the link is ambiguous because other files also match the same simple name
     // (the original link was ambiguous before the rename)
     if (parsed.format === "wikilink" && !target.includes("/") && !target.startsWith("./") && !target.startsWith("../")) {
-      const files = knownFiles ?? [];
-      const matchingFiles = files.filter((f) => {
-        const base = path.basename(f, path.extname(f));
-        return base === normalizedTarget && f !== newPath;
-      });
-      if (matchingFiles.length > 0) {
-        // The link was ambiguous before rename — don't update
-        return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
+      if (basenameCounts) {
+        const newPathBase = path.basename(newPath, path.extname(newPath));
+        const matchingCount = (basenameCounts.get(normalizedTarget) ?? 0) - (newPathBase === normalizedTarget ? 1 : 0);
+        if (matchingCount > 0) {
+          return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
+        }
+      } else {
+        const files = knownFiles ?? [];
+        const matchingFiles = files.filter((f) => {
+          const base = path.basename(f, path.extname(f));
+          return base === normalizedTarget && f !== newPath;
+        });
+        if (matchingFiles.length > 0) {
+          return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
+        }
       }
     }
 
@@ -2108,6 +2221,7 @@ fields:
     knownFiles?: string[],
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
+    basenameCounts?: Map<string, number>,
   ): string {
     if (!body) return body;
 
@@ -2158,7 +2272,19 @@ fields:
         // Determine what kind of link this is and try to update it
         const raw = linkMatch[0];
         const updateResult = this.updateLinkValue(
-          raw, oldPath, newPath, oldBase, newBase, oldNoExt, newNoExt, fromFile, renamedFileId, knownFiles, knownFileCache, nonMarkdownFiles,
+          raw,
+          oldPath,
+          newPath,
+          oldBase,
+          newBase,
+          oldNoExt,
+          newNoExt,
+          fromFile,
+          renamedFileId,
+          knownFiles,
+          knownFileCache,
+          nonMarkdownFiles,
+          basenameCounts,
         );
 
         if (updateResult.updated && updateResult.newValue !== raw) {
@@ -2181,460 +2307,56 @@ fields:
   /**
    * Query the collection.
    */
-  async query(input: {
-    types?: string[];
-    where?: string | Record<string, unknown>;
-    order_by?: Array<{ field: string; direction?: string }>;
-    folder?: string;
-    limit?: number;
-    offset?: number;
-    include_body?: boolean;
-    context_file?: string;
-    formulas?: Record<string, string>;
-    group_by?: { property: string; direction?: "asc" | "desc" | "ASC" | "DESC" };
-    property_summaries?: Record<string, string>;
-    summaries?: Record<string, string>;
-  }): Promise<QueryResult & { error?: { code: string; message: string } }> {
-    // Build thisContext if context_file is provided
-    let thisContext: { frontmatter: Record<string, unknown>; path: string; file?: Record<string, unknown> } | undefined;
-    if (input.context_file) {
-      const ctxResult = await this.read(input.context_file);
-      if (!ctxResult.error && ctxResult.frontmatter) {
-        thisContext = {
-          frontmatter: ctxResult.frontmatter,
-          path: input.context_file,
-          file: (ctxResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined,
-        };
-      }
-    }
-
-    const files = await this.scanFiles();
-    const allFiles = await this.scanAllFiles();
-    const nonMdSet = this.buildNonMarkdownSet(allFiles);
-    const fileCache = new Map<string, ReadResult>();
-    for (const relativePath of files) {
-      const readResult = await this.read(relativePath);
-      if (!readResult.error) {
-        fileCache.set(relativePath, readResult);
-      }
-    }
-    let results: Array<{
-      path: string;
-      frontmatter: Record<string, unknown>;
-      types: string[];
-      body?: string | null;
-      _file?: Record<string, unknown>;
-      formulas?: Record<string, unknown>;
-    }> = [];
-
-    const backlinksCache = new Map<string, BacklinkEntry[]>();
-    const computeBacklinks = (targetPath: string): BacklinkEntry[] => {
-      const existing = backlinksCache.get(targetPath);
-      if (existing) return existing;
-      const backlinks: BacklinkEntry[] = [];
-      const seenSources = new Set<string>();
-      for (const [sourcePath, sourceRead] of fileCache) {
-        if (sourcePath === targetPath) continue;
-        const frontmatter = sourceRead.frontmatter ?? {};
-        const types = sourceRead.types ?? [];
-        const body = sourceRead.body ?? "";
-
-        const allLinkValues: string[] = [];
-        for (const typeName of types) {
-          const typeDef = this.typeDefs.get(typeName);
-          if (!typeDef?.fields) continue;
-          for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-            const value = frontmatter[fieldName];
-            if (value === null || value === undefined) continue;
-            if (fieldDef.type === "link" && typeof value === "string") {
-              allLinkValues.push(value);
-            } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
-              for (const item of value) {
-                if (typeof item === "string") allLinkValues.push(item);
-              }
-            }
-          }
-        }
-        const bodyLinks = extractBodyLinks(body);
-        for (const bl of bodyLinks) {
-          allLinkValues.push(bl.raw);
-        }
-
-        for (const linkValue of allLinkValues) {
-          if (seenSources.has(sourcePath)) break;
-          const resolution = this.resolveLinkFullWithFiles(linkValue, sourcePath, files, undefined, fileCache, nonMdSet);
-          if (resolution.resolved === targetPath) {
-            seenSources.add(sourcePath);
-            const name = sourcePath.split("/").pop() ?? "";
-            backlinks.push({
-              file: {
-                path: sourcePath,
-                name,
-                basename: name.replace(/\.[^.]+$/, ""),
-                folder: path.dirname(sourcePath) === "." ? "" : path.dirname(sourcePath),
-                extension: path.extname(sourcePath).slice(1),
-              },
-            });
-          }
-        }
-      }
-      backlinksCache.set(targetPath, backlinks);
-      return backlinks;
-    };
-
-    for (const relativePath of files) {
-      const readResult = fileCache.get(relativePath);
-      if (!readResult) continue;
-      if (readResult.error) continue;
-
-      const fileTypes = readResult.types ?? [];
-
-      // Filter by type
-      if (input.types && input.types.length > 0) {
-        const hasMatchingType = input.types.some((t) =>
-          fileTypes.includes(t.toLowerCase()),
-        );
-        if (!hasMatchingType) continue;
-      }
-
-      // Filter by folder
-      if (input.folder) {
-        const folder = input.folder.replace(/\/$/, "");
-        if (!relativePath.startsWith(folder + "/")) continue;
-      }
-
-      // Evaluate formulas (only on first file - detect circular first)
-      let formulaValues: Record<string, unknown> | undefined;
-      if (input.formulas) {
-        // Check for circular formula references (only once)
-        if (results.length === 0) {
-          const circularError = this.detectCircularFormulas(input.formulas);
-          if (circularError) {
-            return {
-              results: [],
-              error: circularError,
-            };
-          }
-        }
-
-        formulaValues = {};
-        const fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
-
-        // Resolve formulas in dependency order
-        const resolved = new Map<string, unknown>();
-        const formulaEntries = Object.entries(input.formulas);
-        const maxPasses = formulaEntries.length + 1;
-        for (let pass = 0; pass < maxPasses; pass++) {
-          let progress = false;
-          for (const [name, expr] of formulaEntries) {
-            if (resolved.has(name)) continue;
-            try {
-              const formulaCtx = {
-                frontmatter: { ...readResult.frontmatter ?? {}, formula: Object.fromEntries(resolved) },
-                rawFrontmatter: readResult.rawFrontmatter,
-                path: relativePath,
-                types: fileTypes,
-                body: readResult.body,
-                file: fileInfo,
-                thisContext,
-                strictArithmetic: true,
-                typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
-              };
-              const val = evaluateExpression(expr, formulaCtx);
-              resolved.set(name, val);
-              progress = true;
-            } catch (e: unknown) {
-              if (e instanceof ExpressionError) {
-                // Map expression errors to formula-specific codes
-                let code = e.code;
-                if (code === "invalid_expression") code = "invalid_formula";
-                else if (code === "type_error" || code === "unknown_function") code = "formula_evaluation_error";
-                return {
-                  results: [],
-                  error: { code, message: e.message },
-                };
-              }
-              // May fail if dependencies not yet resolved, try again
-              if (pass === maxPasses - 1) {
-                resolved.set(name, null);
-              }
-            }
-          }
-          if (!progress && resolved.size < formulaEntries.length) break;
-          if (resolved.size === formulaEntries.length) break;
-        }
-        for (const [name] of formulaEntries) {
-          formulaValues[name] = resolved.get(name) ?? null;
-        }
-      }
-
-      // Build frontmatter context with formula values for WHERE
-      const frontmatterWithFormulas = readResult.frontmatter ?? {};
-
-      // Filter by where expression (string or structured)
-      if (input.where) {
-        if (typeof input.where === "string") {
-          const fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
-          const resolveFile = (linkTarget: string) => {
-            const resolution = this.resolveLinkFullWithFiles(linkTarget, relativePath, files, undefined, fileCache, nonMdSet);
-            if (!resolution.resolved) return null;
-            const target = fileCache.get(resolution.resolved);
-            if (!target || target.error) return null;
-            return {
-              frontmatter: target.frontmatter ?? {},
-              path: resolution.resolved,
-              types: target.types ?? [],
-            };
-          };
-          const ctx = {
-            frontmatter: { ...frontmatterWithFormulas, formula: formulaValues ?? {} },
-            rawFrontmatter: readResult.rawFrontmatter,
-            path: relativePath,
-            types: fileTypes,
-            body: readResult.body,
-            file: fileInfo,
-            thisContext,
-            resolveFile,
-            computeBacklinks,
-            typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
-          };
-          try {
-            const whereResult = evaluateExpression(input.where, ctx);
-            if (!toBoolExternal(whereResult)) continue;
-          } catch (e: unknown) {
-            if (e instanceof ExpressionError) {
-              // Structural/deterministic errors abort the query
-              const abortCodes = new Set([
-                "invalid_expression", "unknown_function", "wrong_argument_count",
-                "expression_depth_exceeded",
-              ]);
-              if (abortCodes.has(e.code)) {
-                return {
-                  results: [],
-                  error: { code: e.code, message: e.message },
-                };
-              }
-              continue; // Other errors → skip file
-            }
-            continue; // Non-expression errors → skip file
-          }
-        } else {
-          // Structured where clause (YAML object with and/or/not or field conditions)
-          if (!this.evaluateStructuredWhere(
-            input.where,
-            frontmatterWithFormulas,
-            relativePath,
-            fileTypes,
-            readResult.body,
-          )) continue;
-        }
-      }
-
-      const fileInfo = (readResult as unknown as Record<string, unknown>).file as Record<string, unknown> | undefined;
-      results.push({
-        path: relativePath,
-        ...(readResult.frontmatter ?? {}),
-        frontmatter: readResult.frontmatter ?? {},
-        types: fileTypes,
-        body: readResult.body,
-        _file: fileInfo,
-        formulas: formulaValues,
-      });
-    }
-
-    // Sort
-    if (input.order_by) {
-      // Collect enum value orders for enum fields
-      const enumOrders = new Map<string, Map<string, number>>();
-      for (const [, typeDef] of this.typeDefs) {
-        if (!typeDef.fields) continue;
-        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-          if (fieldDef.values && !enumOrders.has(fieldName)) {
-            const order = new Map<string, number>();
-            fieldDef.values.forEach((v, i) => order.set(v, i));
-            enumOrders.set(fieldName, order);
-          }
-        }
-      }
-
-      for (const orderSpec of [...input.order_by].reverse()) {
-        const field = orderSpec.field;
-        const desc = orderSpec.direction === "desc";
-        const enumOrder = enumOrders.get(field);
-
-        results.sort((a, b) => {
-          let va: unknown;
-          let vb: unknown;
-
-          if (field.startsWith("file.")) {
-            const prop = field.slice(5);
-            if (prop === "path") { va = a.path; vb = b.path; }
-            else if (prop.includes(".")) {
-              // Complex file property like file.embeds.length — evaluate as expression
-              const backlinksCb = (fp: string) => computeBacklinks(fp);
-              try {
-                va = evaluateExpression(field, {
-                  frontmatter: a.frontmatter, path: a.path, types: a.types,
-                  body: a.body ?? undefined, file: a._file,
-                  computeBacklinks: backlinksCb,
-                  typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
-                });
-              } catch { va = null; }
-              try {
-                vb = evaluateExpression(field, {
-                  frontmatter: b.frontmatter, path: b.path, types: b.types,
-                  body: b.body ?? undefined, file: b._file,
-                  computeBacklinks: backlinksCb,
-                  typeDefs: this.typeDefs as unknown as Map<string, { display_name_key?: string; [key: string]: unknown }>,
-                });
-              } catch { vb = null; }
-            }
-            else { va = a._file?.[prop]; vb = b._file?.[prop]; }
-          } else if (field.startsWith("formula.")) {
-            const formulaName = field.slice(8);
-            va = a.formulas?.[formulaName];
-            vb = b.formulas?.[formulaName];
-          } else {
-            va = a.frontmatter[field];
-            vb = b.frontmatter[field];
-          }
-
-          if (va === vb) return 0;
-          // null sorts last in asc, first in desc (§10.3)
-          if (va === null || va === undefined) return desc ? -1 : 1;
-          if (vb === null || vb === undefined) return desc ? 1 : -1;
-
-          // Enum sort by declaration order
-          if (enumOrder) {
-            const ia = enumOrder.get(String(va)) ?? Infinity;
-            const ib = enumOrder.get(String(vb)) ?? Infinity;
-            if (ia !== ib) return desc ? ib - ia : ia - ib;
-            return 0;
-          }
-
-          // Non-scalar: lists sorted by length, objects by key count (§10.3)
-          const aIsArray = Array.isArray(va);
-          const bIsArray = Array.isArray(vb);
-          if (aIsArray || bIsArray) {
-            const la = aIsArray ? (va as unknown[]).length : 0;
-            const lb = bIsArray ? (vb as unknown[]).length : 0;
-            if (la !== lb) return desc ? lb - la : la - lb;
-            // Tie-breaker: file.path ascending
-            const pa = a._file?.path ?? a.path ?? "";
-            const pb = b._file?.path ?? b.path ?? "";
-            return pa < pb ? -1 : pa > pb ? 1 : 0;
-          }
-          const aIsObj = typeof va === "object" && va !== null;
-          const bIsObj = typeof vb === "object" && vb !== null;
-          if (aIsObj || bIsObj) {
-            const ka = aIsObj ? Object.keys(va as Record<string, unknown>).length : 0;
-            const kb = bIsObj ? Object.keys(vb as Record<string, unknown>).length : 0;
-            if (ka !== kb) return desc ? kb - ka : ka - kb;
-            const pa = a._file?.path ?? a.path ?? "";
-            const pb = b._file?.path ?? b.path ?? "";
-            return pa < pb ? -1 : pa > pb ? 1 : 0;
-          }
-
-          if (va < vb) return desc ? 1 : -1;
-          return desc ? -1 : 1;
-        });
-      }
-    }
-
-    const summarySource = [...results];
-    const totalCount = results.length;
-
-    // Grouping mode returns grouped output and bypasses pagination.
-    if (input.group_by) {
-      const property = input.group_by.property;
-      const direction = (input.group_by.direction ?? "ASC").toUpperCase();
-      const groupsByKey = new Map<string, { key: unknown; items: typeof results }>();
-
-      for (const result of results) {
-        const key = result.frontmatter[property] ?? null;
-        const keyString = key === null ? "\0null" : JSON.stringify(key);
-        const existing = groupsByKey.get(keyString);
-        if (existing) {
-          existing.items.push(result);
-        } else {
-          groupsByKey.set(keyString, { key, items: [result] });
-        }
-      }
-
-      const ordered = [...groupsByKey.values()].sort((a, b) => {
-        const aNull = a.key === null;
-        const bNull = b.key === null;
-        if (aNull && bNull) return 0;
-        if (aNull) return 1;
-        if (bNull) return -1;
-        const sa = typeof a.key === "string" ? a.key : JSON.stringify(a.key);
-        const sb = typeof b.key === "string" ? b.key : JSON.stringify(b.key);
-        return sa < sb ? -1 : sa > sb ? 1 : 0;
-      });
-
-      if (direction === "DESC") ordered.reverse();
-
-      const groups = ordered.map((group) => {
-        let groupResults = group.items.map(({ _file, ...rest }) => rest as typeof group.items[0]);
-        if (!input.include_body) {
-          groupResults = groupResults.map(({ body, ...rest }) => ({ ...rest, body: null }) as typeof groupResults[0]);
-        }
-        if (!input.formulas) {
-          groupResults = groupResults.map(({ formulas, ...rest }) => rest as typeof groupResults[0]);
-        }
-        const resultObj: QueryGroupResult = {
-          key: group.key,
-          results: groupResults,
-        };
-        if (input.property_summaries && Object.keys(input.property_summaries).length > 0) {
-          resultObj.summaries = this.computeQuerySummaries(group.items, input.property_summaries, input.summaries ?? {});
-        }
-        return resultObj;
-      });
-
-      return {
-        groups,
-        meta: {
-          total_count: totalCount,
-          has_more: false,
-        },
-      };
-    }
-
-    // Apply offset and limit
-    if (input.offset !== undefined && input.offset > 0) {
-      results = results.slice(input.offset);
-    }
-    let hasMore = false;
-    if (input.limit !== undefined) {
-      hasMore = results.length > input.limit;
-      results = results.slice(0, input.limit);
-    }
-
-    // Strip body if not requested (set to null per spec)
-    if (!input.include_body) {
-      results = results.map(({ body, ...rest }) => ({ ...rest, body: null }) as typeof results[0]);
-    }
-
-    // Strip internal _file metadata from results
-    results = results.map(({ _file, ...rest }) => rest as typeof results[0]);
-
-    // Strip formulas if none were defined
-    if (!input.formulas) {
-      results = results.map(({ formulas, ...rest }) => rest as typeof results[0]);
-    }
-
-    const out: QueryResult = {
-      results,
-      meta: {
-        total_count: totalCount,
-        has_more: hasMore,
+  async query(input: QueryInput): Promise<QueryResult & { error?: { code: string; message: string } }> {
+    const resolutionIndexByCache = new WeakMap<Map<string, IndexedReadResult>, LinkResolutionIndex>();
+    const result = await runQuery(input, {
+      typeDefs: this.typeDefs,
+      scanFiles: () => this.scanFiles(),
+      scanAllFiles: () => this.scanAllFiles(),
+      read: (relativePath: string) => this.read(relativePath),
+      buildFileCache: async (files: string[]) => {
+        const built = await this.buildFileCache(files);
+        return built as Map<string, IndexedReadResult>;
       },
-    };
-    if (input.property_summaries && Object.keys(input.property_summaries).length > 0) {
-      out.summaries = this.computeQuerySummaries(summarySource, input.property_summaries, input.summaries ?? {});
-    }
-    return out;
+      buildNonMarkdownSet: (allFiles: string[]) => this.buildNonMarkdownSet(allFiles),
+      resolveLink: (
+        linkValue: string,
+        fromPath: string,
+        files: string[],
+        fileCache: Map<string, IndexedReadResult>,
+        nonMarkdownFiles: Set<string>,
+      ) => {
+        let resolutionIndex = resolutionIndexByCache.get(fileCache);
+        if (!resolutionIndex) {
+          resolutionIndex = this.buildLinkResolutionIndex(files, fileCache as Map<string, ReadResult>);
+          resolutionIndexByCache.set(fileCache, resolutionIndex);
+        }
+        return this.resolveLinkFullWithFiles(
+          linkValue,
+          fromPath,
+          files,
+          undefined,
+          fileCache as Map<string, ReadResult>,
+          nonMarkdownFiles,
+          resolutionIndex.fileSet,
+          resolutionIndex,
+        );
+      },
+      evaluateStructuredWhere: (
+        condition: Record<string, unknown>,
+        frontmatter: Record<string, unknown>,
+        relativePath: string,
+        fileTypes: string[],
+        body?: string | null,
+      ) => this.evaluateStructuredWhere(condition, frontmatter, relativePath, fileTypes, body),
+      detectCircularFormulas: (formulas: Record<string, string>) => this.detectCircularFormulas(formulas),
+      computeQuerySummaries: (
+        rows: Array<{ frontmatter: Record<string, unknown> }>,
+        propertySummaries: Record<string, string>,
+        customSummaries: Record<string, string>,
+      ) => this.computeQuerySummaries(rows, propertySummaries, customSummaries),
+    });
+    return result as QueryResult & { error?: { code: string; message: string } };
   }
 
   private computeQuerySummaries(
@@ -2815,6 +2537,40 @@ fields:
    * Check uniqueness constraints when updating a file.
    * Returns issues for any violations.
    */
+  private valuesEqualForUniqueness(a: unknown, b: unknown): boolean {
+    if (a === b) return true;
+    if (a === null || a === undefined || b === null || b === undefined) return a === b;
+    try {
+      return JSON.stringify(a) === JSON.stringify(b);
+    } catch {
+      return false;
+    }
+  }
+
+  private shouldCheckUniquenessOnUpdate(
+    originalFrontmatter: Record<string, unknown>,
+    updatedFrontmatter: Record<string, unknown>,
+    types: string[],
+  ): boolean {
+    const idField = this.config.settings.id_field;
+    if (!this.valuesEqualForUniqueness(originalFrontmatter[idField], updatedFrontmatter[idField])) {
+      return true;
+    }
+
+    for (const typeName of types) {
+      const typeDef = this.typeDefs.get(typeName);
+      if (!typeDef?.fields) continue;
+      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+        if (!fieldDef.unique) continue;
+        if (!this.valuesEqualForUniqueness(originalFrontmatter[fieldName], updatedFrontmatter[fieldName])) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
   private async checkUpdateUniqueness(
     updatingPath: string,
     frontmatter: Record<string, unknown>,
@@ -2822,13 +2578,14 @@ fields:
   ): Promise<MdbaseError[]> {
     const issues: MdbaseError[] = [];
     const files = await this.scanFiles();
+    const fileCache = await this.buildFileCache(files);
 
     // Collect all file frontmatter except the updating file
     const otherFiles = new Map<string, Record<string, unknown>>();
     for (const relativePath of files) {
       if (relativePath === updatingPath) continue;
-      const readResult = await this.read(relativePath);
-      if (readResult.frontmatter) {
+      const readResult = fileCache.get(relativePath);
+      if (readResult?.frontmatter) {
         otherFiles.set(relativePath, readResult.frontmatter);
       }
     }
@@ -2965,6 +2722,8 @@ fields:
       }
     }
 
+    this.invalidateRuntimeCaches();
+
     return {
       batch_result: {
         total: matchingPaths.length,
@@ -3078,6 +2837,9 @@ fields:
     const failedPaths = new Set<string>();
     const fileCache = this.skipDependents ? await this.buildFileCache(files) : undefined;
     const nonMdSet = this.skipDependents ? this.buildNonMarkdownSet(await this.scanAllFiles()) : undefined;
+    const resolutionIndex = this.skipDependents && fileCache
+      ? this.buildLinkResolutionIndex(files, fileCache)
+      : undefined;
 
     for (const relativePath of matchingPaths) {
       // Check if this file depends on a failed file (skip_dependents)
@@ -3114,7 +2876,16 @@ fields:
               // Also try full link resolution
               if (!dependsOnFailed) {
                 try {
-                  const resolved = this.resolveLinkFullWithFiles(linkVal, relativePath, files, undefined, fileCache, nonMdSet);
+                  const resolved = this.resolveLinkFullWithFiles(
+                    linkVal,
+                    relativePath,
+                    files,
+                    undefined,
+                    fileCache,
+                    nonMdSet,
+                    resolutionIndex?.fileSet,
+                    resolutionIndex,
+                  );
                   if (resolved.resolved && failedPaths.has(resolved.resolved)) {
                     dependsOnFailed = true;
                   }
@@ -3246,6 +3017,10 @@ fields:
         failed++;
         details.push({ path: upd.path, status: "failed", error: { code: "io_error", message: `Failed to update ${upd.path}` } });
       }
+    }
+
+    if (succeeded > 0) {
+      this.invalidateRuntimeCaches({ fileLists: false, nonMarkdown: false });
     }
 
     return {
@@ -3682,11 +3457,13 @@ fields:
     if (!this.cache) {
       return { success: false, error: { code: "cache_unavailable", message: "Cache store is unavailable" } };
     }
+    this.invalidateRuntimeCaches();
     const files = await this.scanFiles();
     for (const relativePath of files) {
       await this.updateCacheForPath(relativePath);
     }
     await this.cache.flush();
+    this.invalidateRuntimeCaches({ fileLists: false, nonMarkdown: false });
     return { success: true };
   }
 
@@ -3699,6 +3476,7 @@ fields:
     }
     await this.cache.clear();
     this.cache = null;
+    this.invalidateRuntimeCaches({ fileLists: false, nonMarkdown: false });
     return { success: true };
   }
 
@@ -3922,7 +3700,17 @@ fields:
     const fileCache = await this.buildFileCache(files);
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
-    return this.resolveLinkFullWithFiles(linkValue, fromPath, files, targetType, fileCache, nonMdSet);
+    const resolutionIndex = this.buildLinkResolutionIndex(files, fileCache);
+    return this.resolveLinkFullWithFiles(
+      linkValue,
+      fromPath,
+      files,
+      targetType,
+      fileCache,
+      nonMdSet,
+      resolutionIndex.fileSet,
+      resolutionIndex,
+    );
   }
 
   private resolveLinkFullWithFiles(
@@ -3932,6 +3720,8 @@ fields:
     targetType?: string,
     fileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
+    knownFileSet?: Set<string>,
+    resolutionIndex?: LinkResolutionIndex,
   ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
     // Parse the link to get the target
     let parsed: ParsedLink | null;
@@ -3948,11 +3738,13 @@ fields:
     const fromDir = path.dirname(fromPath);
 
     // Strip anchor from target for resolution
-    let resolveTarget = target;
+    const resolveTarget = target;
+    const fileSet = knownFileSet ?? resolutionIndex?.fileSet ?? new Set(files);
+    const index = resolutionIndex ?? this.buildLinkResolutionIndex(files, fileCache, fileSet);
 
     // Helper to check if a file exists (markdown files in scan list, or any file on disk)
     const fileExists = (p: string): boolean => {
-      if (files.includes(p)) return true;
+      if (fileSet.has(p)) return true;
       return nonMarkdownFiles ? nonMarkdownFiles.has(p) : false;
     };
 
@@ -3994,7 +3786,7 @@ fields:
           return this.checkTargetType(resolved, targetType, fileCache);
         }
         for (const ext of this.getExtensions()) {
-          if (files.includes(resolved + ext)) {
+          if (fileSet.has(resolved + ext)) {
             return this.checkTargetType(resolved + ext, targetType, fileCache);
           }
         }
@@ -4008,7 +3800,7 @@ fields:
           return this.checkTargetType(resolved, targetType, fileCache);
         }
         for (const ext of this.getExtensions()) {
-          if (files.includes(resolved + ext)) {
+          if (fileSet.has(resolved + ext)) {
             return this.checkTargetType(resolved + ext, targetType, fileCache);
           }
         }
@@ -4029,11 +3821,11 @@ fields:
       }
 
       // Simple name resolution
-      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache);
+      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache, index);
     }
 
     // Fallback: try as simple name
-    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache);
+    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache, index);
   }
 
   /**
@@ -4045,6 +3837,7 @@ fields:
     files: string[],
     targetType?: string,
     fileCache?: Map<string, ReadResult>,
+    resolutionIndex?: LinkResolutionIndex,
   ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
     const fromDir = path.dirname(fromPath);
 
@@ -4060,17 +3853,13 @@ fields:
 
     // Step 1: ID field match
     const idField = this.config.settings.id_field;
-    const idMatches: string[] = [];
-    if (idField) {
-      for (const filePath of scopeFiles) {
-        const readResult = fileCache?.get(filePath);
-        if (!readResult?.frontmatter) continue;
-        const idValue = readResult.frontmatter[idField];
-        if (idValue !== null && idValue !== undefined && String(idValue) === name) {
-          idMatches.push(filePath);
-        }
-      }
-    }
+    const scopeSet = targetType ? new Set(scopeFiles) : undefined;
+    const idCandidates = idField
+      ? (resolutionIndex?.idToFiles.get(name) ?? this.scanIdMatchesByName(name, files, fileCache, idField))
+      : [];
+    const idMatches = scopeSet
+      ? idCandidates.filter((filePath) => scopeSet.has(filePath))
+      : idCandidates;
 
     if (idMatches.length === 1) {
       return this.checkTargetType(idMatches[0], targetType, fileCache);
@@ -4080,35 +3869,20 @@ fields:
     }
 
     // Step 2: Filename match
-    const filenameMatches: string[] = [];
-    for (const filePath of scopeFiles) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      if (basename === name) {
-        filenameMatches.push(filePath);
-      }
-    }
+    const basenameCandidates = resolutionIndex?.basenameToFiles.get(name) ?? this.scanBasenameMatches(name, files);
+    const filenameMatches = scopeSet
+      ? basenameCandidates.filter((filePath) => scopeSet.has(filePath))
+      : basenameCandidates;
 
     if (filenameMatches.length === 0) {
       // If there's a target constraint and no match found, check if a match exists outside scope
       if (targetType) {
-        const allFiles = files;
-        for (const filePath of allFiles) {
-          const basename = path.basename(filePath, path.extname(filePath));
-          if (basename === name) {
-            // Found a file but it's wrong type
-            return { resolved: null, wrongType: true };
-          }
+        if (basenameCandidates.length > 0) {
+          return { resolved: null, wrongType: true };
         }
         // Also check ID match outside scope
-        if (idField) {
-          for (const filePath of allFiles) {
-            const readResult = fileCache?.get(filePath);
-            if (!readResult?.frontmatter) continue;
-            const idValue = readResult.frontmatter[idField];
-            if (idValue !== null && idValue !== undefined && String(idValue) === name) {
-              return { resolved: null, wrongType: true };
-            }
-          }
+        if (idField && idCandidates.length > 0) {
+          return { resolved: null, wrongType: true };
         }
       }
       return { resolved: null };
@@ -4122,7 +3896,7 @@ fields:
     // 1. Same directory preference
     const sameDir = filenameMatches.filter((f) => path.dirname(f) === fromDir);
     if (sameDir.length === 1) {
-      return this.checkTargetType(sameDir[0], targetType);
+      return this.checkTargetType(sameDir[0], targetType, fileCache);
     }
 
     // 2. Shortest path
@@ -4143,6 +3917,73 @@ fields:
     }
 
     return this.checkTargetType(sorted[0], targetType, fileCache);
+  }
+
+  private scanBasenameMatches(name: string, files: string[]): string[] {
+    const matches: string[] = [];
+    for (const filePath of files) {
+      const basename = path.basename(filePath, path.extname(filePath));
+      if (basename === name) {
+        matches.push(filePath);
+      }
+    }
+    return matches;
+  }
+
+  private scanIdMatchesByName(
+    name: string,
+    files: string[],
+    fileCache: Map<string, ReadResult> | undefined,
+    idField: string,
+  ): string[] {
+    const matches: string[] = [];
+    for (const filePath of files) {
+      const readResult = fileCache?.get(filePath);
+      if (!readResult?.frontmatter) continue;
+      const idValue = readResult.frontmatter[idField];
+      if (idValue !== null && idValue !== undefined && String(idValue) === name) {
+        matches.push(filePath);
+      }
+    }
+    return matches;
+  }
+
+  private buildLinkResolutionIndex(
+    files: string[],
+    fileCache?: Map<string, ReadResult>,
+    fileSet?: Set<string>,
+  ): LinkResolutionIndex {
+    const basenameToFiles = new Map<string, string[]>();
+    const idToFiles = new Map<string, string[]>();
+    const idField = this.config.settings.id_field;
+
+    for (const filePath of files) {
+      const basename = path.basename(filePath, path.extname(filePath));
+      const existingByName = basenameToFiles.get(basename);
+      if (existingByName) {
+        existingByName.push(filePath);
+      } else {
+        basenameToFiles.set(basename, [filePath]);
+      }
+
+      if (!idField) continue;
+      const readResult = fileCache?.get(filePath);
+      const idValue = readResult?.frontmatter?.[idField];
+      if (idValue === null || idValue === undefined) continue;
+      const key = String(idValue);
+      const existingById = idToFiles.get(key);
+      if (existingById) {
+        existingById.push(filePath);
+      } else {
+        idToFiles.set(key, [filePath]);
+      }
+    }
+
+    return {
+      fileSet: fileSet ?? new Set(files),
+      basenameToFiles,
+      idToFiles,
+    };
   }
 
   /**
@@ -4187,6 +4028,19 @@ fields:
     return value.replace(/\\/g, "/").replace(/^\.\//, "");
   }
 
+  private mightReferenceRenamedPath(
+    rawValue: string,
+    oldPath: string,
+    oldBase: string,
+    oldNoExt: string,
+  ): boolean {
+    if (!rawValue) return false;
+    const normalized = rawValue.replace(/\\/g, "/");
+    return normalized.includes(oldBase) ||
+      normalized.includes(oldPath) ||
+      normalized.includes(oldNoExt);
+  }
+
   private extractLinkTarget(value: string): string {
     const trimmed = value.trim();
     const wikiMatch = trimmed.match(/^\[\[([^\]]+)\]\]$/);
@@ -4227,36 +4081,95 @@ fields:
     return targets;
   }
 
-  private async findBacklinks(targetPaths: string[]): Promise<Array<{ target: string; referrer: string }>> {
-    if (targetPaths.length === 0) return [];
-    const targetSet = new Set(targetPaths);
-    const results: Array<{ target: string; referrer: string }> = [];
-    const seen = new Set<string>();
+  private getBacklinkLookupTokens(targetPath: string): string[] {
+    const normalizedPath = this.normalizeLinkTarget(targetPath);
+    const noExt = normalizedPath.replace(/\.(md|markdown)$/, "");
+    const base = path.basename(noExt);
+    return [base, normalizedPath, noExt];
+  }
+
+  private async getBacklinkTokenIndex(): Promise<BacklinkTokenIndex> {
+    if (this.cachedBacklinkTokenIndex) {
+      return this.cachedBacklinkTokenIndex;
+    }
 
     const files = await this.scanFiles();
-    for (const relativePath of files) {
-      if (targetSet.has(relativePath)) continue;
-      const readResult = await this.read(relativePath);
-      if (readResult.error) continue;
+    const fileCache = await this.buildFileCache(files);
+    const tokenToSources = new Map<string, Set<string>>();
+    const sourceToTokens = new Map<string, Set<string>>();
+
+    for (const sourcePath of files) {
+      const readResult = fileCache.get(sourcePath);
+      if (!readResult || readResult.error) continue;
+
       const frontmatter = readResult.frontmatter ?? {};
       const types = readResult.types ?? [];
+      const tokens = new Set<string>();
 
       for (const typeName of types) {
         const typeDef = this.typeDefs.get(typeName);
         if (!typeDef?.fields) continue;
         for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
           const value = frontmatter[fieldName];
-          const targets = this.extractLinkTargetsForField(fieldDef, value);
-          if (targets.length === 0) continue;
-          for (const linkTarget of targets) {
-            for (const targetPath of targetPaths) {
-              if (!this.linkTargetMatches(targetPath, linkTarget)) continue;
-              const key = `${relativePath}::${targetPath}`;
-              if (seen.has(key)) continue;
-              seen.add(key);
-              results.push({ target: targetPath, referrer: relativePath });
-            }
+          const linkTargets = this.extractLinkTargetsForField(fieldDef, value);
+          for (const target of linkTargets) {
+            tokens.add(target);
           }
+        }
+      }
+
+      sourceToTokens.set(sourcePath, tokens);
+      for (const token of tokens) {
+        let sources = tokenToSources.get(token);
+        if (!sources) {
+          sources = new Set<string>();
+          tokenToSources.set(token, sources);
+        }
+        sources.add(sourcePath);
+      }
+    }
+
+    this.cachedBacklinkTokenIndex = {
+      tokenToSources,
+      sourceToTokens,
+    };
+    return this.cachedBacklinkTokenIndex;
+  }
+
+  private removeSourceFromBacklinkTokenIndex(sourcePath: string): void {
+    if (!this.cachedBacklinkTokenIndex) return;
+    const tokens = this.cachedBacklinkTokenIndex.sourceToTokens.get(sourcePath);
+    if (!tokens) return;
+
+    for (const token of tokens) {
+      const sources = this.cachedBacklinkTokenIndex.tokenToSources.get(token);
+      if (!sources) continue;
+      sources.delete(sourcePath);
+      if (sources.size === 0) {
+        this.cachedBacklinkTokenIndex.tokenToSources.delete(token);
+      }
+    }
+
+    this.cachedBacklinkTokenIndex.sourceToTokens.delete(sourcePath);
+  }
+
+  private async findBacklinks(targetPaths: string[]): Promise<Array<{ target: string; referrer: string }>> {
+    if (targetPaths.length === 0) return [];
+    const targetSet = new Set(targetPaths);
+    const results: Array<{ target: string; referrer: string }> = [];
+    const seen = new Set<string>();
+
+    const backlinkIndex = await this.getBacklinkTokenIndex();
+    for (const targetPath of targetPaths) {
+      for (const token of this.getBacklinkLookupTokens(targetPath)) {
+        const sources = backlinkIndex.tokenToSources.get(token);
+        if (!sources) continue;
+        for (const sourcePath of sources) {
+          if (targetSet.has(sourcePath)) continue;
+          const key = `${sourcePath}::${targetPath}`;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          results.push({ target: targetPath, referrer: sourcePath });
         }
       }
     }
@@ -4271,67 +4184,27 @@ fields:
    */
   async computeBacklinksForFile(targetPath: string): Promise<BacklinkEntry[]> {
     const files = await this.scanFiles();
-    const seenSources = new Set<string>();
-    const backlinks: BacklinkEntry[] = [];
-
-    for (const sourcePath of files) {
-      const readResult = await this.read(sourcePath);
-      if (readResult.error) continue;
-      const frontmatter = readResult.frontmatter ?? {};
-      const types = readResult.types ?? [];
-      const body = readResult.body ?? "";
-
-      // Collect all link values from this source file
-      const allLinkValues: string[] = [];
-
-      // 1. Frontmatter link-typed fields
-      for (const typeName of types) {
-        const typeDef = this.typeDefs.get(typeName);
-        if (!typeDef?.fields) continue;
-        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-          const value = frontmatter[fieldName];
-          if (value === null || value === undefined) continue;
-          if (fieldDef.type === "link" && typeof value === "string") {
-            allLinkValues.push(value);
-          } else if (fieldDef.type === "list" && fieldDef.items?.type === "link" && Array.isArray(value)) {
-            for (const item of value) {
-              if (typeof item === "string") allLinkValues.push(item);
-            }
-          }
-        }
-      }
-
-      // 2. Body links (including embeds) — all create backlinks
-      const bodyLinks = extractBodyLinks(body);
-      for (const bl of bodyLinks) {
-        allLinkValues.push(bl.raw);
-      }
-
-      // Check if any link resolves to the target
-      for (const linkValue of allLinkValues) {
-        if (seenSources.has(sourcePath)) break;
-        try {
-          const resolution = await this.resolveLinkFull(linkValue, sourcePath);
-          if (resolution.resolved === targetPath) {
-            seenSources.add(sourcePath);
-            const name = sourcePath.split("/").pop() ?? "";
-            backlinks.push({
-              file: {
-                path: sourcePath,
-                name,
-                basename: name.replace(/\.[^.]+$/, ""),
-                folder: sourcePath.includes("/") ? sourcePath.slice(0, sourcePath.lastIndexOf("/")) : "",
-                extension: "md",
-              },
-            });
-          }
-        } catch {
-          // Invalid link, skip
-        }
-      }
-    }
-
-    return backlinks;
+    const allFiles = await this.scanAllFiles();
+    const nonMdSet = this.buildNonMarkdownSet(allFiles);
+    const fileCache = await this.buildFileCache(files);
+    const resolutionIndex = this.buildLinkResolutionIndex(files, fileCache);
+    const linkIndex = buildLinkIndex({
+      files,
+      fileCache,
+      typeDefs: this.typeDefs,
+      resolveLink: (linkValue: string, fromPath: string) =>
+        this.resolveLinkFullWithFiles(
+          linkValue,
+          fromPath,
+          files,
+          undefined,
+          fileCache,
+          nonMdSet,
+          resolutionIndex.fileSet,
+          resolutionIndex,
+        ),
+    });
+    return linkIndex.backlinksFor(targetPath);
   }
 
   /**
@@ -4363,13 +4236,35 @@ fields:
   }
 
   private async buildFileCache(files: string[]): Promise<Map<string, ReadResult>> {
-    const fileCache = new Map<string, ReadResult>();
-    for (const filePath of files) {
-      const readResult = await this.read(filePath);
-      if (!readResult.error) {
-        fileCache.set(filePath, readResult);
-      }
+    if (
+      this.cachedFileCache &&
+      this.cachedFileCacheFiles &&
+      this.areSamePathLists(files, this.cachedFileCacheFiles)
+    ) {
+      return this.cachedFileCache;
     }
+
+    const fileCache = new Map<string, ReadResult>();
+    const workerCount = Math.max(1, Math.min(16, files.length));
+    let cursor = 0;
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const index = cursor++;
+        if (index >= files.length) break;
+        const filePath = files[index];
+        const readResult = await this.read(filePath);
+        if (!readResult.error) {
+          fileCache.set(filePath, readResult);
+        }
+      }
+    });
+    await Promise.all(workers);
+
+    if (this.cachedFiles && this.areSamePathLists(files, this.cachedFiles)) {
+      this.cachedFileCache = fileCache;
+      this.cachedFileCacheFiles = this.cachedFiles;
+    }
+
     return fileCache;
   }
 
@@ -4391,11 +4286,24 @@ fields:
     await this.cache.upsertFile(relativePath, stat, parsed.frontmatter, parsed.body ?? "");
   }
 
-  /**
-   * Scan all markdown files in the collection.
-   */
-  private async scanFiles(dir?: string): Promise<string[]> {
-    const scanDir = dir ?? this.root;
+  private async upsertCacheFromData(
+    relativePath: string,
+    frontmatter: Record<string, unknown>,
+    body: string,
+  ): Promise<void> {
+    if (!this.cache) return;
+    const fullPath = path.join(this.root, relativePath);
+    let stat: fs.Stats;
+    try {
+      stat = await fs.promises.stat(fullPath);
+    } catch {
+      await this.cache.deleteFile(relativePath);
+      return;
+    }
+    await this.cache.upsertFile(relativePath, stat, frontmatter, body);
+  }
+
+  private async scanFilesRecursive(scanDir: string): Promise<string[]> {
     const files: string[] = [];
 
     let entries: fs.Dirent[];
@@ -4413,17 +4321,15 @@ fields:
 
       if (this.isExcluded(relativePath)) continue;
 
-      // Nested collection boundary
       if (entry.isDirectory()) {
         const nestedConfig = path.join(fullPath, "mdbase.yaml");
         if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
           continue;
         }
         if (this.config.settings.include_subfolders) {
-          files.push(...await this.scanFiles(fullPath));
+          files.push(...await this.scanFilesRecursive(fullPath));
         }
       } else if (this.isMarkdownFile(entry.name)) {
-        // Skip mdbase.yaml
         if (entry.name === "mdbase.yaml") continue;
         files.push(relativePath);
       }
@@ -4432,8 +4338,7 @@ fields:
     return files;
   }
 
-  private async scanAllFiles(dir?: string): Promise<string[]> {
-    const scanDir = dir ?? this.root;
+  private async scanAllFilesRecursive(scanDir: string): Promise<string[]> {
     const files: string[] = [];
 
     let entries: fs.Dirent[];
@@ -4451,14 +4356,13 @@ fields:
 
       if (this.isExcluded(relativePath)) continue;
 
-      // Nested collection boundary
       if (entry.isDirectory()) {
         const nestedConfig = path.join(fullPath, "mdbase.yaml");
         if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
           continue;
         }
         if (this.config.settings.include_subfolders) {
-          files.push(...await this.scanAllFiles(fullPath));
+          files.push(...await this.scanAllFilesRecursive(fullPath));
         }
       } else {
         if (entry.name === "mdbase.yaml") continue;
@@ -4469,13 +4373,51 @@ fields:
     return files;
   }
 
+  /**
+   * Scan all markdown files in the collection.
+   */
+  private async scanFiles(dir?: string): Promise<string[]> {
+    if (dir && path.resolve(dir) !== path.resolve(this.root)) {
+      return await this.scanFilesRecursive(dir);
+    }
+    if (this.cachedFiles) {
+      return this.cachedFiles;
+    }
+    this.cachedFiles = await this.scanFilesRecursive(this.root);
+    return this.cachedFiles;
+  }
+
+  private async scanAllFiles(dir?: string): Promise<string[]> {
+    if (dir && path.resolve(dir) !== path.resolve(this.root)) {
+      return await this.scanAllFilesRecursive(dir);
+    }
+    if (this.cachedAllFiles) {
+      return this.cachedAllFiles;
+    }
+    this.cachedAllFiles = await this.scanAllFilesRecursive(this.root);
+    return this.cachedAllFiles;
+  }
+
   private buildNonMarkdownSet(allFiles: string[]): Set<string> {
+    if (
+      this.cachedNonMarkdownFiles &&
+      this.cachedAllFiles &&
+      this.areSamePathLists(allFiles, this.cachedAllFiles)
+    ) {
+      return this.cachedNonMarkdownFiles;
+    }
+
     const nonMd = new Set<string>();
     for (const filePath of allFiles) {
       if (!this.isMarkdownFile(filePath)) {
         nonMd.add(filePath);
       }
     }
+
+    if (this.cachedAllFiles && this.areSamePathLists(allFiles, this.cachedAllFiles)) {
+      this.cachedNonMarkdownFiles = nonMd;
+    }
+
     return nonMd;
   }
 }

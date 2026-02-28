@@ -25,6 +25,9 @@
     "url": "https://github.com/callumalpass/mdbase/issues"
   },
   "homepage": "https://github.com/callumalpass/mdbase#readme",
+  "bin": {
+    "mdb-profile": "dist/bin/mdb-profile.js"
+  },
   "keywords": [
     "markdown",
     "sqlite",
@@ -37,7 +40,8 @@
     "build": "tsc",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts"
+    "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts",
+    "profile": "npm run build && node dist/bin/mdb-profile.js"
   },
   "dependencies": {
     "gray-matter": "^4.0.3",

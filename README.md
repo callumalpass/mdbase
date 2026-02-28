@@ -28,6 +28,22 @@ npm run build
 npm test
 ```
 
+## Performance profiling
+
+Run the synthetic profiler with default workload:
+
+```bash
+./scripts/profile.sh
+```
+
+Write results to a JSON file with custom sizing:
+
+```bash
+./scripts/profile.sh --files 5000 --query-iters 500 --output .ops/profile/latest.json
+```
+
+The profiler reports latency percentiles (`p50`, `p95`, `p99`), averages, and throughput for core operations (`open`, `read`, `query_basic`, `query_formula`, `update`, `rename_update_refs`, `create`, `delete`, `cache_rebuild`).
+
 ## Usage
 
 The public API is async. Open a collection, run operations, then close it.
@@ -75,7 +91,7 @@ See `src/operations/collection.ts` for the authoritative behavior.
 Collections are configured with `mdbase.yaml`:
 
 ```yaml
-spec_version: "0.2.0"
+spec_version: "0.2.1"
 settings:
   types_folder: "_types"
   migrations_folder: "_types/_migrations"
