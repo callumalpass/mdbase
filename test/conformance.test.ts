@@ -19,11 +19,48 @@ import { parseFile, parseFileAsync } from "../src/frontmatter/parser.js";
 import { evaluateWhere, evaluateExpression, ExpressionError } from "../src/expressions/evaluator.js";
 import { parseLink, extractBodyLinks } from "../src/links/parser.js";
 
-// Path to the spec's test files
-const SPEC_TESTS_DIR = path.resolve(
-  os.homedir(),
-  "projects/mdbase-spec/tests",
-);
+interface SpecTestsLocation {
+  dir: string;
+  attempted: string[];
+}
+
+function resolveSpecTestsDir(): SpecTestsLocation {
+  const attempted: string[] = [];
+  const explicitDir = process.env.MDBASE_SPEC_TESTS_DIR;
+  if (explicitDir) {
+    const resolved = path.resolve(explicitDir);
+    attempted.push(resolved);
+    return { dir: resolved, attempted };
+  }
+
+  const explicitRepo = process.env.MDBASE_SPEC_REPO_DIR;
+  if (explicitRepo) {
+    const candidate = path.resolve(explicitRepo, "tests");
+    attempted.push(candidate);
+    return { dir: candidate, attempted };
+  }
+
+  const defaults = [
+    path.resolve(process.cwd(), "mdbase-spec/tests"),
+    path.resolve(process.cwd(), "../mdbase-spec/tests"),
+    path.resolve(os.homedir(), "projects/mdbase-spec/tests"),
+  ];
+  for (const candidate of defaults) {
+    attempted.push(candidate);
+    if (fs.existsSync(candidate)) {
+      return { dir: candidate, attempted };
+    }
+  }
+
+  return {
+    dir: explicitDir ? path.resolve(explicitDir) : defaults[0],
+    attempted,
+  };
+}
+
+const specTestsLocation = resolveSpecTestsDir();
+const SPEC_TESTS_DIR = specTestsLocation.dir;
+const REQUIRE_CONFORMANCE = process.env.MDBASE_REQUIRE_CONFORMANCE === "1";
 
 interface TestSetup {
   config?: string | null;
@@ -2022,9 +2059,14 @@ const allTests = discoverTests();
 
 if (allTests.size === 0) {
   describe("mdbase conformance", () => {
-    it("no test files found (waiting for test-writing loop)", () => {
-      console.log(`Looked in: ${SPEC_TESTS_DIR}`);
-      console.log("Run the test-writing Ralph Loop first to generate test YAML files.");
+    it("no test files found", () => {
+      console.log(`Looked in primary location: ${SPEC_TESTS_DIR}`);
+      console.log(`Attempted locations: ${specTestsLocation.attempted.join(", ")}`);
+      if (REQUIRE_CONFORMANCE) {
+        throw new Error(
+          `Conformance tests are required but no spec tests were found. Set MDBASE_SPEC_TESTS_DIR or clone mdbase-spec into ./mdbase-spec`,
+        );
+      }
     });
   });
 } else {

@@ -39,6 +39,13 @@ export interface ConfigLoadResult {
   error?: { code: string; message: string };
 }
 
+const SUPPORTED_SPEC_MAJOR = 0;
+const SUPPORTED_SPEC_MINOR = 2;
+const SUPPORTED_SPEC_PATCH = 1;
+
+export const SUPPORTED_SPEC_VERSION =
+  `${SUPPORTED_SPEC_MAJOR}.${SUPPORTED_SPEC_MINOR}.${SUPPORTED_SPEC_PATCH}`;
+
 const DEFAULT_SETTINGS: MdbaseSettings = {
   extensions: [],
   exclude: [".git", "node_modules", ".mdbase"],
@@ -145,13 +152,20 @@ export async function loadConfigAsync(
 
   let specVersion = String(rawConfig.spec_version);
 
-  // Handle "0.1" alias for "0.1.0"
+  // Handle short aliases like "0.2" by normalizing to a patch version.
   const shortVersionMatch = specVersion.match(/^(\d+)\.(\d+)$/);
   if (shortVersionMatch) {
+    const shortMajor = parseInt(shortVersionMatch[1], 10);
+    const shortMinor = parseInt(shortVersionMatch[2], 10);
+    const normalizedPatch =
+      shortMajor === SUPPORTED_SPEC_MAJOR && shortMinor === SUPPORTED_SPEC_MINOR
+        ? SUPPORTED_SPEC_PATCH
+        : 0;
+    const normalizedVersion = `${shortMajor}.${shortMinor}.${normalizedPatch}`;
     warnings.push(
-      `spec_version "${specVersion}" is a shorthand; normalizing to "${specVersion}.0"`,
+      `spec_version "${specVersion}" is a shorthand; normalizing to "${normalizedVersion}"`,
     );
-    specVersion = `${specVersion}.0`;
+    specVersion = normalizedVersion;
   }
 
   // Parse semver
@@ -180,20 +194,18 @@ export async function loadConfigAsync(
     };
   }
 
-  const supportedMinor = 2;
-
   // During 0.x, minor must match (we support 0.2.x)
-  if (minor !== supportedMinor) {
-    if (options?.allowFutureMinor && minor > supportedMinor) {
+  if (minor !== SUPPORTED_SPEC_MINOR) {
+    if (options?.allowFutureMinor && minor > SUPPORTED_SPEC_MINOR) {
       warnings.push(
-        `spec_version "${specVersion}" is newer than supported 0.${supportedMinor}.x; attempting to proceed`,
+        `spec_version "${specVersion}" is newer than supported 0.${SUPPORTED_SPEC_MINOR}.x; attempting to proceed`,
       );
     } else {
       return {
         valid: false,
         error: {
           code: "unsupported_version",
-          message: `Unsupported minor version: 0.${minor}`,
+          message: `Unsupported minor version: 0.${minor} (supported: ${SUPPORTED_SPEC_VERSION})`,
         },
       };
     }

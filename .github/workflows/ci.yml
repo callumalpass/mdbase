@@ -15,5 +15,10 @@ jobs:
         with:
           node-version: 22
       - run: npm ci
+      - name: Checkout mdbase spec tests
+        run: git clone --depth 1 https://github.com/callumalpass/mdbase-spec.git mdbase-spec
       - run: npm run build
       - run: npm test
+        env:
+          MDBASE_SPEC_TESTS_DIR: ${{ github.workspace }}/mdbase-spec/tests
+          MDBASE_REQUIRE_CONFORMANCE: "1"
