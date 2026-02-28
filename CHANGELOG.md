@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.1 - 2026-02-28
+## 0.2.2 - 2026-02-28
 - Add a built-in performance profiler (`mdb-profile`, `npm run profile`, `scripts/profile.sh`) for repeatable latency/throughput benchmarking on synthetic large collections.
 - Refactor query execution into a dedicated query engine with shared file caches to reduce repeated parsing and resolver setup.
 - Add link/backlink indexing and token-based backlink acceleration to cut repeated collection-wide scans during query/filter evaluation.
