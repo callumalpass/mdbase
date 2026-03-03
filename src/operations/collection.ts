@@ -1278,15 +1278,8 @@ fields:
     // Build the effective frontmatter (includes defaults) and the disk frontmatter
     const effectiveFrontmatter = { ...frontmatter };
 
-    // Check if any type has generated fields — if so, suppress default-only fields from disk
-    // even when write_defaults is true (generated types handle defaults differently)
-    const typeHasGeneratedFields = typeNames.some((tn) => {
-      const td = this.typeDefs.get(tn);
-      return td?.fields && Object.values(td.fields).some((f) => f.generated);
-    });
-
     const diskFrontmatter: Record<string, unknown> = {};
-    if (this.config.settings.write_defaults && !typeHasGeneratedFields) {
+    if (this.config.settings.write_defaults) {
       Object.assign(diskFrontmatter, frontmatter);
     } else {
       for (const [key, value] of Object.entries(frontmatter)) {
