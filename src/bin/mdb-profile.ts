@@ -6,55 +6,65 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { serializeFile } from "../frontmatter/parser.js";
+import { SUPPORTED_SPEC_VERSION } from "../config/loader.js";
 import { Collection } from "../operations/collection.js";
 
-const DEFAULT_SPEC_VERSION = "0.2.1";
+const DEFAULT_SPEC_VERSION = SUPPORTED_SPEC_VERSION;
 
 const TASK_TYPE_DEF = `---
+kind: mdbase.type
 name: task
+version: 1
 description: Synthetic task type for profiling
-strict: false
-fields:
-  title:
-    type: string
-    required: true
-  status:
-    type: enum
-    values: [open, in-progress, done]
-    default: open
-  priority:
-    type: integer
-    min: 1
-    max: 5
-    default: 3
-  points:
-    type: integer
-    min: 0
-    max: 13
-    default: 1
-  project:
-    type: link
-  id:
-    type: string
-  tags:
-    type: list
-    items:
-      type: string
+schema:
+  dialect: json-schema-2020-12
+  value:
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    type: object
+    additionalProperties: false
+    required: [type, title]
+    properties:
+      type: { const: task }
+      title: { type: string, minLength: 1 }
+      status: { enum: [open, in-progress, done] }
+      priority: { type: integer, minimum: 1, maximum: 5 }
+      points: { type: integer, minimum: 0, maximum: 13 }
+      project: { type: string }
+      id: { type: string }
+      tags:
+        type: array
+        items: { type: string }
+collection:
+  display:
+    name_field: title
+  links:
+    project:
+      target_type: project
+      validate_exists: true
 ---
 
 # Task
 `;
 
 const PROJECT_TYPE_DEF = `---
+kind: mdbase.type
 name: project
+version: 1
 description: Synthetic project type for profiling
-strict: false
-fields:
-  title:
-    type: string
-    required: true
-  id:
-    type: string
+schema:
+  dialect: json-schema-2020-12
+  value:
+    $schema: "https://json-schema.org/draft/2020-12/schema"
+    type: object
+    additionalProperties: false
+    required: [type, title]
+    properties:
+      type: { const: project }
+      title: { type: string, minLength: 1 }
+      id: { type: string }
+collection:
+  display:
+    name_field: title
 ---
 
 # Project
@@ -459,8 +469,9 @@ async function buildFixture(root: string, args: ProfileArgs): Promise<FixtureDat
 name: "Profiler"
 settings:
   types_folder: "_types"
-  default_validation: "error"
-  default_strict: false
+  validation: "error"
+  explicit_type_keys: [type, types]
+  id_field: id
   rename_update_refs: true
   exclude:
     - "_types"

@@ -1,4 +1,5 @@
 import { evaluateExpression, ExpressionError } from "../expressions/evaluator.js";
+import { evaluateMdbaseCel } from "../expressions/cel.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { TypeDefinition } from "../types/loader.js";
 
@@ -28,6 +29,7 @@ export interface QueryGroupResultOutput {
 
 export interface QueryResultRowOutput {
   path: string;
+  file: Record<string, unknown>;
   frontmatter: Record<string, unknown>;
   types: string[];
   body?: string | null;
@@ -44,6 +46,7 @@ export interface QueryResultOutput {
     has_more?: boolean;
   };
   error?: { code: string; message: string };
+  diagnostics?: Array<Record<string, unknown>>;
 }
 
 interface QueryRow extends QueryResultRowOutput {
@@ -83,6 +86,8 @@ export interface QueryEngineDeps {
     propertySummaries: Record<string, string>,
     customSummaries: Record<string, string>,
   ) => Record<string, unknown>;
+  useCel?: boolean;
+  omitBodyWhenExcluded?: boolean;
 }
 
 export async function runQuery(
@@ -205,6 +210,15 @@ export async function runQuery(
     if (input.where) {
       if (typeof input.where === "string") {
         const fileInfo = (readResult as Record<string, unknown>).file as Record<string, unknown> | undefined;
+        if (deps.useCel) {
+          const whereResult = evaluateMdbaseCel(input.where, {
+            record: { ...frontmatterWithFormulas, formula: formulaValues ?? {} },
+            raw: readResult.rawFrontmatter ?? {},
+            file: buildCelFileInfo(fileInfo, readResult.body, frontmatterWithFormulas),
+            thisRecord: thisContext?.frontmatter,
+          });
+          if (whereResult.diagnostics.length > 0 || !toBoolExternal(whereResult.value)) continue;
+        } else {
         const resolveFile = (linkTarget: string) => {
           const resolution = deps.resolveLink(linkTarget, relativePath, files, fileCache, nonMdSet);
           if (!resolution.resolved) return null;
@@ -249,6 +263,7 @@ export async function runQuery(
           }
           continue;
         }
+        }
       } else {
         if (!deps.evaluateStructuredWhere(
           input.where,
@@ -263,6 +278,7 @@ export async function runQuery(
     const fileInfo = (readResult as Record<string, unknown>).file as Record<string, unknown> | undefined;
     results.push({
       path: relativePath,
+      file: fileInfo ?? { path: relativePath },
       ...(readResult.frontmatter ?? {}),
       frontmatter: readResult.frontmatter ?? {},
       types: fileTypes,
@@ -280,7 +296,13 @@ export async function runQuery(
   const totalCount = results.length;
 
   if (input.group_by) {
-    const groups = groupRows(results, input.group_by, input.include_body ?? false, !!input.formulas);
+    const groups = groupRows(
+      results,
+      input.group_by,
+      input.include_body ?? false,
+      !!input.formulas,
+      deps.omitBodyWhenExcluded ?? false,
+    );
     const grouped: QueryGroupResultOutput[] = groups.map((group) => {
       const out: QueryGroupResultOutput = {
         key: group.key,
@@ -297,6 +319,7 @@ export async function runQuery(
     });
     return {
       groups: grouped,
+      diagnostics: [],
       meta: {
         total_count: totalCount,
         has_more: false,
@@ -314,9 +337,14 @@ export async function runQuery(
     results = results.slice(0, input.limit);
   }
 
-  let outputRows = results.map(({ _file, ...rest }) => rest);
+  let outputRows = results.map(({ _file, ...rest }) => ({
+    ...rest,
+    file: _file ?? rest.file ?? { path: rest.path },
+  }));
   if (!input.include_body) {
-    outputRows = outputRows.map(({ body, ...rest }) => ({ ...rest, body: null }));
+    outputRows = deps.omitBodyWhenExcluded
+      ? outputRows.map(({ body, ...rest }) => rest)
+      : outputRows.map(({ body, ...rest }) => ({ ...rest, body: null }));
   }
   if (!input.formulas) {
     outputRows = outputRows.map(({ formulas, ...rest }) => rest);
@@ -324,6 +352,7 @@ export async function runQuery(
 
   const out: QueryResultOutput = {
     results: outputRows,
+    diagnostics: [],
     meta: {
       total_count: totalCount,
       has_more: hasMore,
@@ -486,6 +515,7 @@ function groupRows(
   groupBy: { property: string; direction?: "asc" | "desc" | "ASC" | "DESC" },
   includeBody: boolean,
   includeFormulas: boolean,
+  omitBodyWhenExcluded: boolean,
 ): Array<{ key: unknown; rows: QueryResultRowOutput[]; sourceRows: QueryRow[] }> {
   const property = groupBy.property;
   const direction = (groupBy.direction ?? "ASC").toUpperCase();
@@ -518,7 +548,9 @@ function groupRows(
   for (const group of ordered) {
     let groupRowsOut = group.items.map(({ _file, ...rest }) => rest);
     if (!includeBody) {
-      groupRowsOut = groupRowsOut.map(({ body, ...rest }) => ({ ...rest, body: null }));
+      groupRowsOut = groupRowsOut.map(({ body, ...rest }) =>
+        omitBodyWhenExcluded ? rest : { ...rest, body: null },
+      );
     }
     if (!includeFormulas) {
       groupRowsOut = groupRowsOut.map(({ formulas, ...rest }) => rest);
@@ -530,6 +562,24 @@ function groupRows(
     });
   }
   return out;
+}
+
+function buildCelFileInfo(
+  fileInfo: Record<string, unknown> | undefined,
+  body: string | null | undefined,
+  frontmatter: Record<string, unknown>,
+): Record<string, unknown> {
+  const tagsValue = frontmatter.tags;
+  const tags = Array.isArray(tagsValue)
+    ? tagsValue.map(String)
+    : typeof tagsValue === "string"
+      ? [tagsValue]
+      : [];
+  return {
+    ...(fileInfo ?? {}),
+    body: body ?? "",
+    tags,
+  };
 }
 
 function toBoolExternal(val: unknown): boolean {

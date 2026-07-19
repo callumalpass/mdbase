@@ -1,0 +1,147 @@
+import {
+  CelScalar,
+  celMethod,
+  isCelError,
+  isCelList,
+  mapType,
+  run,
+  type CelValue,
+  type CelInput,
+} from "@bufbuild/cel";
+import { strings } from "@bufbuild/cel/ext";
+
+export interface MdbaseCelDiagnostic {
+  code: string;
+  message: string;
+  expression: string;
+}
+
+export interface MdbaseCelContext {
+  record?: Record<string, unknown>;
+  raw?: Record<string, unknown>;
+  old?: Record<string, unknown>;
+  file?: Record<string, unknown>;
+  event?: Record<string, unknown>;
+  steps?: Record<string, unknown>;
+  vars?: Record<string, unknown>;
+  item?: unknown;
+  thisRecord?: Record<string, unknown>;
+  operation?: Record<string, unknown>;
+}
+
+export interface MdbaseCelResult {
+  value: unknown;
+  diagnostics: MdbaseCelDiagnostic[];
+}
+
+const mapDyn = mapType(CelScalar.STRING, CelScalar.DYN);
+
+const mdbaseCelFuncs = [
+  ...strings,
+  celMethod("inFolder", mapDyn, [CelScalar.STRING], CelScalar.BOOL, function inFolder(folder) {
+    const filePath = this.get("path");
+    if (typeof filePath !== "string") return false;
+    const normalizedFolder = folder.replace(/^\/+|\/+$/g, "");
+    return filePath === normalizedFolder || filePath.startsWith(`${normalizedFolder}/`);
+  }),
+  celMethod("hasTag", mapDyn, [CelScalar.STRING], CelScalar.BOOL, function hasTag(tag) {
+    const tags = this.get("tags");
+    if (!isCelList(tags)) return false;
+    const expected = tag.replace(/^#/, "");
+    for (const value of tags) {
+      if (typeof value !== "string") continue;
+      const actual = value.replace(/^#/, "");
+      if (actual === expected || actual.startsWith(`${expected}/`)) {
+        return true;
+      }
+    }
+    return false;
+  }),
+  celMethod("hasLink", mapDyn, [CelScalar.STRING], CelScalar.BOOL, function hasLink(linkValue) {
+    const links = this.get("links");
+    if (!isCelList(links)) return false;
+    for (const value of links) {
+      if (typeof value === "string" && value === linkValue) return true;
+      if (isObjectWithRaw(value) && value.raw === linkValue) return true;
+    }
+    return false;
+  }),
+  celMethod("asLink", mapDyn, [], CelScalar.STRING, function asLink() {
+    const filePath = this.get("path");
+    return typeof filePath === "string" ? `[[${filePath}]]` : "";
+  }),
+];
+
+export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext): MdbaseCelResult {
+  try {
+    const value = run(expression, buildMdbaseCelBindings(context) as Record<string, CelInput>, { funcs: mdbaseCelFuncs });
+    if (isCelError(value)) {
+      return {
+        value: null,
+        diagnostics: [{
+          code: "expression_evaluation_error",
+          message: value.message,
+          expression,
+        }],
+      };
+    }
+    return { value: normalizeCelValue(value), diagnostics: [] };
+  } catch (error) {
+    return {
+      value: null,
+      diagnostics: [{
+        code: "expression_evaluation_error",
+        message: error instanceof Error ? error.message : "CEL expression failed",
+        expression,
+      }],
+    };
+  }
+}
+
+export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string, unknown> {
+  const record = context.record ?? {};
+  const raw = context.raw ?? record;
+  const old = context.old ?? {};
+  const knownFields = new Set([...Object.keys(record), ...Object.keys(raw), ...Object.keys(old)]);
+  const bindings: Record<string, unknown> = {
+    ...record,
+    record,
+    raw,
+    note: record,
+    old,
+    file: context.file ?? {},
+    event: context.event ?? {},
+    steps: context.steps ?? {},
+    vars: context.vars ?? {},
+    operation: context.operation ?? {},
+    present: {
+      record: buildPresenceMap(record, knownFields),
+      raw: buildPresenceMap(raw, knownFields),
+      old: buildPresenceMap(old, knownFields),
+    },
+  };
+  if (context.item !== undefined) {
+    bindings.item = context.item;
+  }
+  if (context.thisRecord !== undefined) {
+    bindings.this = context.thisRecord;
+  }
+  return bindings;
+}
+
+function buildPresenceMap(value: Record<string, unknown>, knownFields: Set<string>): Record<string, boolean> {
+  const result: Record<string, boolean> = {};
+  for (const key of knownFields) {
+    result[key] = Object.prototype.hasOwnProperty.call(value, key);
+  }
+  return result;
+}
+
+function normalizeCelValue(value: CelValue): unknown {
+  if (typeof value === "bigint") return Number(value);
+  return value;
+}
+
+function isObjectWithRaw(value: unknown): value is { raw: string } {
+  return typeof value === "object" && value !== null && "raw" in value && typeof (value as { raw?: unknown }).raw === "string";
+}

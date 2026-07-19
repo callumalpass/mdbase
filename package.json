@@ -1,6 +1,6 @@
 {
   "name": "@callumalpass/mdbase",
-  "version": "0.2.2",
+  "version": "0.3.0-alpha.1",
   "description": "TypeScript implementation of the mdbase specification",
   "type": "module",
   "main": "dist/index.js",
@@ -13,6 +13,7 @@
   },
   "files": [
     "dist",
+    "conformance",
     "README.md",
     "LICENSE",
     "CHANGELOG.md"
@@ -38,25 +39,32 @@
   ],
   "scripts": {
     "build": "tsc",
+    "sync:v03-schemas": "node scripts/sync-v03-schemas.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts",
     "profile": "npm run build && node dist/bin/mdb-profile.js"
   },
   "dependencies": {
+    "@bufbuild/cel": "^0.6.0",
+    "@bufbuild/protobuf": "^2.12.0",
+    "@callumalpass/mdbase-runtime": "file:../mdbase-spec/packages/runtime-contracts",
+    "ajv": "^8.20.0",
+    "ajv-formats": "^3.0.1",
     "gray-matter": "^4.0.3",
-    "js-yaml": "^4.1.0",
-    "picomatch": "^4.0.0",
+    "js-yaml": "^4.3.0",
+    "picomatch": "^4.0.5",
+    "semver": "^7.8.5",
     "sql.js": "^1.12.0",
     "ulid": "^2.3.0",
-    "uuid": "^10.0.0",
-    "yaml": "^2.8.2"
+    "yaml": "^2.9.0"
   },
   "devDependencies": {
     "@types/js-yaml": "^4.0.0",
     "@types/node": "^22.0.0",
+    "@types/semver": "^7.7.1",
     "@types/sql.js": "^1.4.9",
     "typescript": "^5.5.0",
-    "vitest": "^2.0.0"
+    "vitest": "^4.1.10"
   }
 }

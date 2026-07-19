@@ -8,6 +8,7 @@ import { MdbaseConfig } from "../config/loader.js";
 import { TypeDefinition, FieldDefinition } from "../types/loader.js";
 import { MdbaseError } from "../errors.js";
 import { parseLink } from "../links/parser.js";
+import { validateJsonSchemaFrontmatter } from "./json-schema.js";
 
 export interface ValidationResult {
   valid: boolean;
@@ -317,6 +318,21 @@ export function validateFrontmatter(
   allFiles?: Map<string, Record<string, unknown>>,
 ): ValidationResult {
   const issues: MdbaseError[] = [];
+
+  const v03Types = types.filter((typeDef) => typeDef.schema);
+  for (const typeDef of v03Types) {
+    issues.push(...validateJsonSchemaFrontmatter(frontmatter, typeDef));
+  }
+
+  const legacyTypes = types.filter((typeDef) => !typeDef.schema);
+  if (legacyTypes.length === 0) {
+    const hasErrors = issues.some((i) => i.severity === "error" || !i.severity);
+    return {
+      valid: !hasErrors,
+      issues,
+    };
+  }
+  types = legacyTypes;
 
   // Merge fields from all types
   const { mergedFields, conflicts } = mergeTypeFields(types);

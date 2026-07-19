@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.0-alpha.1 - 2026-07-16
+- Add the v0.3 JSON Schema type profile, collection semantics, lifecycle behavior, CEL bindings, canonical diagnostics, and canonical operation envelopes.
+- Add portable runtime contracts, provider registry composition, policy checks, event/action validation, and materialization helpers.
+- Add report-first v0.2-to-v0.3 type and collection migration with source hashes, backups, validation, and recovery.
+- Retain explicit v0.2 loading and initialization through a compatibility adapter.
+- Make new collections and the built-in profiler use v0.3 by default.
+- Ship a machine-readable conformance claim and shared-fixture evidence.
+
 ## 0.2.2 - 2026-02-28
 - Add a built-in performance profiler (`mdb-profile`, `npm run profile`, `scripts/profile.sh`) for repeatable latency/throughput benchmarking on synthetic large collections.
 - Refactor query execution into a dedicated query engine with shared file caches to reduce repeated parsing and resolver setup.

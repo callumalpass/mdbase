@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as yaml from "js-yaml";
 
 export interface MdbaseSettings {
+  record_extensions: string[];
   extensions: string[];
   exclude: string[];
   include_subfolders: boolean;
@@ -27,9 +28,11 @@ export interface MdbaseSettings {
 
 export interface MdbaseConfig {
   spec_version: string;
+  spec_profile: "v0.2" | "v0.3";
   name?: string;
   description?: string;
   settings: MdbaseSettings;
+  runtime?: Record<string, unknown>;
 }
 
 export interface ConfigLoadResult {
@@ -39,14 +42,17 @@ export interface ConfigLoadResult {
   error?: { code: string; message: string };
 }
 
-const SUPPORTED_SPEC_MAJOR = 0;
-const SUPPORTED_SPEC_MINOR = 2;
-const SUPPORTED_SPEC_PATCH = 1;
+export const SUPPORTED_SPEC_VERSION = "0.3.0";
+export const PRERELEASE_SPEC_VERSIONS = ["0.3.0-alpha.1"] as const;
+export const LEGACY_SPEC_VERSION = "0.2.1";
 
-export const SUPPORTED_SPEC_VERSION =
-  `${SUPPORTED_SPEC_MAJOR}.${SUPPORTED_SPEC_MINOR}.${SUPPORTED_SPEC_PATCH}`;
+export function isSupportedV03SpecVersion(version: string): boolean {
+  return version === SUPPORTED_SPEC_VERSION
+    || PRERELEASE_SPEC_VERSIONS.includes(version as typeof PRERELEASE_SPEC_VERSIONS[number]);
+}
 
 const DEFAULT_SETTINGS: MdbaseSettings = {
+  record_extensions: ["md"],
   extensions: [],
   exclude: [".git", "node_modules", ".mdbase"],
   include_subfolders: true,
@@ -68,9 +74,11 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
   "name",
   "description",
   "settings",
+  "runtime",
 ]);
 
 const KNOWN_SETTINGS_KEYS = new Set([
+  "record_extensions",
   "extensions",
   "exclude",
   "include_subfolders",
@@ -85,6 +93,7 @@ const KNOWN_SETTINGS_KEYS = new Set([
   "write_defaults",
   "rename_update_refs",
   "cache_folder",
+  "validation",
 ]);
 
 export async function loadConfigAsync(
@@ -152,15 +161,12 @@ export async function loadConfigAsync(
 
   let specVersion = String(rawConfig.spec_version);
 
-  // Handle short aliases like "0.2" by normalizing to a patch version.
+  // Preserve the v0.2 compatibility adapter's historical shorthand.
   const shortVersionMatch = specVersion.match(/^(\d+)\.(\d+)$/);
   if (shortVersionMatch) {
     const shortMajor = parseInt(shortVersionMatch[1], 10);
     const shortMinor = parseInt(shortVersionMatch[2], 10);
-    const normalizedPatch =
-      shortMajor === SUPPORTED_SPEC_MAJOR && shortMinor === SUPPORTED_SPEC_MINOR
-        ? SUPPORTED_SPEC_PATCH
-        : 0;
+    const normalizedPatch = shortMajor === 0 && shortMinor === 2 ? 1 : 0;
     const normalizedVersion = `${shortMajor}.${shortMinor}.${normalizedPatch}`;
     warnings.push(
       `spec_version "${specVersion}" is a shorthand; normalizing to "${normalizedVersion}"`,
@@ -168,8 +174,8 @@ export async function loadConfigAsync(
     specVersion = normalizedVersion;
   }
 
-  // Parse semver
-  const versionMatch = specVersion.match(/^(\d+)\.(\d+)\.(\d+)$/);
+  // Parse SemVer, including retained v0.3 prerelease identifiers.
+  const versionMatch = specVersion.match(/^(\d+)\.(\d+)\.(\d+)(?:-([A-Za-z0-9.-]+))?$/);
   if (!versionMatch) {
     return {
       valid: false,
@@ -182,8 +188,6 @@ export async function loadConfigAsync(
 
   const major = parseInt(versionMatch[1], 10);
   const minor = parseInt(versionMatch[2], 10);
-
-  // Major version must be 0 (we only support 0.x)
   if (major !== 0) {
     return {
       valid: false,
@@ -194,21 +198,28 @@ export async function loadConfigAsync(
     };
   }
 
-  // During 0.x, minor must match (we support 0.2.x)
-  if (minor !== SUPPORTED_SPEC_MINOR) {
-    if (options?.allowFutureMinor && minor > SUPPORTED_SPEC_MINOR) {
+  const isV03 = isSupportedV03SpecVersion(specVersion);
+  const isLegacyV02 = minor === 2 && versionMatch[4] === undefined;
+  if (!isV03 && !isLegacyV02) {
+    if (options?.allowFutureMinor && minor > 3) {
       warnings.push(
-        `spec_version "${specVersion}" is newer than supported 0.${SUPPORTED_SPEC_MINOR}.x; attempting to proceed`,
+        `spec_version "${specVersion}" is newer than supported v0.3; attempting with the v0.3 profile`,
       );
     } else {
       return {
         valid: false,
         error: {
           code: "unsupported_version",
-          message: `Unsupported minor version: 0.${minor} (supported: ${SUPPORTED_SPEC_VERSION})`,
+          message: `Unsupported spec version: ${specVersion} (supported: ${SUPPORTED_SPEC_VERSION}; legacy adapter: 0.2.x)`,
         },
       };
     }
+  }
+
+  if (isV03 && specVersion !== SUPPORTED_SPEC_VERSION) {
+    warnings.push(
+      `spec_version "${specVersion}" is a compatible v0.3 prerelease; new collections use "${SUPPORTED_SPEC_VERSION}"`,
+    );
   }
 
   // Parse settings
@@ -223,6 +234,7 @@ export async function loadConfigAsync(
 
   const config: MdbaseConfig = {
     spec_version: specVersion,
+    spec_profile: isLegacyV02 ? "v0.2" : "v0.3",
     settings: settingsResult.settings!,
   };
 
@@ -245,6 +257,9 @@ export async function loadConfigAsync(
   }
   if (rawConfig.description !== undefined) {
     config.description = String(rawConfig.description);
+  }
+  if (rawConfig.runtime !== undefined && rawConfig.runtime !== null && typeof rawConfig.runtime === "object" && !Array.isArray(rawConfig.runtime)) {
+    config.runtime = rawConfig.runtime as Record<string, unknown>;
   }
 
   return {
@@ -290,7 +305,23 @@ function parseSettings(
     }
   }
 
-  // extensions
+  // record_extensions (v0.3 name): complete record extension set.
+  if (raw.record_extensions !== undefined) {
+    if (!Array.isArray(raw.record_extensions)) {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: "settings.record_extensions must be a list",
+        },
+      };
+    }
+    const normalized = normalizeExtensions(raw.record_extensions);
+    settings.record_extensions = normalized.length > 0 ? normalized : ["md"];
+    settings.extensions = settings.record_extensions.filter((ext) => ext !== "md");
+  }
+
+  // extensions (v0.2 name): additional extensions; .md is always included.
   if (raw.extensions !== undefined) {
     if (!Array.isArray(raw.extensions)) {
       return {
@@ -304,11 +335,8 @@ function parseSettings(
     const normalized: string[] = [];
     for (const ext of raw.extensions) {
       let e = String(ext);
-      // Normalize leading dot
       const hadDot = e.startsWith(".");
-      if (hadDot) {
-        e = e.slice(1);
-      }
+      if (hadDot) e = e.slice(1);
       // Warn about md being in the list
       if (e === "md") {
         warnings.push(
@@ -319,6 +347,7 @@ function parseSettings(
       normalized.push(e);
     }
     settings.extensions = normalized;
+    settings.record_extensions = ["md", ...normalized];
   }
 
   // exclude
@@ -397,7 +426,7 @@ function parseSettings(
     settings.explicit_type_keys = raw.explicit_type_keys.map(String);
   }
 
-  // default_validation
+  // default_validation (v0.2 name)
   if (raw.default_validation !== undefined) {
     const val = String(raw.default_validation);
     if (!["off", "warn", "error"].includes(val)) {
@@ -406,6 +435,21 @@ function parseSettings(
         error: {
           code: "invalid_config",
           message: `settings.default_validation must be "off", "warn", or "error", got "${val}"`,
+        },
+      };
+    }
+    settings.default_validation = val as "off" | "warn" | "error";
+  }
+
+  // validation (v0.3 name)
+  if (raw.validation !== undefined && raw.default_validation === undefined) {
+    const val = String(raw.validation);
+    if (!["off", "warn", "error"].includes(val)) {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: `settings.validation must be "off", "warn", or "error", got "${val}"`,
         },
       };
     }
@@ -514,4 +558,15 @@ function parseSettings(
   }
 
   return { valid: true, settings };
+}
+
+function normalizeExtensions(values: unknown[]): string[] {
+  const extensions: string[] = [];
+  for (const value of values) {
+    const ext = String(value).replace(/^\./, "");
+    if (ext && !extensions.includes(ext)) {
+      extensions.push(ext);
+    }
+  }
+  return extensions;
 }

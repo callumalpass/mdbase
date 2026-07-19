@@ -5,19 +5,39 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
+import { dump } from "js-yaml";
+import { validateCanonicalSchema } from "@callumalpass/mdbase-runtime";
 import picomatch from "picomatch";
 import { ulid } from "ulid";
-import { loadConfigAsync, MdbaseConfig } from "../config/loader.js";
-import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../types/loader.js";
+import {
+  isSupportedV03SpecVersion,
+  LEGACY_SPEC_VERSION,
+  loadConfigAsync,
+  MdbaseConfig,
+  SUPPORTED_SPEC_VERSION,
+} from "../config/loader.js";
+import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules, V03Migration } from "../types/loader.js";
 import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateWhere, evaluateExpression } from "../expressions/evaluator.js";
+import { evaluateMdbaseCel } from "../expressions/cel.js";
 import { parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 import { QueryInput, runQuery } from "./query-engine.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
+import {
+  buildRuntimePackage,
+  composeRuntimeRegistry,
+  LoadRuntimeContractsOptions,
+  preflightRuntimeWorkflows,
+  RuntimeMarkdownRecord,
+  RuntimePackage,
+  RuntimeRegistry,
+  RuntimeValidationResult,
+} from "../runtime/contracts.js";
 
 export interface ReadResult {
   valid?: boolean;
@@ -26,6 +46,7 @@ export interface ReadResult {
   body?: string | null;
   types?: string[];
   file?: Record<string, unknown>;
+  revision?: string;
   warnings?: Array<{ code: string; message: string }>;
   error?: { code: string; message: string };
 }
@@ -42,6 +63,8 @@ export interface CreateResult {
   frontmatter?: Record<string, unknown>;
   body?: string;
   path?: string;
+  revision?: string;
+  types?: string[];
   error?: { code: string; message: string };
 }
 
@@ -49,6 +72,9 @@ export interface UpdateResult {
   valid?: boolean;
   frontmatter?: Record<string, unknown>;
   body?: string;
+  path?: string;
+  revision?: string;
+  types?: string[];
   error?: { code: string; message: string };
 }
 
@@ -62,6 +88,7 @@ export interface QueryGroupResult {
   key: unknown;
   results: Array<{
     path: string;
+    file: Record<string, unknown>;
     frontmatter: Record<string, unknown>;
     types: string[];
     body?: string | null;
@@ -72,6 +99,7 @@ export interface QueryGroupResult {
 export interface QueryResult {
   results?: Array<{
     path: string;
+    file: Record<string, unknown>;
     frontmatter: Record<string, unknown>;
     types: string[];
     body?: string | null;
@@ -82,6 +110,7 @@ export interface QueryResult {
     total_count: number;
     has_more?: boolean;
   };
+  diagnostics?: Array<Record<string, unknown>>;
 }
 
 export interface BatchResultDetail {
@@ -107,6 +136,12 @@ export interface CacheOpResult {
   error?: { code: string; message: string };
 }
 
+export interface TypeMigrationEntry {
+  type: string;
+  source_path?: string;
+  migration: V03Migration;
+}
+
 interface BacklinkTokenIndex {
   tokenToSources: Map<string, Set<string>>;
   sourceToTokens: Map<string, Set<string>>;
@@ -118,7 +153,25 @@ interface LinkResolutionIndex {
   idToFiles: Map<string, string[]>;
 }
 
-const DEFAULT_SPEC_VERSION = "0.2.1";
+const DEFAULT_SPEC_VERSION = SUPPORTED_SPEC_VERSION;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function normalizeInitTypesFolder(value: string): string {
+  const normalized = value.replaceAll("\\", "/");
+  const segments = normalized.split("/");
+  const invalid = normalized.length === 0 ||
+    normalized.includes("\0") ||
+    path.posix.isAbsolute(normalized) ||
+    path.win32.isAbsolute(value) ||
+    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..");
+  if (invalid) {
+    throw new Error("settings.types_folder must be a non-empty relative path without traversal segments");
+  }
+  return segments.join("/");
+}
 
 export class Collection {
   private config: MdbaseConfig;
@@ -180,6 +233,19 @@ export class Collection {
     this.cachedBacklinkTokenIndex = null;
   }
 
+  /** Return the canonical v0.3 operation surface for this collection. */
+  v03Operations(): V03Operations {
+    if (this.config.spec_profile !== "v0.3") {
+      throw new V03ProfileError({
+        severity: "error",
+        code: "unsupported_profile",
+        message: "The v0.3 operation facade requires a v0.3 collection.",
+        path: "mdbase.yaml",
+      });
+    }
+    return new V03Operations(this);
+  }
+
   private isInvalidRelativePath(relativePath: string): boolean {
     const normalizedPath = relativePath.replace(/\\/g, "/");
     return normalizedPath.includes("\0") ||
@@ -225,44 +291,87 @@ export class Collection {
   }
 
   static async init(collectionRoot: string, input?: Record<string, unknown>): Promise<Record<string, unknown>> {
-    // Extract types_folder from input config if provided
-    let typesFolder = "_types";
-    const inputConfig = input?.config as Record<string, unknown> | undefined;
-    if (inputConfig?.settings) {
-      const settings = inputConfig.settings as Record<string, unknown>;
-      if (settings.types_folder) {
-        typesFolder = String(settings.types_folder);
-      }
+    const suppliedConfig = input?.config;
+    if (suppliedConfig !== undefined && !isPlainObject(suppliedConfig)) {
+      throw new Error("config must be a mapping");
     }
-    if (input?.types_folder) {
-      typesFolder = String(input.types_folder);
+
+    const config: Record<string, unknown> = suppliedConfig
+      ? { ...suppliedConfig }
+      : {};
+    const suppliedSettings = config.settings;
+    if (suppliedSettings !== undefined && !isPlainObject(suppliedSettings)) {
+      throw new Error("config.settings must be a mapping");
+    }
+    const settings: Record<string, unknown> = suppliedSettings
+      ? { ...suppliedSettings }
+      : {};
+
+    const requestedVersion = config.spec_version === undefined
+      ? DEFAULT_SPEC_VERSION
+      : String(config.spec_version);
+    const isLegacyV02 = /^0\.2(?:\.\d+)?$/.test(requestedVersion);
+    if (!isSupportedV03SpecVersion(requestedVersion) && !isLegacyV02) {
+      throw new Error(
+        `Unsupported spec version: ${requestedVersion} (supported: ${SUPPORTED_SPEC_VERSION}; legacy adapter: 0.2.x)`,
+      );
+    }
+    config.spec_version = requestedVersion === "0.2" ? LEGACY_SPEC_VERSION : requestedVersion;
+
+    const requestedTypesFolder = input?.types_folder ?? settings.types_folder ?? "_types";
+    if (typeof requestedTypesFolder !== "string") {
+      throw new Error("settings.types_folder must be a string");
+    }
+    const typesFolder = normalizeInitTypesFolder(requestedTypesFolder);
+    if (input?.types_folder !== undefined || settings.types_folder !== undefined || typesFolder !== "_types") {
+      settings.types_folder = typesFolder;
+    }
+    if (Object.keys(settings).length > 0) {
+      config.settings = settings;
+    }
+
+    if (!isLegacyV02) {
+      const canonicalConfig = requestedVersion === SUPPORTED_SPEC_VERSION
+        ? config
+        : { ...config, spec_version: SUPPORTED_SPEC_VERSION };
+      const validation = validateCanonicalSchema("config", canonicalConfig);
+      if (!validation.valid) {
+        const details = validation.errors
+          .map((error) => `${error.instancePath || "/"} ${error.message ?? error.keyword}`)
+          .join("; ");
+        throw new Error(`Invalid v0.3 config: ${details}`);
+      }
     }
 
     const configPath = path.join(collectionRoot, "mdbase.yaml");
-    const typesFolderPath = path.join(collectionRoot, typesFolder);
+    const typesFolderPath = path.join(collectionRoot, ...typesFolder.split("/"));
     const metaTypePath = path.join(typesFolderPath, "meta.md");
+    const configContent = `${dump(config, {
+      noRefs: true,
+      lineWidth: 100,
+      sortKeys: false,
+      quotingType: '"',
+    }).trimEnd()}\n`;
 
-    // Create mdbase.yaml
     await fs.promises.mkdir(collectionRoot, { recursive: true });
-    let configContent = `spec_version: "${DEFAULT_SPEC_VERSION}"\n`;
-    if (inputConfig) {
-      // Serialize the provided config
-      const lines: string[] = [];
-      if (inputConfig.spec_version) lines.push(`spec_version: "${inputConfig.spec_version}"`);
-      else lines.push(`spec_version: "${DEFAULT_SPEC_VERSION}"`);
-      if (inputConfig.settings) {
-        lines.push("settings:");
-        const settings = inputConfig.settings as Record<string, unknown>;
-        for (const [k, v] of Object.entries(settings)) {
-          lines.push(`  ${k}: ${typeof v === "string" ? `"${v}"` : v}`);
-        }
+    try {
+      await fs.promises.writeFile(configPath, configContent, { encoding: "utf8", flag: "wx" });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new Error(`mdbase.yaml already exists in ${collectionRoot}`);
       }
-      configContent = lines.join("\n") + "\n";
+      throw error;
     }
-    await fs.promises.writeFile(configPath, configContent);
 
-    // Create types folder and meta type with full schema
     await fs.promises.mkdir(typesFolderPath, { recursive: true });
+    if (!isLegacyV02) {
+      return {
+        config_path: "mdbase.yaml",
+        types_folder: typesFolder,
+      };
+    }
+
+    // v0.2 collections retain the generated meta type required by that profile.
     const metaContent = `---
 name: meta
 description: >
@@ -432,8 +541,7 @@ fields:
    */
   private isMarkdownFile(filePath: string): boolean {
     const ext = path.extname(filePath).slice(1); // remove dot
-    if (ext === "md") return true;
-    return this.config.settings.extensions.includes(ext);
+    return this.config.settings.record_extensions.includes(ext);
   }
 
   private async fileExists(fullPath: string): Promise<boolean> {
@@ -511,14 +619,17 @@ fields:
   ): boolean {
     // path_glob
     if (match.path_glob !== undefined) {
-      const matcher = picomatch(match.path_glob, { dot: true });
-      if (!matcher(relativePath)) return false;
+      const patterns = Array.isArray(match.path_glob) ? match.path_glob : [match.path_glob];
+      if (!patterns.some((pattern) => picomatch(pattern, { dot: true })(relativePath))) {
+        return false;
+      }
     }
 
     // fields_present - all listed fields must be present and non-null
     if (match.fields_present !== undefined) {
       for (const field of match.fields_present) {
-        if (!(field in frontmatter) || frontmatter[field] === null || frontmatter[field] === undefined) {
+        const value = getFieldPathValue(frontmatter, field);
+        if (!value.present || value.value === null || value.value === undefined) {
           return false;
         }
       }
@@ -527,6 +638,15 @@ fields:
     // where - all conditions must match
     if (match.where !== undefined) {
       if (!this.matchesWhereConditions(frontmatter, match.where)) return false;
+    }
+
+    if (match.expr !== undefined) {
+      const result = evaluateMdbaseCel(match.expr.$expr, {
+        record: frontmatter,
+        raw: frontmatter,
+      });
+      if (result.diagnostics.length > 0) return false;
+      return result.value === true;
     }
 
     return true;
@@ -543,61 +663,56 @@ fields:
     where: Record<string, unknown>,
   ): boolean {
     for (const [field, condition] of Object.entries(where)) {
-      const fieldValue = frontmatter[field];
+      const selected = getFieldPathValue(frontmatter, field);
+      const fieldValue = selected.value;
 
-      if (condition === null || condition === undefined) {
-        // null condition: field must be null/missing
-        if (fieldValue !== null && fieldValue !== undefined) return false;
-        continue;
-      }
-
-      if (typeof condition !== "object" || Array.isArray(condition)) {
+      if (condition === null || condition === undefined || typeof condition !== "object" || Array.isArray(condition)) {
         // Literal value: exact equality
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (String(fieldValue) !== String(condition)) return false;
+        if (!selected.present || !deepJsonEqual(fieldValue, condition)) return false;
         continue;
       }
 
       // Object with operators
       const ops = condition as Record<string, unknown>;
       for (const [op, expected] of Object.entries(ops)) {
-        if (!this.evalWhereOp(fieldValue, op, expected)) return false;
+        if (!this.evalWhereOp(fieldValue, selected.present, op, expected)) return false;
       }
     }
     return true;
   }
 
-  private evalWhereOp(fieldValue: unknown, op: string, expected: unknown): boolean {
+  private evalWhereOp(fieldValue: unknown, present: boolean, op: string, expected: unknown): boolean {
     switch (op) {
       case "eq":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return String(fieldValue) === String(expected);
+      case "const":
+        if (!present || fieldValue === null || fieldValue === undefined) return false;
+        return deepJsonEqual(fieldValue, expected);
       case "neq":
-        if (fieldValue === null || fieldValue === undefined) return true;
-        return String(fieldValue) !== String(expected);
+        if (!present || fieldValue === null || fieldValue === undefined) return false;
+        return !deepJsonEqual(fieldValue, expected);
       case "gt":
         if (fieldValue === null || fieldValue === undefined) return false;
-        return Number(fieldValue) > Number(expected);
+        return compareWhereValues(fieldValue, expected, (left, right) => left > right);
       case "gte":
         if (fieldValue === null || fieldValue === undefined) return false;
-        return Number(fieldValue) >= Number(expected);
+        return compareWhereValues(fieldValue, expected, (left, right) => left >= right);
       case "lt":
         if (fieldValue === null || fieldValue === undefined) return false;
-        return Number(fieldValue) < Number(expected);
+        return compareWhereValues(fieldValue, expected, (left, right) => left < right);
       case "lte":
         if (fieldValue === null || fieldValue === undefined) return false;
-        return Number(fieldValue) <= Number(expected);
+        return compareWhereValues(fieldValue, expected, (left, right) => left <= right);
       case "exists":
-        if (expected === true) {
-          // Field must be present and non-null
-          return fieldValue !== null && fieldValue !== undefined;
+        if (this.config.spec_profile === "v0.3") {
+          return expected === true ? present : !present;
         }
-        // exists: false — field must be missing or null
-        return fieldValue === null || fieldValue === undefined;
+        return expected === true
+          ? present && fieldValue !== null && fieldValue !== undefined
+          : !present || fieldValue === null || fieldValue === undefined;
       case "contains":
         if (fieldValue === null || fieldValue === undefined) return false;
         if (Array.isArray(fieldValue)) {
-          return fieldValue.some((item) => String(item) === String(expected));
+          return fieldValue.some((item) => deepJsonEqual(item, expected));
         }
         if (typeof fieldValue === "string") {
           return fieldValue.includes(String(expected));
@@ -606,18 +721,23 @@ fields:
       case "containsAll":
         if (!Array.isArray(fieldValue) || !Array.isArray(expected)) return false;
         return expected.every((e) =>
-          fieldValue.some((item) => String(item) === String(e)),
+          fieldValue.some((item) => deepJsonEqual(item, e)),
         );
       case "containsAny":
         if (!Array.isArray(fieldValue) || !Array.isArray(expected)) return false;
         return expected.some((e) =>
-          fieldValue.some((item) => String(item) === String(e)),
+          fieldValue.some((item) => deepJsonEqual(item, e)),
         );
+      case "in":
+        if (fieldValue === null || fieldValue === undefined || !Array.isArray(expected)) return false;
+        return expected.some((item) => deepJsonEqual(item, fieldValue));
       case "startsWith":
+      case "starts_with":
         if (fieldValue === null || fieldValue === undefined) return false;
         if (typeof fieldValue === "string") return fieldValue.startsWith(String(expected));
         return false;
       case "endsWith":
+      case "ends_with":
         if (fieldValue === null || fieldValue === undefined) return false;
         if (typeof fieldValue === "string") return fieldValue.endsWith(String(expected));
         return false;
@@ -697,6 +817,8 @@ fields:
       };
     }
 
+    const revision = await computeRevision(fullPath);
+
     let parsed: Awaited<ReturnType<typeof parseFileAsync>>;
     let cached: CachedFile | null = null;
     if (this.cache) {
@@ -740,6 +862,7 @@ fields:
           body: parsed.body,
           types: [],
           file,
+          revision,
         } as unknown as ReadResult;
       }
       if (this.config.settings.default_validation === "warn") {
@@ -758,6 +881,7 @@ fields:
           types: [],
           warnings: [{ code: "invalid_frontmatter", message: parsed.error.message }],
           file,
+          revision,
         } as unknown as ReadResult;
       }
       // At "error" level: return error
@@ -783,6 +907,7 @@ fields:
         }
       }
     }
+    this.applyV03ReadDefaults(frontmatter, types);
 
     // Coerce values based on type definitions
     for (const typeName of types) {
@@ -829,6 +954,7 @@ fields:
       body: parsed.body,
       types,
       file,
+      revision,
     };
   }
 
@@ -887,6 +1013,118 @@ fields:
     }
   }
 
+  private applyV03ReadDefaults(frontmatter: Record<string, unknown>, types: string[]): void {
+    for (const typeName of types) {
+      const typeDef = this.typeDefs.get(typeName);
+      const defaults = typeDef?.collection?.read_defaults;
+      if (!defaults) continue;
+      for (const [fieldName, value] of Object.entries(defaults)) {
+        if (!(fieldName in frontmatter)) {
+          frontmatter[fieldName] = cloneJsonLike(value);
+        }
+      }
+    }
+  }
+
+  private applyV03Lifecycle(
+    types: string[],
+    event: "on_create" | "on_update",
+    frontmatter: Record<string, unknown>,
+    context: { oldFrontmatter?: Record<string, unknown>; relativePath?: string } = {},
+  ): MdbaseError[] {
+    const issues: MdbaseError[] = [];
+    const assignments = new Map<string, unknown>();
+
+    for (const typeName of types) {
+      const typeDef = this.typeDefs.get(typeName);
+      const eventPolicy = typeDef?.lifecycle?.[event];
+      if (!eventPolicy) continue;
+      const actions = Array.isArray(eventPolicy) ? eventPolicy : [eventPolicy];
+      for (const [index, action] of actions.entries()) {
+        if (action.if) {
+          const guard = evaluateMdbaseCel(action.if, {
+            record: frontmatter,
+            raw: frontmatter,
+            old: context.oldFrontmatter ?? {},
+            operation: {
+              event,
+              path: context.relativePath,
+            },
+          });
+          if (guard.diagnostics.length > 0) {
+            issues.push({
+              code: "expression_evaluation_error",
+              message: `Lifecycle guard on ${typeName}.${event}[${index}] failed: ${guard.diagnostics[0].message}`,
+              severity: "error",
+            });
+            continue;
+          }
+          if (guard.value !== true) {
+            continue;
+          }
+        }
+        for (const [fieldPath, lifecycleValue] of Object.entries(action.set)) {
+          const value = this.evaluateLifecycleValue(lifecycleValue, frontmatter, context);
+          if (assignments.has(fieldPath)) {
+            const previous = assignments.get(fieldPath);
+            if (JSON.stringify(previous) !== JSON.stringify(value)) {
+              issues.push({
+                code: "lifecycle_conflict",
+                message: `Conflicting lifecycle assignment for "${fieldPath}" on ${event}`,
+                field: fieldPath,
+                severity: "error",
+              });
+              continue;
+            }
+          }
+          assignments.set(fieldPath, value);
+        }
+      }
+    }
+
+    if (issues.some((issue) => issue.severity === "error" || !issue.severity)) {
+      return issues;
+    }
+
+    for (const [fieldPath, value] of assignments) {
+      try {
+        setFieldPathValue(frontmatter, fieldPath, value);
+      } catch (error) {
+        issues.push({
+          code: "invalid_lifecycle_path",
+          message: (error as Error).message,
+          field: fieldPath,
+          severity: "error",
+        });
+      }
+    }
+    return issues;
+  }
+
+  private evaluateLifecycleValue(
+    lifecycleValue: unknown,
+    frontmatter: Record<string, unknown>,
+    context: { oldFrontmatter?: Record<string, unknown>; relativePath?: string },
+  ): unknown {
+    if (!lifecycleValue || typeof lifecycleValue !== "object" || Array.isArray(lifecycleValue)) {
+      return lifecycleValue;
+    }
+    const value = lifecycleValue as Record<string, unknown>;
+    if (value.now === true) return new Date().toISOString();
+    if (value.today === true) return new Date().toISOString().slice(0, 10);
+    if (value.uuid === true) return crypto.randomUUID();
+    if (value.ulid === true) return ulid();
+    if (typeof value.slugify === "string") {
+      const source = getFieldPathValue(frontmatter, value.slugify).value;
+      return source === null || source === undefined ? null : slugify(String(source));
+    }
+    if (typeof value.copy === "string") {
+      return cloneJsonLike(getFieldPathValue(frontmatter, value.copy).value);
+    }
+    if ("literal" in value) return cloneJsonLike(value.literal);
+    return undefined;
+  }
+
   /**
    * Validate a single file or the entire collection.
    */
@@ -931,8 +1169,22 @@ fields:
       }
       typeDefs.push(typeDef);
     }
+    const rawFrontmatter = readResult.rawFrontmatter ?? frontmatter;
+    const v03TypeDefs = typeDefs.filter((typeDef) => typeDef.schema);
+    const legacyTypeDefs = typeDefs.filter((typeDef) => !typeDef.schema);
+    const result: ValidateResult = {
+      valid: true,
+      issues: [],
+    };
 
-    const result = validateFrontmatter(frontmatter, typeDefs, this.config);
+    if (v03TypeDefs.length > 0) {
+      const v03Result = validateFrontmatter(rawFrontmatter, v03TypeDefs, this.config);
+      result.issues.push(...v03Result.issues);
+    }
+    if (legacyTypeDefs.length > 0) {
+      const legacyResult = validateFrontmatter(frontmatter, legacyTypeDefs, this.config);
+      result.issues.push(...legacyResult.issues);
+    }
     // Add path to all issues
     for (const issue of result.issues) {
       if (!issue.path) {
@@ -946,7 +1198,7 @@ fields:
       const pattern = typeDef.path_pattern;
       // Expand {field} placeholders using frontmatter values
       const expectedFilename = pattern.replace(/\{(\w+)\}/g, (_, key) => {
-        const val = frontmatter[key];
+          const val = frontmatter[key];
         return val !== null && val !== undefined ? String(val) : "";
       });
       const actualFilename = path.basename(relativePath);
@@ -961,11 +1213,12 @@ fields:
     }
 
     // Check link fields: validate_exists, target constraint, ambiguous_link
-    await this.validateLinkFields(typeDefs, frontmatter, relativePath, result);
+    await this.validateLinkFields(legacyTypeDefs, frontmatter, relativePath, result);
+    await this.validateLinkFields(v03TypeDefs, rawFrontmatter, relativePath, result);
 
     // Check cross-file uniqueness for this file
     const uniqueFields = new Set<string>();
-    for (const typeDef of typeDefs) {
+    for (const typeDef of legacyTypeDefs) {
       if (!typeDef.fields) continue;
       for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
         if (fieldDef.unique) uniqueFields.add(fieldName);
@@ -998,7 +1251,56 @@ fields:
       }
     }
 
+    await this.checkV03UniqueForFile(relativePath, rawFrontmatter, v03TypeDefs, result.issues);
+    result.valid = !result.issues.some((issue) => issue.severity === "error" || !issue.severity);
+
     return result;
+  }
+
+  private validateForWrite(
+    v03Frontmatter: Record<string, unknown>,
+    legacyFrontmatter: Record<string, unknown>,
+    typeNames: string[],
+  ): ValidateResult {
+    const typeDefs = typeNames.map((typeName) => this.typeDefs.get(typeName)!).filter(Boolean);
+    const v03TypeDefs = typeDefs.filter((typeDef) => typeDef.schema);
+    const legacyTypeDefs = typeDefs.filter((typeDef) => !typeDef.schema);
+    const result: ValidateResult = {
+      valid: true,
+      issues: [],
+    };
+
+    if (v03TypeDefs.length > 0) {
+      const v03Result = validateFrontmatter(v03Frontmatter, v03TypeDefs, this.config);
+      result.issues.push(...v03Result.issues);
+    }
+    if (legacyTypeDefs.length > 0) {
+      const legacyResult = validateFrontmatter(legacyFrontmatter, legacyTypeDefs, this.config);
+      result.issues.push(...legacyResult.issues);
+    }
+
+    result.valid = !result.issues.some((issue) => issue.severity === "error" || !issue.severity);
+    return result;
+  }
+
+  private async validateCollectionPoliciesForWrite(
+    relativePath: string,
+    v03Frontmatter: Record<string, unknown>,
+    legacyFrontmatter: Record<string, unknown>,
+    typeNames: string[],
+  ): Promise<MdbaseError[]> {
+    const typeDefs = typeNames.map((typeName) => this.typeDefs.get(typeName)!).filter(Boolean);
+    const v03TypeDefs = typeDefs.filter((typeDef) => typeDef.schema);
+    const legacyTypeDefs = typeDefs.filter((typeDef) => !typeDef.schema);
+    const result: ValidateResult = {
+      valid: true,
+      issues: [],
+    };
+
+    await this.validateLinkFields(legacyTypeDefs, legacyFrontmatter, relativePath, result);
+    await this.validateLinkFields(v03TypeDefs, v03Frontmatter, relativePath, result);
+    result.issues.push(...await this.checkUpdateUniqueness(relativePath, v03Frontmatter, typeNames));
+    return result.issues;
   }
 
   private async validateCollection(): Promise<ValidateResult> {
@@ -1010,7 +1312,12 @@ fields:
     for (const relativePath of files) {
       const readResult = await this.read(relativePath);
       if (readResult.frontmatter) {
-        allFiles.set(relativePath, readResult.frontmatter);
+        allFiles.set(
+          relativePath,
+          this.config.spec_profile === "v0.3"
+            ? (readResult.rawFrontmatter ?? readResult.frontmatter)
+            : readResult.frontmatter,
+        );
       }
     }
 
@@ -1050,6 +1357,98 @@ fields:
     };
   }
 
+  async loadRuntimeContracts(options: LoadRuntimeContractsOptions = {}): Promise<RuntimePackage> {
+    const records: RuntimeMarkdownRecord[] = [];
+
+    if (options.includeTypeFiles !== false) {
+      for (const relativePath of await this.scanTypeFilesForRuntime()) {
+        const parsed = await parseFileAsync(path.join(this.root, relativePath));
+        if (parsed.error) {
+          records.push({
+            path: relativePath,
+            frontmatter: {},
+            body: parsed.body,
+          });
+          continue;
+        }
+        records.push({
+          path: relativePath,
+          frontmatter: parsed.frontmatter,
+          body: parsed.body,
+        });
+      }
+    }
+
+    for (const relativePath of await this.scanFiles()) {
+      const parsed = await parseFileAsync(path.join(this.root, relativePath));
+      if (parsed.error) continue;
+      records.push({
+        path: relativePath,
+        frontmatter: parsed.frontmatter,
+        body: parsed.body,
+      });
+    }
+
+    const runtimePackage = buildRuntimePackage(this.root, records, options);
+    const profileVersion = this.config.runtime?.profile_version;
+    if (profileVersion !== undefined && profileVersion !== "0.1.0") {
+      runtimePackage.diagnostics.push({
+        severity: "error",
+        code: "unsupported_profile",
+        message: `Unsupported runtime profile ${String(profileVersion)}; supported: 0.1.0.`,
+      });
+    }
+    return runtimePackage;
+  }
+
+  async getRuntimeRegistry(options: LoadRuntimeContractsOptions = {}): Promise<RuntimeRegistry> {
+    const runtimePackage = await this.loadRuntimeContracts(options);
+    const selectedPath = typeof this.config.runtime?.policy === "string"
+      ? this.config.runtime.policy.replace(/\\/g, "/").replace(/^\.\//, "")
+      : undefined;
+    const selectedPolicyId = options.selectedPolicyId
+      ?? runtimePackage.policies.find((policy) => policy.path === selectedPath)?.frontmatter.id;
+    if (selectedPath && !selectedPolicyId) {
+      runtimePackage.diagnostics.push({
+        severity: "error",
+        code: "policy_not_selected",
+        message: `Selected runtime policy ${selectedPath} was not found.`,
+        path: selectedPath,
+      });
+    }
+    return composeRuntimeRegistry(runtimePackage, options.implicitContracts, selectedPolicyId);
+  }
+
+  async preflightRuntimeWorkflows(
+    options: LoadRuntimeContractsOptions = {},
+  ): Promise<RuntimeValidationResult> {
+    const registry = await this.getRuntimeRegistry(options);
+    return preflightRuntimeWorkflows(registry);
+  }
+
+  listTypeMigrations(options: { type?: string; from?: number; to?: number } = {}): TypeMigrationEntry[] {
+    const requestedType = options.type?.toLowerCase();
+    const entries: TypeMigrationEntry[] = [];
+    for (const [typeName, typeDef] of this.typeDefs) {
+      if (requestedType && typeName !== requestedType) continue;
+      for (const migration of typeDef.migrations ?? []) {
+        if (options.from !== undefined && migration.from !== options.from) continue;
+        if (options.to !== undefined && migration.to !== options.to) continue;
+        entries.push({
+          type: typeName,
+          source_path: typeDef.source_path,
+          migration,
+        });
+      }
+    }
+    return entries.sort((a, b) => {
+      const typeCompare = a.type.localeCompare(b.type);
+      if (typeCompare !== 0) return typeCompare;
+      if (a.migration.from !== b.migration.from) return a.migration.from - b.migration.from;
+      return a.migration.to - b.migration.to;
+    });
+  }
+
   private checkCrossFileConstraints(
     allFiles: Map<string, Record<string, unknown>>,
     issues: MdbaseError[],
@@ -1075,6 +1474,33 @@ fields:
             } else {
               seen.set(key, filePath);
             }
+          }
+        }
+      }
+    }
+
+    // v0.3 collection.unique constraints
+    for (const [, typeDef] of this.typeDefs) {
+      if (!typeDef.collection?.unique) continue;
+      for (const rule of typeDef.collection.unique) {
+        const seen = new Map<string, string>();
+        for (const [filePath, frontmatter] of allFiles) {
+          const fileTypes = this.getTypesForFile(filePath, frontmatter);
+          if (!fileTypes.includes(typeDef.name)) continue;
+          if (!this.v03UniqueRuleApplies(rule, typeDef.name, filePath, fileTypes)) continue;
+          const fieldValue = getFieldPathValue(frontmatter, rule.field);
+          if (!fieldValue.present || fieldValue.value === null || fieldValue.value === undefined) continue;
+          const key = JSON.stringify(fieldValue.value);
+          if (seen.has(key)) {
+            issues.push({
+              code: "duplicate_value",
+              message: `Duplicate value "${String(fieldValue.value)}" for unique field "${rule.field}"`,
+              field: rule.field,
+              path: filePath,
+              severity: "error",
+            });
+          } else {
+            seen.set(key, filePath);
           }
         }
       }
@@ -1147,6 +1573,24 @@ fields:
           frontmatter[typesKey] = typeNames;
         }
       }
+    }
+
+    const createLifecycleIssues = this.applyV03Lifecycle(typeNames, "on_create", frontmatter, {
+      relativePath: input.path,
+    });
+    if (createLifecycleIssues.some((issue) => issue.severity === "error" || !issue.severity)) {
+      return {
+        valid: false,
+        error: { code: "validation_failed", message: "Lifecycle validation failed on create" },
+        issues: createLifecycleIssues,
+      } as unknown as CreateResult;
+    }
+    const postLifecycleTypes = this.getTypesForFile(input.path ?? "", frontmatter);
+    if (this.config.spec_profile === "v0.3" && !sameStringSet(typeNames, postLifecycleTypes)) {
+      return {
+        valid: false,
+        error: { code: "type_membership_changed", message: "Lifecycle changed type membership during create" },
+      };
     }
 
     // Track which fields are default-only (not user-provided, not generated)
@@ -1250,8 +1694,12 @@ fields:
 
     // Path validation: traversal, null bytes, and invalid characters
     if (this.isInvalidRelativePath(relativePath)) {
+      const normalizedPath = relativePath.replace(/\\/g, "/");
       return {
-        error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
+        error: {
+          code: this.config.spec_profile === "v0.3" && normalizedPath.split("/").includes("..") ? "path_traversal" : "invalid_path",
+          message: `Invalid path: ${relativePath}`,
+        },
       };
     }
 
@@ -1301,10 +1749,10 @@ fields:
       }
     }
 
-    // Validate the effective frontmatter (includes defaults)
+    // Validate before writing. v0.3 JSON Schema sees persisted/lifecycle values;
+    // legacy validation keeps the previous effective-default behavior.
     if (this.config.settings.default_validation !== "off") {
-      const typeDefs = typeNames.map((t) => this.typeDefs.get(t)!).filter(Boolean);
-      const valResult = validateFrontmatter(effectiveFrontmatter, typeDefs, this.config);
+      const valResult = this.validateForWrite(frontmatter, effectiveFrontmatter, typeNames);
       if (!valResult.valid) {
         // At "error" level: always reject. At "warn" level: reject if there are error-severity issues
         const hasErrors = valResult.issues.some((i) => i.severity === "error" || !i.severity);
@@ -1316,7 +1764,16 @@ fields:
           } as unknown as CreateResult;
         }
       }
+      const policyIssues = await this.validateCollectionPoliciesForWrite(relativePath, frontmatter, effectiveFrontmatter, typeNames);
+      if (hasValidationErrors(policyIssues) && this.config.settings.default_validation === "error") {
+        return {
+          valid: false,
+          error: { code: "validation_failed", message: "Collection policy validation failed on create" },
+          issues: policyIssues,
+        } as unknown as CreateResult;
+      }
     }
+    this.applyV03ReadDefaults(effectiveFrontmatter, typeNames);
 
     // Collect warnings (e.g. deprecated fields)
     const warnings: string[] = [];
@@ -1362,6 +1819,7 @@ fields:
       body,
       path: relativePath,
       types: typeNames,
+      revision: await computeRevision(fullPath),
     };
     if (warnings.length > 0) {
       result.warnings = warnings;
@@ -1376,6 +1834,7 @@ fields:
     path: string;
     fields?: Record<string, unknown>;
     body?: string;
+    if_revision?: string;
   }): Promise<UpdateResult> {
     const relativePath = input.path;
     if (this.isInvalidRelativePath(relativePath)) {
@@ -1388,6 +1847,14 @@ fields:
     if (!await this.fileExists(fullPath)) {
       return {
         error: { code: "file_not_found", message: `File not found: ${relativePath}` },
+      };
+    }
+
+    const readRevision = await computeRevision(fullPath);
+    if (input.if_revision !== undefined && input.if_revision !== readRevision) {
+      return {
+        valid: false,
+        error: { code: "concurrent_modification", message: `Revision mismatch for "${relativePath}"` },
       };
     }
 
@@ -1404,7 +1871,7 @@ fields:
     }
 
     // Determine types
-    const types = this.getFileTypes(frontmatter);
+    const types = this.getTypesForFile(relativePath, frontmatter);
 
     // Coerce values based on type definitions
     for (const typeName of types) {
@@ -1416,6 +1883,24 @@ fields:
         if (!fieldDef || value === null || value === undefined) continue;
         frontmatter[key] = coerceForRead(value, fieldDef);
       }
+    }
+
+    const updateLifecycleIssues = this.applyV03Lifecycle(types, "on_update", frontmatter, {
+      oldFrontmatter: originalFrontmatter,
+      relativePath,
+    });
+    if (updateLifecycleIssues.some((issue) => issue.severity === "error" || !issue.severity)) {
+      return {
+        error: { code: "validation_failed", message: "Lifecycle validation failed on update" },
+        issues: updateLifecycleIssues,
+      } as unknown as UpdateResult;
+    }
+    const postLifecycleTypes = this.getTypesForFile(relativePath, frontmatter);
+    if (this.config.spec_profile === "v0.3" && !sameStringSet(types, postLifecycleTypes)) {
+      return {
+        valid: false,
+        error: { code: "type_membership_changed", message: "Lifecycle changed type membership during update" },
+      };
     }
 
     // Apply now_on_write generated fields
@@ -1432,9 +1917,8 @@ fields:
 
     // Validate before writing (if validation is not off)
     if (this.config.settings.default_validation !== "off") {
-      const typeDefs = types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
-      if (typeDefs.length > 0) {
-        const valResult = validateFrontmatter(frontmatter, typeDefs, this.config);
+      if (types.length > 0) {
+        const valResult = this.validateForWrite(frontmatter, frontmatter, types);
         if (!valResult.valid && this.config.settings.default_validation === "error") {
           return {
             error: { code: "validation_failed", message: "Validation failed on update" },
@@ -1443,15 +1927,16 @@ fields:
         }
       }
 
-      // Check cross-file uniqueness constraints on update
-      if (this.shouldCheckUniquenessOnUpdate(originalFrontmatter, frontmatter, types)) {
-        const uniqueIssues = await this.checkUpdateUniqueness(relativePath, frontmatter, types);
-        if (uniqueIssues.length > 0 && this.config.settings.default_validation === "error") {
-          return {
-            error: { code: "validation_failed", message: "Uniqueness constraint violated on update" },
-            issues: uniqueIssues,
-          } as unknown as UpdateResult;
-        }
+      const policyIssues = await this.validateCollectionPoliciesForWrite(relativePath, frontmatter, frontmatter, types);
+      const changedUniqueness = this.shouldCheckUniquenessOnUpdate(originalFrontmatter, frontmatter, types);
+      const effectivePolicyIssues = changedUniqueness
+        ? policyIssues
+        : policyIssues.filter((issue) => issue.code !== "duplicate_id" && issue.code !== "duplicate_value");
+      if (hasValidationErrors(effectivePolicyIssues) && this.config.settings.default_validation === "error") {
+        return {
+          error: { code: "validation_failed", message: "Collection policy validation failed on update" },
+          issues: effectivePolicyIssues,
+        } as unknown as UpdateResult;
       }
     }
 
@@ -1470,6 +1955,7 @@ fields:
         }
       }
     }
+    this.applyV03ReadDefaults(effectiveFrontmatter, types);
 
     // Collect warnings (e.g. deprecated fields)
     const warnings: string[] = [];
@@ -1486,6 +1972,16 @@ fields:
 
     // Strip computed fields from disk frontmatter
     const diskFrontmatter = { ...frontmatter };
+    if (this.config.spec_profile === "v0.2" && this.config.settings.write_defaults) {
+      for (const typeName of types) {
+        const typeDef = this.typeDefs.get(typeName);
+        for (const [fieldName, fieldDef] of Object.entries(typeDef?.fields ?? {})) {
+          if (!(fieldName in diskFrontmatter) && fieldDef.default !== undefined) {
+            diskFrontmatter[fieldName] = cloneJsonLike(fieldDef.default);
+          }
+        }
+      }
+    }
     for (const typeName of types) {
       const typeDef = this.typeDefs.get(typeName);
       if (!typeDef?.fields) continue;
@@ -1529,6 +2025,9 @@ fields:
       valid: true,
       frontmatter: effectiveFrontmatter,
       body,
+      path: relativePath,
+      types,
+      revision: await computeRevision(fullPath),
     };
     if (warnings.length > 0) {
       result.warnings = warnings;
@@ -1539,7 +2038,7 @@ fields:
   /**
    * Delete a file from the collection.
    */
-  async delete(relativePath: string, input?: { check_backlinks?: boolean }): Promise<DeleteResult> {
+  async delete(relativePath: string, input?: { check_backlinks?: boolean; if_revision?: string }): Promise<DeleteResult> {
     if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
@@ -1549,6 +2048,12 @@ fields:
     if (!await this.fileExists(fullPath)) {
       return {
         error: { code: "file_not_found", message: `File not found: ${relativePath}` },
+      };
+    }
+    if (input?.if_revision !== undefined && input.if_revision !== await computeRevision(fullPath)) {
+      return {
+        valid: false,
+        error: { code: "concurrent_modification", message: `Revision mismatch for "${relativePath}"` },
       };
     }
 
@@ -1708,6 +2213,7 @@ fields:
     from: string;
     to: string;
     update_refs?: boolean;
+    if_revision?: string;
   }): Promise<Record<string, unknown>> {
     const fromPath = path.join(this.root, input.from);
     const toPath = path.join(this.root, input.to);
@@ -1721,6 +2227,12 @@ fields:
     if (!await this.fileExists(fromPath)) {
       return {
         error: { code: "file_not_found", message: `Source not found: ${input.from}` },
+      };
+    }
+    if (input.if_revision !== undefined && input.if_revision !== await computeRevision(fromPath)) {
+      return {
+        valid: false,
+        error: { code: "concurrent_modification", message: `Revision mismatch for "${input.from}"` },
       };
     }
 
@@ -2348,6 +2860,8 @@ fields:
         propertySummaries: Record<string, string>,
         customSummaries: Record<string, string>,
       ) => this.computeQuerySummaries(rows, propertySummaries, customSummaries),
+      useCel: this.config.spec_profile === "v0.3",
+      omitBodyWhenExcluded: this.config.spec_profile === "v0.3",
     });
     return result as QueryResult & { error?: { code: string; message: string } };
   }
@@ -2495,6 +3009,20 @@ fields:
   ): boolean {
     // String expression
     if (typeof where === "string") {
+      if (this.config.spec_profile === "v0.3") {
+        const folder = path.dirname(filePath) === "." ? "" : path.dirname(filePath);
+        const result = evaluateMdbaseCel(where, {
+          record: frontmatter,
+          raw: frontmatter,
+          file: {
+            path: filePath,
+            name: path.basename(filePath),
+            folder,
+            body: body ?? "",
+          },
+        });
+        return result.diagnostics.length === 0 && result.value === true;
+      }
       return evaluateWhere(where, { frontmatter, path: filePath, types, body });
     }
 
@@ -2540,6 +3068,61 @@ fields:
     }
   }
 
+  private async checkV03UniqueForFile(
+    relativePath: string,
+    frontmatter: Record<string, unknown>,
+    typeDefs: TypeDefinition[],
+    issues: MdbaseError[],
+  ): Promise<void> {
+    const files = await this.scanFiles();
+    for (const typeDef of typeDefs) {
+      if (!typeDef.collection?.unique) continue;
+      const currentTypes = typeDefs.map((t) => t.name);
+      for (const rule of typeDef.collection.unique) {
+        const fieldValue = getFieldPathValue(frontmatter, rule.field);
+        if (!fieldValue.present || fieldValue.value === null || fieldValue.value === undefined) continue;
+        if (!this.v03UniqueRuleApplies(rule, typeDef.name, relativePath, currentTypes)) continue;
+        const key = JSON.stringify(fieldValue.value);
+        for (const otherPath of files) {
+          if (otherPath === relativePath) continue;
+          const other = await this.read(otherPath);
+          const otherFrontmatter = other.rawFrontmatter ?? other.frontmatter;
+          if (!otherFrontmatter) continue;
+          const otherTypes = other.types ?? this.getTypesForFile(otherPath, otherFrontmatter);
+          if (!otherTypes.includes(typeDef.name)) continue;
+          if (!this.v03UniqueRuleApplies(rule, typeDef.name, otherPath, otherTypes)) continue;
+          const otherValue = getFieldPathValue(otherFrontmatter, rule.field);
+          if (!otherValue.present || otherValue.value === null || otherValue.value === undefined) continue;
+          if (JSON.stringify(otherValue.value) === key) {
+            issues.push({
+              code: "duplicate_value",
+              message: `Duplicate value "${String(fieldValue.value)}" for unique field "${rule.field}"`,
+              field: rule.field,
+              path: relativePath,
+              severity: "error",
+            });
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  private v03UniqueRuleApplies(
+    rule: { scope?: "collection" | "type" | "path_glob"; path_glob?: string },
+    typeName: string,
+    relativePath: string,
+    fileTypes: string[],
+  ): boolean {
+    const scope = rule.scope ?? "type";
+    if (scope === "collection") return true;
+    if (scope === "type") return fileTypes.includes(typeName);
+    if (scope === "path_glob") {
+      return typeof rule.path_glob === "string" && picomatch(rule.path_glob, { dot: true })(relativePath);
+    }
+    return false;
+  }
+
   private shouldCheckUniquenessOnUpdate(
     originalFrontmatter: Record<string, unknown>,
     updatedFrontmatter: Record<string, unknown>,
@@ -2552,10 +3135,18 @@ fields:
 
     for (const typeName of types) {
       const typeDef = this.typeDefs.get(typeName);
-      if (!typeDef?.fields) continue;
-      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-        if (!fieldDef.unique) continue;
-        if (!this.valuesEqualForUniqueness(originalFrontmatter[fieldName], updatedFrontmatter[fieldName])) {
+      if (typeDef?.fields) {
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          if (!fieldDef.unique) continue;
+          if (!this.valuesEqualForUniqueness(originalFrontmatter[fieldName], updatedFrontmatter[fieldName])) {
+            return true;
+          }
+        }
+      }
+      for (const rule of typeDef?.collection?.unique ?? []) {
+        const before = getFieldPathValue(originalFrontmatter, rule.field).value;
+        const after = getFieldPathValue(updatedFrontmatter, rule.field).value;
+        if (!this.valuesEqualForUniqueness(before, after)) {
           return true;
         }
       }
@@ -2579,7 +3170,7 @@ fields:
       if (relativePath === updatingPath) continue;
       const readResult = fileCache.get(relativePath);
       if (readResult?.frontmatter) {
-        otherFiles.set(relativePath, readResult.frontmatter);
+        otherFiles.set(relativePath, readResult.rawFrontmatter ?? readResult.frontmatter);
       }
     }
 
@@ -2606,19 +3197,41 @@ fields:
     // Check unique field constraints
     for (const typeName of types) {
       const typeDef = this.typeDefs.get(typeName);
-      if (!typeDef?.fields) continue;
-      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-        if (!fieldDef.unique) continue;
-        const myValue = frontmatter[fieldName];
-        if (myValue === null || myValue === undefined) continue;
+      if (typeDef?.fields) {
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          if (!fieldDef.unique) continue;
+          const myValue = frontmatter[fieldName];
+          if (myValue === null || myValue === undefined) continue;
+          for (const [otherPath, otherFm] of otherFiles) {
+            const otherValue = otherFm[fieldName];
+            if (otherValue !== null && otherValue !== undefined &&
+                JSON.stringify(myValue) === JSON.stringify(otherValue)) {
+              issues.push({
+                code: "duplicate_value",
+                message: `Duplicate value "${myValue}" for unique field "${fieldName}" (conflicts with ${otherPath})`,
+                field: fieldName,
+                path: updatingPath,
+                severity: "error",
+              });
+              break;
+            }
+          }
+        }
+      }
+      for (const rule of typeDef?.collection?.unique ?? []) {
+        const myValue = getFieldPathValue(frontmatter, rule.field);
+        if (!myValue.present || myValue.value === null || myValue.value === undefined) continue;
         for (const [otherPath, otherFm] of otherFiles) {
-          const otherValue = otherFm[fieldName];
-          if (otherValue !== null && otherValue !== undefined &&
-              JSON.stringify(myValue) === JSON.stringify(otherValue)) {
+          const otherTypes = this.getTypesForFile(otherPath, otherFm);
+          if (!otherTypes.includes(typeName)) continue;
+          if (!this.v03UniqueRuleApplies(rule, typeName, otherPath, otherTypes)) continue;
+          const otherValue = getFieldPathValue(otherFm, rule.field);
+          if (!otherValue.present || otherValue.value === null || otherValue.value === undefined) continue;
+          if (JSON.stringify(myValue.value) === JSON.stringify(otherValue.value)) {
             issues.push({
               code: "duplicate_value",
-              message: `Duplicate value "${myValue}" for unique field "${fieldName}" (conflicts with ${otherPath})`,
-              field: fieldName,
+              message: `Duplicate value "${String(myValue.value)}" for unique field "${rule.field}" (conflicts with ${otherPath})`,
+              field: rule.field,
               path: updatingPath,
               severity: "error",
             });
@@ -2653,7 +3266,7 @@ fields:
         types: readResult.types ?? [],
         body: readResult.body,
       };
-      if (evaluateWhere(input.where, ctx)) {
+      if (this.evaluateStructuredWhere(input.where, ctx.frontmatter, ctx.path, ctx.types, ctx.body)) {
         matchingPaths.push(relativePath);
       }
     }
@@ -2766,7 +3379,7 @@ fields:
         types: readResult.types ?? [],
         body: readResult.body,
       };
-      if (evaluateWhere(input.where, ctx)) {
+      if (this.evaluateStructuredWhere(input.where, ctx.frontmatter, ctx.path, ctx.types, ctx.body)) {
         matchingPaths.push(relativePath);
       }
     }
@@ -2782,12 +3395,12 @@ fields:
       for (const relativePath of matchingPaths) {
         const existing = await parseFileAsync(path.join(this.root, relativePath));
         const merged = { ...existing.frontmatter, ...input.fields };
-        const types = this.getFileTypes(merged);
-        const typeDefs = types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
-        if (typeDefs.length > 0) {
+        const types = this.getTypesForFile(relativePath, merged);
+        if (types.length > 0) {
           // Coerce before validation
-          for (const typeDef of typeDefs) {
-            if (!typeDef.fields) continue;
+          for (const typeName of types) {
+            const typeDef = this.typeDefs.get(typeName);
+            if (!typeDef?.fields) continue;
             for (const [key, value] of Object.entries(merged)) {
               if (this.config.settings.explicit_type_keys.includes(key)) continue;
               const fieldDef = typeDef.fields[key];
@@ -2795,11 +3408,18 @@ fields:
               merged[key] = coerceForRead(value, fieldDef);
             }
           }
-          const valResult = validateFrontmatter(merged, typeDefs, this.config);
+          const valResult = this.validateForWrite(merged, merged, types);
           if (!valResult.valid) {
             return {
               batch_result: { total: matchingPaths.length, succeeded: 0, failed: matchingPaths.length, details: [] },
               error: { code: "validation_failed", message: `Validation failed for ${relativePath}` },
+            };
+          }
+          const policyIssues = await this.validateCollectionPoliciesForWrite(relativePath, merged, merged, types);
+          if (hasValidationErrors(policyIssues)) {
+            return {
+              batch_result: { total: matchingPaths.length, succeeded: 0, failed: matchingPaths.length, details: [] },
+              error: { code: "validation_failed", message: `Collection policy validation failed for ${relativePath}` },
             };
           }
         }
@@ -2953,11 +3573,11 @@ fields:
         }
         const existing = await parseFileAsync(fullPath);
         const merged = { ...existing.frontmatter, ...upd.fields };
-        const types = this.getFileTypes(merged);
-        const typeDefs = types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
-        if (typeDefs.length > 0) {
-          for (const typeDef of typeDefs) {
-            if (!typeDef.fields) continue;
+        const types = this.getTypesForFile(upd.path, merged);
+        if (types.length > 0) {
+          for (const typeName of types) {
+            const typeDef = this.typeDefs.get(typeName);
+            if (!typeDef?.fields) continue;
             for (const [key, value] of Object.entries(merged)) {
               if (this.config.settings.explicit_type_keys.includes(key)) continue;
               const fieldDef = typeDef.fields[key];
@@ -2965,11 +3585,18 @@ fields:
               merged[key] = coerceForRead(value, fieldDef);
             }
           }
-          const valResult = validateFrontmatter(merged, typeDefs, this.config);
+          const valResult = this.validateForWrite(merged, merged, types);
           if (!valResult.valid) {
             return {
               batch_result: { total: updates.length, succeeded: 0, failed: updates.length, details: [] },
               error: { code: "validation_failed", message: `Validation failed for ${upd.path}` },
+            };
+          }
+          const policyIssues = await this.validateCollectionPoliciesForWrite(upd.path, merged, merged, types);
+          if (hasValidationErrors(policyIssues)) {
+            return {
+              batch_result: { total: updates.length, succeeded: 0, failed: updates.length, details: [] },
+              error: { code: "validation_failed", message: `Collection policy validation failed for ${upd.path}` },
             };
           }
         }
@@ -3257,9 +3884,8 @@ fields:
     // Pre-validate all updates when validation is "error"
     if (this.config.settings.default_validation === "error") {
       for (const upd of updates) {
-        const typeDefs = upd.types.map((t) => this.typeDefs.get(t)!).filter(Boolean);
-        if (typeDefs.length > 0) {
-          const valResult = validateFrontmatter(upd.updated, typeDefs, this.config);
+        if (upd.types.length > 0) {
+          const valResult = this.validateForWrite(upd.updated, upd.updated, upd.types);
           if (!valResult.valid) {
             return {
               error: { code: "validation_failed", message: "Validation failed on backfill" },
@@ -3267,10 +3893,10 @@ fields:
             };
           }
         }
-        const uniqueIssues = await this.checkUpdateUniqueness(upd.path, upd.updated, upd.types);
-        if (uniqueIssues.length > 0) {
+        const policyIssues = await this.validateCollectionPoliciesForWrite(upd.path, upd.updated, upd.updated, upd.types);
+        if (hasValidationErrors(policyIssues)) {
           return {
-            error: { code: "validation_failed", message: "Uniqueness constraint violated on backfill" },
+            error: { code: "validation_failed", message: "Collection policy validation failed on backfill" },
             batch_result: { total: 0, succeeded: 0, failed: 0, details: [] },
           };
         }
@@ -3556,15 +4182,40 @@ fields:
     result: { valid: boolean; issues: MdbaseError[] },
   ): Promise<void> {
     for (const typeDef of typeDefs) {
-      if (!typeDef.fields) continue;
-      for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
-        if (fieldDef.type === "link") {
-          await this.validateSingleLink(fieldName, fieldDef, frontmatter[fieldName], relativePath, result);
-        } else if (fieldDef.type === "list" && fieldDef.items?.type === "link") {
-          const value = frontmatter[fieldName];
-          if (!Array.isArray(value)) continue;
-          for (const item of value) {
-            await this.validateSingleLink(fieldName, fieldDef.items, item, relativePath, result);
+      if (typeDef.fields) {
+        for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
+          if (fieldDef.type === "link") {
+            await this.validateSingleLink(fieldName, fieldDef, frontmatter[fieldName], relativePath, result);
+          } else if (fieldDef.type === "list" && fieldDef.items?.type === "link") {
+            const value = frontmatter[fieldName];
+            if (!Array.isArray(value)) continue;
+            for (const item of value) {
+              await this.validateSingleLink(fieldName, fieldDef.items, item, relativePath, result);
+            }
+          }
+        }
+      }
+      if (typeDef.collection?.links) {
+        for (const [fieldPath, rule] of Object.entries(typeDef.collection.links)) {
+          const values = getFieldPathValues(frontmatter, fieldPath);
+          for (const value of values) {
+            if (value === null || value === undefined) continue;
+            const targetType = Array.isArray(rule.target_type)
+              ? rule.target_type.find((entry) => entry !== "any")
+              : rule.target_type === "any"
+                ? undefined
+                : rule.target_type;
+            await this.validateSingleLink(
+              fieldPath,
+              {
+                type: "link",
+                validate_exists: rule.validate_exists,
+                target: targetType,
+              } as unknown as FieldDefinition,
+              value,
+              relativePath,
+              result,
+            );
           }
         }
       }
@@ -4002,10 +4653,11 @@ fields:
    * Get configured file extensions to try for link resolution.
    */
   private getExtensions(): string[] {
-    const configExts = this.config.settings?.extensions ?? [];
-    const normalizedExtra = configExts.map((e: string) => e.startsWith(".") ? e : `.${e}`);
-    // .md is always first, then configured extras
-    return [".md", ...normalizedExtra.filter((e: string) => e !== ".md")];
+    const configExts = this.config.settings?.record_extensions ?? ["md"];
+    const normalized = configExts.map((e: string) => e.startsWith(".") ? e : `.${e}`);
+    return normalized.includes(".md")
+      ? [".md", ...normalized.filter((e: string) => e !== ".md")]
+      : normalized;
   }
 
   /**
@@ -4366,6 +5018,39 @@ fields:
     return files;
   }
 
+  private async scanTypeFilesForRuntime(): Promise<string[]> {
+    const root = this.root;
+    const typesRoot = path.join(this.root, this.config.settings.types_folder);
+    const migrationsRoot = path.resolve(this.root, this.config.settings.migrations_folder);
+    const files: string[] = [];
+
+    async function walk(directory: string): Promise<void> {
+      let entries: fs.Dirent[];
+      try {
+        entries = await fs.promises.readdir(directory, { withFileTypes: true });
+      } catch {
+        return;
+      }
+
+      entries.sort((a, b) => a.name.localeCompare(b.name));
+      for (const entry of entries) {
+        const fullPath = path.join(directory, entry.name);
+        const resolved = path.resolve(fullPath);
+        if (resolved === migrationsRoot || resolved.startsWith(migrationsRoot + path.sep)) {
+          continue;
+        }
+        if (entry.isDirectory()) {
+          await walk(fullPath);
+        } else if (entry.isFile() && path.extname(entry.name) === ".md") {
+          files.push(path.relative(root, fullPath).replace(/\\/g, "/"));
+        }
+      }
+    }
+
+    await walk(typesRoot);
+    return files;
+  }
+
   /**
    * Scan all markdown files in the collection.
    */
@@ -4413,6 +5098,257 @@ fields:
 
     return nonMd;
   }
+}
+
+export interface V03Diagnostic {
+  severity: "info" | "warning" | "error";
+  code: string;
+  message: string;
+  path?: string;
+  field?: string;
+  type?: string;
+  schema_location?: string;
+  details?: unknown;
+}
+
+export interface V03OperationResult<T = Record<string, unknown>> {
+  valid: boolean;
+  result: T;
+  diagnostics: V03Diagnostic[];
+}
+
+export interface V03ReadInput {
+  path: string;
+}
+
+export interface V03ValidateInput {
+  path?: string;
+}
+
+export interface V03CreateInput {
+  type?: string;
+  types?: string[];
+  path?: string;
+  frontmatter?: Record<string, unknown>;
+  body?: string;
+}
+
+export interface V03UpdateInput {
+  path: string;
+  fields?: Record<string, unknown>;
+  body?: string;
+  if_revision?: string;
+}
+
+export interface V03DeleteInput {
+  path: string;
+  check_backlinks?: boolean;
+  if_revision?: string;
+}
+
+export interface V03RenameInput {
+  from: string;
+  to: string;
+  update_refs?: boolean;
+  if_revision?: string;
+}
+
+export class V03ProfileError extends Error {
+  constructor(public readonly diagnostic: V03Diagnostic) {
+    super(diagnostic.message);
+    this.name = "V03ProfileError";
+  }
+}
+
+/** Canonical `{ valid, result, diagnostics }` operations for v0.3 collections. */
+export class V03Operations {
+  constructor(private readonly collection: Collection) {}
+
+  async read(input: V03ReadInput): Promise<V03OperationResult> {
+    return await this.normalize("read", input, await this.collection.read(input.path));
+  }
+
+  async validate(input: V03ValidateInput = {}): Promise<V03OperationResult> {
+    return await this.normalize("validate", input, await this.collection.validate(input.path));
+  }
+
+  async create(input: V03CreateInput): Promise<V03OperationResult> {
+    return await this.normalize("create", input, await this.collection.create(input));
+  }
+
+  async update(input: V03UpdateInput): Promise<V03OperationResult> {
+    return await this.normalize("update", input, await this.collection.update(input));
+  }
+
+  async delete(input: V03DeleteInput): Promise<V03OperationResult> {
+    return await this.normalize(
+      "delete",
+      input,
+      await this.collection.delete(input.path, {
+        check_backlinks: input.check_backlinks,
+        if_revision: input.if_revision,
+      }),
+    );
+  }
+
+  async rename(input: V03RenameInput): Promise<V03OperationResult> {
+    return await this.normalize("rename", input, await this.collection.rename(input));
+  }
+
+  private async normalize(
+    operation: "read" | "validate" | "create" | "update" | "delete" | "rename",
+    input: V03ReadInput | V03ValidateInput | V03CreateInput | V03UpdateInput | V03DeleteInput | V03RenameInput,
+    rawValue: unknown,
+  ): Promise<V03OperationResult> {
+    const raw = isObjectRecord(rawValue) ? rawValue : {};
+    const fallbackPath = operation === "rename"
+      ? (input as V03RenameInput).from
+      : "path" in input && typeof input.path === "string"
+        ? input.path
+        : undefined;
+    const diagnostics = collectV03Diagnostics(raw, fallbackPath);
+    const result: Record<string, unknown> = { ...raw };
+    for (const key of ["valid", "error", "issues", "warnings", "validation", "diagnostics"]) {
+      delete result[key];
+    }
+
+    if (result.rawFrontmatter !== undefined) {
+      result.raw_frontmatter = result.rawFrontmatter;
+      delete result.rawFrontmatter;
+    }
+    if (operation === "read" && fallbackPath && !result.path) {
+      result.path = fallbackPath;
+    }
+
+    let valid = typeof raw.valid === "boolean" ? raw.valid : raw.error === undefined;
+    if (diagnostics.some((diagnostic) => diagnostic.severity === "error")) {
+      valid = false;
+    }
+
+    if (valid && operation !== "validate" && operation !== "delete") {
+      const persistedPath = operation === "rename"
+        ? (input as V03RenameInput).to
+        : typeof result.path === "string"
+          ? result.path
+          : fallbackPath;
+      if (persistedPath) {
+        const persisted = await this.collection.read(persistedPath);
+        if (persisted.error) {
+          diagnostics.push(toV03Diagnostic(persisted.error, "error", persistedPath));
+          valid = false;
+        } else {
+          result.path = persistedPath;
+          result.frontmatter = persisted.rawFrontmatter ?? persisted.frontmatter ?? {};
+          result.types = persisted.types ?? [];
+          if (persisted.revision) result.revision = persisted.revision;
+          if (operation === "read") {
+            result.raw_frontmatter = persisted.rawFrontmatter ?? {};
+            result.frontmatter = persisted.frontmatter ?? {};
+          }
+        }
+      }
+    }
+
+    if (operation === "validate" && fallbackPath) {
+      result.path = fallbackPath;
+    }
+
+    return {
+      valid: valid && !diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+      result,
+      diagnostics: deduplicateV03Diagnostics(diagnostics),
+    };
+  }
+}
+
+function collectV03Diagnostics(raw: Record<string, unknown>, fallbackPath?: string): V03Diagnostic[] {
+  const diagnostics: V03Diagnostic[] = [];
+  for (const value of arrayValue(raw.issues)) {
+    diagnostics.push(toV03Diagnostic(value, "error", fallbackPath));
+  }
+  const validation = isObjectRecord(raw.validation) ? raw.validation : undefined;
+  for (const value of arrayValue(validation?.issues)) {
+    diagnostics.push(toV03Diagnostic(value, "error", fallbackPath));
+  }
+  const error = isObjectRecord(raw.error) ? raw.error : undefined;
+  for (const value of arrayValue(error?.issues)) {
+    diagnostics.push(toV03Diagnostic(value, "error", fallbackPath));
+  }
+  if (error) {
+    diagnostics.push(toV03Diagnostic(error, "error", fallbackPath));
+  }
+  for (const warning of arrayValue(raw.warnings)) {
+    diagnostics.push(toV03Diagnostic(warning, "warning", fallbackPath));
+  }
+  for (const diagnostic of arrayValue(raw.diagnostics)) {
+    diagnostics.push(toV03Diagnostic(diagnostic, "error", fallbackPath));
+  }
+  return deduplicateV03Diagnostics(diagnostics);
+}
+
+function toV03Diagnostic(
+  value: unknown,
+  defaultSeverity: V03Diagnostic["severity"],
+  fallbackPath?: string,
+): V03Diagnostic {
+  const item = isObjectRecord(value) ? value : { message: String(value) };
+  const rawPath = typeof item.path === "string" ? item.path : fallbackPath;
+  const pathValue = rawPath && isSafeDiagnosticPath(rawPath) ? rawPath : undefined;
+  const details = isObjectRecord(item.details) ? { ...item.details } : {};
+  for (const key of ["expected", "actual", "line", "column", "end_line", "end_column"]) {
+    if (item[key] !== undefined) details[key] = item[key];
+  }
+  if (rawPath && !pathValue) details.input_path = rawPath;
+
+  let code = typeof item.code === "string" ? item.code : "operation_failed";
+  if (code === "invalid_path" && rawPath?.replace(/\\/g, "/").split("/").includes("..")) {
+    code = "path_traversal";
+  }
+  code = code.toLowerCase().replace(/[^a-z0-9_]+/g, "_").replace(/^[^a-z]+/, "") || "operation_failed";
+
+  const severity = item.severity === "info" || item.severity === "warning" || item.severity === "error"
+    ? item.severity
+    : defaultSeverity;
+  return {
+    severity,
+    code,
+    message: typeof item.message === "string" && item.message ? item.message : "Operation failed.",
+    ...(pathValue ? { path: pathValue } : {}),
+    ...(typeof item.field === "string" ? { field: item.field } : {}),
+    ...(typeof item.type === "string"
+      ? { type: item.type }
+      : typeof item.type_name === "string"
+        ? { type: item.type_name }
+        : {}),
+    ...(typeof item.schema_location === "string" ? { schema_location: item.schema_location } : {}),
+    ...(Object.keys(details).length > 0 ? { details } : {}),
+  };
+}
+
+function isSafeDiagnosticPath(value: string): boolean {
+  const normalized = value.replace(/\\/g, "/");
+  return !path.isAbsolute(value)
+    && !normalized.startsWith("/")
+    && !normalized.split("/").includes("..")
+    && !value.includes("\\");
+}
+
+function deduplicateV03Diagnostics(diagnostics: V03Diagnostic[]): V03Diagnostic[] {
+  const seen = new Set<string>();
+  return diagnostics.filter((diagnostic) => {
+    const key = canonicalJson(diagnostic);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function arrayValue(value: unknown): unknown[] {
+  return Array.isArray(value) ? value : [];
+}
+
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function coerceForRead(value: unknown, fieldDef: FieldDefinition): unknown {
@@ -4500,4 +5436,117 @@ function slugify(str: string): string {
     .replace(/[^a-z0-9]+/g, "-") // Replace non-alphanumeric with hyphens
     .replace(/-+/g, "-") // Collapse multiple hyphens
     .replace(/^-|-$/g, ""); // Trim leading/trailing hyphens
+}
+
+function hasValidationErrors(issues: MdbaseError[]): boolean {
+  return issues.some((issue) => issue.severity === "error" || !issue.severity);
+}
+
+function cloneJsonLike<T>(value: T): T {
+  if (value === null || value === undefined) return value;
+  if (typeof value !== "object") return value;
+  return JSON.parse(JSON.stringify(value)) as T;
+}
+
+function deepJsonEqual(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function canonicalJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+function sameStringSet(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  const rightSet = new Set(right);
+  return left.every((value) => rightSet.has(value));
+}
+
+function compareWhereValues(
+  left: unknown,
+  right: unknown,
+  compare: (leftValue: number | string, rightValue: number | string) => boolean,
+): boolean {
+  if (typeof left === "number" && typeof right === "number" && Number.isFinite(left) && Number.isFinite(right)) {
+    return compare(left, right);
+  }
+  if (typeof left === "string" && typeof right === "string") {
+    return compare(left, right);
+  }
+  return false;
+}
+
+async function computeRevision(filePath: string): Promise<string> {
+  const content = await fs.promises.readFile(filePath);
+  return `sha256:${createHash("sha256").update(content).digest("hex")}`;
+}
+
+function getFieldPathValue(
+  frontmatter: Record<string, unknown>,
+  fieldPath: string,
+): { present: boolean; value: unknown } {
+  const values = getFieldPathValues(frontmatter, fieldPath);
+  if (values.length === 0) return { present: false, value: undefined };
+  return { present: true, value: values[0] };
+}
+
+function getFieldPathValues(frontmatter: Record<string, unknown>, fieldPath: string): unknown[] {
+  const segments = fieldPath.split(".").filter(Boolean);
+  let current: unknown[] = [frontmatter];
+
+  for (const segment of segments) {
+    const arraySegment = segment.endsWith("[]");
+    const key = arraySegment ? segment.slice(0, -2) : segment;
+    const next: unknown[] = [];
+
+    for (const value of current) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
+      const child = (value as Record<string, unknown>)[key];
+      if (arraySegment) {
+        if (Array.isArray(child)) {
+          next.push(...child);
+        }
+      } else if (child !== undefined) {
+        next.push(child);
+      }
+    }
+
+    current = next;
+    if (current.length === 0) break;
+  }
+
+  return current;
+}
+
+function setFieldPathValue(
+  frontmatter: Record<string, unknown>,
+  fieldPath: string,
+  value: unknown,
+): void {
+  const segments = fieldPath.split(".").filter(Boolean);
+  if (segments.length === 0) return;
+  let target: Record<string, unknown> = frontmatter;
+
+  for (let i = 0; i < segments.length - 1; i++) {
+    const segment = segments[i];
+    if (segment.endsWith("[]")) {
+      throw new Error(`Cannot assign lifecycle value through array path "${fieldPath}"`);
+    }
+    const existing = target[segment];
+    if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
+      target[segment] = {};
+    }
+    target = target[segment] as Record<string, unknown>;
+  }
+
+  const finalSegment = segments[segments.length - 1];
+  if (finalSegment.endsWith("[]")) {
+    throw new Error(`Cannot assign lifecycle value through array path "${fieldPath}"`);
+  }
+  target[finalSegment] = value;
 }
