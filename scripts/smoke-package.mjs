@@ -3,14 +3,20 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
-const npm = process.platform === "win32" ? "npm.cmd" : "npm";
 const packageRoot = resolve(import.meta.dirname, "..");
 const tempRoot = mkdtempSync(join(tmpdir(), "mdbase-package-smoke-"));
 let tarball;
 
+function runNpm(args, options) {
+  if (process.env.npm_execpath) {
+    return execFileSync(process.execPath, [process.env.npm_execpath, ...args], options);
+  }
+  return execFileSync("npm", args, { ...options, shell: process.platform === "win32" });
+}
+
 try {
   const packed = JSON.parse(
-    execFileSync(npm, ["pack", "--json"], {
+    runNpm(["pack", "--json"], {
       cwd: packageRoot,
       encoding: "utf8",
       stdio: ["ignore", "pipe", "inherit"],
@@ -31,7 +37,7 @@ try {
     ].join("\n"),
   );
 
-  execFileSync(npm, ["install", "--ignore-scripts", tarball], {
+  runNpm(["install", "--ignore-scripts", tarball], {
     cwd: tempRoot,
     stdio: "inherit",
   });
