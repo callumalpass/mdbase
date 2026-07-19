@@ -1,12 +1,28 @@
-import { chmod, mkdir, mkdtemp, readFile, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeV02CollectionMigration,
   applyV02CollectionMigration,
   recoverV02CollectionMigration,
 } from "../src/index.js";
+
+const renameFailure = vi.hoisted((): { target?: string; pending: boolean } => ({ pending: false }));
+
+vi.mock("node:fs/promises", async (importOriginal) => {
+  const original = await importOriginal<typeof import("node:fs/promises")>();
+  return {
+    ...original,
+    rename: async (source: string, target: string) => {
+      if (renameFailure.pending && target === renameFailure.target) {
+        renameFailure.pending = false;
+        throw new Error("Injected atomic replacement failure");
+      }
+      return original.rename(source, target);
+    },
+  };
+});
 
 const roots: string[] = [];
 
@@ -46,6 +62,8 @@ This body must be preserved byte for byte.\n`);
 }
 
 afterEach(async () => {
+  renameFailure.target = undefined;
+  renameFailure.pending = false;
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })));
 });
 
@@ -192,17 +210,13 @@ fields:
     const root = await makeCollection();
     const analysis = await analyzeV02CollectionMigration(root);
     const originalType = await readFile(path.join(root, "_types", "note.md"), "utf8");
-    await mkdir(path.join(root, ".mdbase", "migrations"), { recursive: true });
-    const originalMode = (await stat(root)).mode;
+    renameFailure.target = path.join(root, "mdbase.yaml");
+    renameFailure.pending = true;
 
-    await chmod(root, 0o555);
-    try {
-      const applied = await applyV02CollectionMigration(root, analysis.report!);
-      expect(applied.valid).toBe(false);
-      expect(applied.restored).toBe(true);
-      expect(await readFile(path.join(root, "_types", "note.md"), "utf8")).toBe(originalType);
-    } finally {
-      await chmod(root, originalMode);
-    }
+    const applied = await applyV02CollectionMigration(root, analysis.report!);
+    expect(applied.valid).toBe(false);
+    expect(applied.restored).toBe(true);
+    expect(renameFailure.pending).toBe(false);
+    expect(await readFile(path.join(root, "_types", "note.md"), "utf8")).toBe(originalType);
   });
 });

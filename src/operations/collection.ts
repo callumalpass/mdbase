@@ -482,7 +482,7 @@ fields:
     return {
       config_path: "mdbase.yaml",
       types_folder: typesFolder,
-      meta_type_path: path.join(typesFolder, "meta.md"),
+      meta_type_path: path.posix.join(typesFolder.replaceAll("\\", "/"), "meta.md"),
     };
   }
 
