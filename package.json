@@ -1,7 +1,8 @@
 {
   "name": "@callumalpass/mdbase",
-  "version": "0.3.0-alpha.1",
+  "version": "0.3.0-rc.1",
   "description": "TypeScript implementation of the mdbase specification",
+  "license": "MIT",
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
@@ -43,12 +44,13 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts",
+    "test:package": "npm run build && node scripts/smoke-package.mjs",
     "profile": "npm run build && node dist/bin/mdb-profile.js"
   },
   "dependencies": {
     "@bufbuild/cel": "^0.6.0",
     "@bufbuild/protobuf": "^2.12.0",
-    "@callumalpass/mdbase-runtime": "file:../mdbase-spec/packages/runtime-contracts",
+    "@callumalpass/mdbase-runtime": "0.1.0-rc.1",
     "ajv": "^8.20.0",
     "ajv-formats": "^3.0.1",
     "gray-matter": "^4.0.3",

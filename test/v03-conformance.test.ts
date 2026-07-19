@@ -70,7 +70,7 @@ const REQUIRE_V03_CONFORMANCE = process.env.MDBASE_REQUIRE_V03_CONFORMANCE === "
 function resolveSpecRepo(): string {
   const candidates = [
     process.env.MDBASE_SPEC_REPO_DIR,
-    process.env.MDBASE_SPEC_TESTS_DIR ? path.resolve(process.env.MDBASE_SPEC_TESTS_DIR, "..", "..") : undefined,
+    process.env.MDBASE_SPEC_TESTS_DIR ? path.resolve(process.env.MDBASE_SPEC_TESTS_DIR, "..") : undefined,
     path.resolve(process.cwd(), "../mdbase-spec"),
     path.resolve(os.homedir(), "projects/mdbase-spec"),
   ].filter(Boolean) as string[];

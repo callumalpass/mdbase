@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.3.0-rc.1 - 2026-07-19
+- Publish the first v0.3 release candidate against the registry-hosted mdbase runtime package.
+- Verify the installable package on Linux, macOS, and Windows, including a fresh-tarball import smoke test.
+
 ## 0.3.0-alpha.1 - 2026-07-16
 - Add the v0.3 JSON Schema type profile, collection semantics, lifecycle behavior, CEL bindings, canonical diagnostics, and canonical operation envelopes.
 - Add portable runtime contracts, provider registry composition, policy checks, event/action validation, and materialization helpers.
