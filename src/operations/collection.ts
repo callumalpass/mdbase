@@ -66,6 +66,11 @@ import {
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import {
+  BacklinkTokenIndex,
+  CollectionRuntimeCache,
+  RuntimeCacheInvalidation,
+} from "./runtime-cache.js";
+import {
   buildRuntimePackage,
   composeRuntimeRegistry,
   LoadRuntimeContractsOptions,
@@ -98,11 +103,6 @@ export type {
   ValidateResult,
 } from "./contracts.js";
 
-interface BacklinkTokenIndex {
-  tokenToSources: Map<string, Set<string>>;
-  sourceToTokens: Map<string, Set<string>>;
-}
-
 interface LinkResolutionIndex {
   fileSet: Set<string>;
   basenameToFiles: Map<string, string[]>;
@@ -134,12 +134,7 @@ export class Collection {
   private typeDefs: Map<string, TypeDefinition>;
   private excludeMatchers: ((str: string) => boolean)[];
   private cache: CacheStoreAsync | null;
-  private cachedFiles: string[] | null;
-  private cachedAllFiles: string[] | null;
-  private cachedNonMarkdownFiles: Set<string> | null;
-  private cachedFileCache: Map<string, ReadResult> | null;
-  private cachedFileCacheFiles: string[] | null;
-  private cachedBacklinkTokenIndex: BacklinkTokenIndex | null;
+  private readonly runtimeCache: CollectionRuntimeCache<ReadResult>;
   private readonly observer: OperationObserver;
 
   /**
@@ -183,12 +178,7 @@ export class Collection {
       return [picomatch(pattern, { dot: true })];
     });
     this.cache = null;
-    this.cachedFiles = null;
-    this.cachedAllFiles = null;
-    this.cachedNonMarkdownFiles = null;
-    this.cachedFileCache = null;
-    this.cachedFileCacheFiles = null;
-    this.cachedBacklinkTokenIndex = null;
+    this.runtimeCache = new CollectionRuntimeCache();
     this.observer = new OperationObserver(options.observability);
   }
 
@@ -213,40 +203,8 @@ export class Collection {
       normalizedPath.split("/").includes("..");
   }
 
-  private invalidateRuntimeCaches(options?: {
-    fileLists?: boolean;
-    fileCache?: boolean;
-    nonMarkdown?: boolean;
-    backlinks?: boolean;
-  }): void {
-    const fileLists = options?.fileLists ?? true;
-    const fileCache = options?.fileCache ?? true;
-    const nonMarkdown = options?.nonMarkdown ?? true;
-    const backlinks = options?.backlinks ?? true;
-
-    if (fileLists) {
-      this.cachedFiles = null;
-      this.cachedAllFiles = null;
-    }
-    if (fileCache) {
-      this.cachedFileCache = null;
-      this.cachedFileCacheFiles = null;
-    }
-    if (nonMarkdown) {
-      this.cachedNonMarkdownFiles = null;
-    }
-    if (backlinks) {
-      this.cachedBacklinkTokenIndex = null;
-    }
-  }
-
-  private areSamePathLists(a: string[], b: string[]): boolean {
-    if (a === b) return true;
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return false;
-    }
-    return true;
+  private invalidateRuntimeCaches(options?: RuntimeCacheInvalidation): void {
+    this.runtimeCache.invalidate(options);
   }
 
   static async init(
@@ -4899,9 +4857,8 @@ fields:
   }
 
   private async getBacklinkTokenIndex(): Promise<BacklinkTokenIndex> {
-    if (this.cachedBacklinkTokenIndex) {
-      return this.cachedBacklinkTokenIndex;
-    }
+    const cached = this.runtimeCache.getBacklinkTokens();
+    if (cached) return cached;
 
     const files = await this.scanFiles();
     const fileCache = await this.buildFileCache(files);
@@ -4939,28 +4896,14 @@ fields:
       }
     }
 
-    this.cachedBacklinkTokenIndex = {
+    return this.runtimeCache.setBacklinkTokens({
       tokenToSources,
       sourceToTokens,
-    };
-    return this.cachedBacklinkTokenIndex;
+    });
   }
 
   private removeSourceFromBacklinkTokenIndex(sourcePath: string): void {
-    if (!this.cachedBacklinkTokenIndex) return;
-    const tokens = this.cachedBacklinkTokenIndex.sourceToTokens.get(sourcePath);
-    if (!tokens) return;
-
-    for (const token of tokens) {
-      const sources = this.cachedBacklinkTokenIndex.tokenToSources.get(token);
-      if (!sources) continue;
-      sources.delete(sourcePath);
-      if (sources.size === 0) {
-        this.cachedBacklinkTokenIndex.tokenToSources.delete(token);
-      }
-    }
-
-    this.cachedBacklinkTokenIndex.sourceToTokens.delete(sourcePath);
+    this.runtimeCache.removeBacklinkSource(sourcePath);
   }
 
   private async findBacklinks(targetPaths: string[]): Promise<Array<{ target: string; referrer: string }>> {
@@ -5054,13 +4997,8 @@ fields:
   }
 
   private async buildFileCache(files: string[]): Promise<Map<string, ReadResult>> {
-    if (
-      this.cachedFileCache &&
-      this.cachedFileCacheFiles &&
-      this.areSamePathLists(files, this.cachedFileCacheFiles)
-    ) {
-      return this.cachedFileCache;
-    }
+    const cached = this.runtimeCache.getFileCache(files);
+    if (cached) return cached;
 
     const fileCache = new Map<string, ReadResult>();
     const workerCount = Math.max(1, Math.min(16, files.length));
@@ -5078,12 +5016,7 @@ fields:
     });
     await Promise.all(workers);
 
-    if (this.cachedFiles && this.areSamePathLists(files, this.cachedFiles)) {
-      this.cachedFileCache = fileCache;
-      this.cachedFileCacheFiles = this.cachedFiles;
-    }
-
-    return fileCache;
+    return this.runtimeCache.setFileCache(files, fileCache);
   }
 
   private async updateCacheForPath(relativePath: string): Promise<void> {
@@ -5231,32 +5164,23 @@ fields:
     if (dir && path.resolve(dir) !== path.resolve(this.root)) {
       return await this.scanFilesRecursive(dir);
     }
-    if (this.cachedFiles) {
-      return this.cachedFiles;
-    }
-    this.cachedFiles = await this.scanFilesRecursive(this.root);
-    return this.cachedFiles;
+    const cached = this.runtimeCache.getFiles();
+    if (cached) return cached;
+    return this.runtimeCache.setFiles(await this.scanFilesRecursive(this.root));
   }
 
   private async scanAllFiles(dir?: string): Promise<string[]> {
     if (dir && path.resolve(dir) !== path.resolve(this.root)) {
       return await this.scanAllFilesRecursive(dir);
     }
-    if (this.cachedAllFiles) {
-      return this.cachedAllFiles;
-    }
-    this.cachedAllFiles = await this.scanAllFilesRecursive(this.root);
-    return this.cachedAllFiles;
+    const cached = this.runtimeCache.getAllFiles();
+    if (cached) return cached;
+    return this.runtimeCache.setAllFiles(await this.scanAllFilesRecursive(this.root));
   }
 
   private buildNonMarkdownSet(allFiles: string[]): Set<string> {
-    if (
-      this.cachedNonMarkdownFiles &&
-      this.cachedAllFiles &&
-      this.areSamePathLists(allFiles, this.cachedAllFiles)
-    ) {
-      return this.cachedNonMarkdownFiles;
-    }
+    const cached = this.runtimeCache.getNonMarkdownFiles(allFiles);
+    if (cached) return cached;
 
     const nonMd = new Set<string>();
     for (const filePath of allFiles) {
@@ -5265,11 +5189,7 @@ fields:
       }
     }
 
-    if (this.cachedAllFiles && this.areSamePathLists(allFiles, this.cachedAllFiles)) {
-      this.cachedNonMarkdownFiles = nonMd;
-    }
-
-    return nonMd;
+    return this.runtimeCache.setNonMarkdownFiles(allFiles, nonMd);
   }
 }
 
