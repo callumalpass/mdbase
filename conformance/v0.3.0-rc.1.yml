@@ -69,17 +69,17 @@ evidence:
   - kind: conformance_suite
     command: npm run test -- test/v03-conformance.test.ts
     result: pass
-    verified_at: "2026-07-21T23:55:02+10:00"
+    verified_at: "2026-07-22T00:48:00+10:00"
     artifact: test/v03-conformance.test.ts
     environment: Linux x86_64, Node.js 22
   - kind: test_suite
     command: npm test
     result: pass
-    verified_at: "2026-07-19T20:50:00+10:00"
+    verified_at: "2026-07-22T00:48:00+10:00"
     environment: Linux x86_64, Node.js 22
   - kind: package_smoke
     command: npm pack --dry-run
     result: pass
-    verified_at: "2026-07-19T20:50:00+10:00"
+    verified_at: "2026-07-22T00:48:00+10:00"
     artifact: callumalpass-mdbase-0.3.0-rc.1.tgz
     environment: Linux x86_64, Node.js 22
