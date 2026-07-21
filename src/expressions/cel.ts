@@ -1,10 +1,13 @@
 import {
   CelScalar,
+  celEnv,
   celMethod,
   isCelError,
   isCelList,
   mapType,
-  run,
+  parse,
+  plan,
+  type CelResult,
   type CelValue,
   type CelInput,
 } from "@bufbuild/cel";
@@ -75,9 +78,46 @@ const mdbaseCelFuncs = [
   }),
 ];
 
+export const MDBASE_CEL_PROGRAM_CACHE_LIMIT = 512;
+
+type CelProgram = (bindings: Record<string, CelInput>) => CelResult;
+
+const mdbaseCelEnvironment = celEnv({ funcs: mdbaseCelFuncs });
+const programCache = new Map<string, CelProgram>();
+
+function compileMdbaseCel(expression: string): CelProgram {
+  const cached = programCache.get(expression);
+  if (cached) {
+    // Refresh insertion order so the bounded map behaves as an LRU cache.
+    programCache.delete(expression);
+    programCache.set(expression, cached);
+    return cached;
+  }
+
+  const compiled = plan(mdbaseCelEnvironment, parse(expression)) as CelProgram;
+  if (programCache.size >= MDBASE_CEL_PROGRAM_CACHE_LIMIT) {
+    const leastRecentlyUsed = programCache.keys().next().value;
+    if (leastRecentlyUsed !== undefined) programCache.delete(leastRecentlyUsed);
+  }
+  programCache.set(expression, compiled);
+  return compiled;
+}
+
+/** Clear process-local compiled CEL programs, primarily for deterministic tests. */
+export function clearMdbaseCelProgramCache(): void {
+  programCache.clear();
+}
+
+/** Return the current bounded cache size without exposing cached expressions. */
+export function getMdbaseCelProgramCacheSize(): number {
+  return programCache.size;
+}
+
 export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext): MdbaseCelResult {
   try {
-    const value = run(expression, buildMdbaseCelBindings(context) as Record<string, CelInput>, { funcs: mdbaseCelFuncs });
+    const value = compileMdbaseCel(expression)(
+      buildMdbaseCelBindings(context) as Record<string, CelInput>,
+    );
     if (isCelError(value)) {
       return {
         value: null,
