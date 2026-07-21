@@ -21,7 +21,7 @@ import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../
 import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
-import { evaluateWhere, evaluateExpression } from "../expressions/evaluator.js";
+import { evaluateExpression } from "../expressions/evaluator.js";
 import { evaluateMdbaseCel } from "../expressions/cel.js";
 import { extractBodyLinks, parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
@@ -70,6 +70,10 @@ import {
   CollectionRuntimeCache,
   RuntimeCacheInvalidation,
 } from "./runtime-cache.js";
+import {
+  evaluateStructuredWhere as evaluateWhereClause,
+  matchesFieldConditions,
+} from "./structured-where.js";
 import {
   buildRuntimePackage,
   composeRuntimeRegistry,
@@ -582,7 +586,7 @@ fields:
 
     // where - all conditions must match
     if (match.where !== undefined) {
-      if (!this.matchesWhereConditions(frontmatter, match.where)) return false;
+      if (!matchesFieldConditions(frontmatter, match.where, this.config.spec_profile)) return false;
     }
 
     if (match.expr !== undefined) {
@@ -620,109 +624,6 @@ fields:
       extension,
       folder: folder === "." ? "" : folder,
     };
-  }
-
-  /**
-   * Evaluate where conditions from a match block against frontmatter.
-   * where is an object where each key is a field name and the value is either:
-   *   - a literal value (exact equality)
-   *   - an object with operator keys (eq, neq, gt, gte, lt, lte, exists, contains, containsAll, containsAny, startsWith, endsWith, matches)
-   */
-  private matchesWhereConditions(
-    frontmatter: Record<string, unknown>,
-    where: Record<string, unknown>,
-  ): boolean {
-    for (const [field, condition] of Object.entries(where)) {
-      const selected = getFieldPathValue(frontmatter, field);
-      const fieldValue = selected.value;
-
-      if (condition === null || condition === undefined || typeof condition !== "object" || Array.isArray(condition)) {
-        // Literal value: exact equality
-        if (!selected.present || !deepJsonEqual(fieldValue, condition)) return false;
-        continue;
-      }
-
-      // Object with operators
-      const ops = condition as Record<string, unknown>;
-      for (const [op, expected] of Object.entries(ops)) {
-        if (!this.evalWhereOp(fieldValue, selected.present, op, expected)) return false;
-      }
-    }
-    return true;
-  }
-
-  private evalWhereOp(fieldValue: unknown, present: boolean, op: string, expected: unknown): boolean {
-    switch (op) {
-      case "eq":
-      case "const":
-        if (!present || fieldValue === null || fieldValue === undefined) return false;
-        return deepJsonEqual(fieldValue, expected);
-      case "neq":
-        if (!present || fieldValue === null || fieldValue === undefined) return false;
-        return !deepJsonEqual(fieldValue, expected);
-      case "gt":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left > right);
-      case "gte":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left >= right);
-      case "lt":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left < right);
-      case "lte":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left <= right);
-      case "exists":
-        if (this.config.spec_profile === "v0.3") {
-          return expected === true ? present : !present;
-        }
-        return expected === true
-          ? present && fieldValue !== null && fieldValue !== undefined
-          : !present || fieldValue === null || fieldValue === undefined;
-      case "contains":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (Array.isArray(fieldValue)) {
-          return fieldValue.some((item) => deepJsonEqual(item, expected));
-        }
-        if (typeof fieldValue === "string") {
-          return fieldValue.includes(String(expected));
-        }
-        return false;
-      case "containsAll":
-        if (!Array.isArray(fieldValue) || !Array.isArray(expected)) return false;
-        return expected.every((e) =>
-          fieldValue.some((item) => deepJsonEqual(item, e)),
-        );
-      case "containsAny":
-        if (!Array.isArray(fieldValue) || !Array.isArray(expected)) return false;
-        return expected.some((e) =>
-          fieldValue.some((item) => deepJsonEqual(item, e)),
-        );
-      case "in":
-        if (fieldValue === null || fieldValue === undefined || !Array.isArray(expected)) return false;
-        return expected.some((item) => deepJsonEqual(item, fieldValue));
-      case "startsWith":
-      case "starts_with":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (typeof fieldValue === "string") return fieldValue.startsWith(String(expected));
-        return false;
-      case "endsWith":
-      case "ends_with":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (typeof fieldValue === "string") return fieldValue.endsWith(String(expected));
-        return false;
-      case "matches":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        try {
-          let pattern = String(expected);
-          pattern = pattern.replace(/\\\\/g, "\\");
-          return new RegExp(pattern).test(String(fieldValue));
-        } catch {
-          return false;
-        }
-      default:
-        return false;
-    }
   }
 
   /**
@@ -2964,51 +2865,13 @@ fields:
     types: string[],
     body?: string | null,
   ): boolean {
-    // String expression
-    if (typeof where === "string") {
-      if (this.config.spec_profile === "v0.3") {
-        const folder = path.dirname(filePath) === "." ? "" : path.dirname(filePath);
-        const result = evaluateMdbaseCel(where, {
-          record: frontmatter,
-          raw: frontmatter,
-          file: {
-            path: filePath,
-            name: path.basename(filePath),
-            folder,
-            body: body ?? "",
-          },
-        });
-        return result.diagnostics.length === 0 && result.value === true;
-      }
-      return evaluateWhere(where, { frontmatter, path: filePath, types, body });
-    }
-
-    // Handle logical operators
-    if ("and" in where) {
-      const conditions = where.and as Array<string | Record<string, unknown>>;
-      return conditions.every((c) =>
-        this.evaluateStructuredWhere(c, frontmatter, filePath, types, body),
-      );
-    }
-    if ("or" in where) {
-      const conditions = where.or as Array<string | Record<string, unknown>>;
-      return conditions.some((c) =>
-        this.evaluateStructuredWhere(c, frontmatter, filePath, types, body),
-      );
-    }
-    if ("not" in where) {
-      const condition = where.not as string | Record<string, unknown>;
-      return !this.evaluateStructuredWhere(condition, frontmatter, filePath, types, body);
-    }
-
-    // Handle explicit expression key
-    if ("expression" in where) {
-      const expr = where.expression as string;
-      return evaluateWhere(expr, { frontmatter, path: filePath, types, body });
-    }
-
-    // Handle field conditions (same as type match where)
-    return this.matchesWhereConditions(frontmatter, where);
+    return evaluateWhereClause(where, {
+      frontmatter,
+      filePath,
+      types,
+      body,
+      specProfile: this.config.spec_profile,
+    });
   }
 
   /**
@@ -5384,10 +5247,6 @@ function cloneJsonLike<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function deepJsonEqual(left: unknown, right: unknown): boolean {
-  return canonicalJson(left) === canonicalJson(right);
-}
-
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -5401,20 +5260,6 @@ function sameStringSet(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false;
   const rightSet = new Set(right);
   return left.every((value) => rightSet.has(value));
-}
-
-function compareWhereValues(
-  left: unknown,
-  right: unknown,
-  compare: (leftValue: number | string, rightValue: number | string) => boolean,
-): boolean {
-  if (typeof left === "number" && typeof right === "number" && Number.isFinite(left) && Number.isFinite(right)) {
-    return compare(left, right);
-  }
-  if (typeof left === "string" && typeof right === "string") {
-    return compare(left, right);
-  }
-  return false;
 }
 
 async function computeRevision(filePath: string): Promise<string> {
