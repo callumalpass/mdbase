@@ -93,6 +93,25 @@ describe("OperationObserver", () => {
     expect(events.map((event) => event.operation)).toEqual(["collection.query"]);
   });
 
+  it("does not suppress operations owned by an independent observer", async () => {
+    const events: MdbaseLogEvent[] = [];
+    const runtime = deterministicRuntime([0, 5, 10, 20]);
+    const outer = new OperationObserver(
+      { performance: true, logger: (event) => events.push(event) },
+      runtime,
+    );
+    const independent = new OperationObserver(
+      { performance: true, logger: (event) => events.push(event) },
+      runtime,
+    );
+
+    await outer.trace("outer", {}, async () => {
+      await independent.trace("independent", {}, async () => undefined);
+    });
+
+    expect(events.map((event) => event.operation).sort()).toEqual(["independent", "outer"]);
+  });
+
   it("isolates collection behavior from logger failures", async () => {
     const observer = new OperationObserver({
       performance: true,

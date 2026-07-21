@@ -62,9 +62,8 @@ interface ObserverRuntime {
   timestamp?: () => string;
 }
 
-const operationDepth = new AsyncLocalStorage<number>();
-
 export class OperationObserver {
+  private readonly operationDepth = new AsyncLocalStorage<number>();
   private readonly performanceEnabled: boolean;
   private readonly errorEnabled: boolean;
   private readonly performanceThreshold: number;
@@ -102,11 +101,11 @@ export class OperationObserver {
   ): Promise<T> {
     if (!this.enabled) return await task();
 
-    const depth = operationDepth.getStore() ?? 0;
+    const depth = this.operationDepth.getStore() ?? 0;
     const shouldEmit = depth === 0 || this.includeNested;
     if (!shouldEmit) return await task();
 
-    return await operationDepth.run(depth + 1, async () => {
+    return await this.operationDepth.run(depth + 1, async () => {
       const startedAt = this.now();
       let failure: OperationFailure | undefined;
       try {
