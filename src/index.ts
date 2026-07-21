@@ -123,3 +123,28 @@ export type {
   V03ValidateInput,
 } from "./operations/collection.js";
 export { CollectionAsync } from "./operations/collection-async.js";
+export type { CollectionAsyncCreateInput } from "./operations/collection-async.js";
+export type {
+  BackfillInput,
+  BatchDeleteInput,
+  BatchResult,
+  BatchResultDetail,
+  BatchUpdateInput,
+  CacheOpResult,
+  CreateInput,
+  CreateResult,
+  CreateTypeInput,
+  DeleteOptions,
+  DeleteResult,
+  OperationError,
+  OperationWarning,
+  QueryGroupResult,
+  QueryResult,
+  QueryResultRow,
+  ReadResult,
+  RenameInput,
+  UpdateInput,
+  UpdateResult,
+  ValidateResult,
+  WriteResult,
+} from "./operations/contracts.js";
