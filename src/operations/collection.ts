@@ -66,6 +66,7 @@ import {
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
+import { CollectionScanner } from "./collection-scanner.js";
 import {
   BacklinkTokenIndex,
   CollectionRuntimeCache,
@@ -131,11 +132,11 @@ function normalizeInitTypesFolder(value: string): string {
 export class Collection {
   private config: MdbaseConfig;
   private typeDefs: Map<string, TypeDefinition>;
-  private excludeMatchers: ((str: string) => boolean)[];
   private cache: CacheStoreAsync | null;
   private readonly runtimeCache: CollectionRuntimeCache<ReadResult>;
   private readonly observer: OperationObserver;
   private readonly linkResolver: LinkResolver;
+  private readonly scanner: CollectionScanner;
 
   /**
    * Hook called after reading a file but before writing.
@@ -162,27 +163,21 @@ export class Collection {
   ) {
     this.config = config;
     this.typeDefs = typeDefs;
-    this.excludeMatchers = config.settings.exclude.flatMap((pattern) => {
-      // If the pattern doesn't contain glob characters or /, it's a directory name
-      // Match both the directory itself and anything inside it
-      if (!pattern.includes("/") && !pattern.includes("*") && !pattern.includes("?")) {
-        return [
-          picomatch(pattern, { dot: true }),
-          picomatch(`${pattern}/**`, { dot: true }),
-        ];
-      }
-      // If it contains no /, use matchBase for basename matching
-      if (!pattern.includes("/")) {
-        return [picomatch(pattern, { dot: true, matchBase: true })];
-      }
-      return [picomatch(pattern, { dot: true })];
-    });
     this.cache = null;
     this.runtimeCache = new CollectionRuntimeCache();
     this.observer = new OperationObserver(options.observability);
     this.linkResolver = new LinkResolver({
       idField: config.settings.id_field,
       recordExtensions: config.settings.record_extensions,
+    });
+    this.scanner = new CollectionScanner({
+      root,
+      exclude: config.settings.exclude,
+      recordExtensions: config.settings.record_extensions,
+      includeSubfolders: config.settings.include_subfolders,
+      typesFolder: config.settings.types_folder,
+      cacheFolder: config.settings.cache_folder,
+      migrationsFolder: config.settings.migrations_folder,
     });
   }
 
@@ -462,34 +457,14 @@ fields:
    * Check if a path is excluded by config.
    */
   private isExcluded(relativePath: string): boolean {
-    for (const matcher of this.excludeMatchers) {
-      if (matcher(relativePath)) return true;
-    }
-    // Types folder is always excluded from regular file scan
-    if (relativePath.startsWith(this.config.settings.types_folder + "/") ||
-        relativePath === this.config.settings.types_folder) {
-      return true;
-    }
-    // Cache folder excluded
-    if (relativePath.startsWith(this.config.settings.cache_folder + "/") ||
-        relativePath === this.config.settings.cache_folder) {
-      return true;
-    }
-    // Migrations folder excluded
-    if (relativePath.startsWith(this.config.settings.migrations_folder + "/") ||
-        relativePath === this.config.settings.migrations_folder) {
-      return true;
-    }
-    // Nested collection boundary check: if a subdirectory has mdbase.yaml, don't scan into it
-    return false;
+    return this.scanner.isExcluded(relativePath);
   }
 
   /**
    * Check if a file has a valid markdown extension.
    */
   private isMarkdownFile(filePath: string): boolean {
-    const ext = path.extname(filePath).slice(1); // remove dot
-    return this.config.settings.record_extensions.includes(ext);
+    return this.scanner.isRecordFile(filePath);
   }
 
   private async fileExists(fullPath: string): Promise<boolean> {
@@ -4521,107 +4496,11 @@ fields:
     await this.cache.upsertFile(relativePath, stat, frontmatter, body);
   }
 
-  private async scanFilesRecursive(scanDir: string): Promise<string[]> {
-    const files: string[] = [];
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
-    } catch {
-      return files;
-    }
-
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-
-    for (const entry of entries) {
-      const fullPath = path.join(scanDir, entry.name);
-      const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
-
-      if (this.isExcluded(relativePath)) continue;
-
-      if (entry.isDirectory()) {
-        const nestedConfig = path.join(fullPath, "mdbase.yaml");
-        if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
-          continue;
-        }
-        if (this.config.settings.include_subfolders) {
-          files.push(...await this.scanFilesRecursive(fullPath));
-        }
-      } else if (this.isMarkdownFile(entry.name)) {
-        if (entry.name === "mdbase.yaml") continue;
-        files.push(relativePath);
-      }
-    }
-
-    return files;
-  }
-
-  private async scanAllFilesRecursive(scanDir: string): Promise<string[]> {
-    const files: string[] = [];
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
-    } catch {
-      return files;
-    }
-
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-
-    for (const entry of entries) {
-      const fullPath = path.join(scanDir, entry.name);
-      const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
-
-      if (this.isExcluded(relativePath)) continue;
-
-      if (entry.isDirectory()) {
-        const nestedConfig = path.join(fullPath, "mdbase.yaml");
-        if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
-          continue;
-        }
-        if (this.config.settings.include_subfolders) {
-          files.push(...await this.scanAllFilesRecursive(fullPath));
-        }
-      } else {
-        if (entry.name === "mdbase.yaml") continue;
-        files.push(relativePath);
-      }
-    }
-
-    return files;
-  }
-
   private async scanTypeFilesForRuntime(): Promise<string[]> {
-    const root = this.root;
-    const typesRoot = path.join(this.root, this.config.settings.types_folder);
-    const migrationsRoot = path.resolve(this.root, this.config.settings.migrations_folder);
-    const files: string[] = [];
-
-    async function walk(directory: string): Promise<void> {
-      let entries: fs.Dirent[];
-      try {
-        entries = await fs.promises.readdir(directory, { withFileTypes: true });
-      } catch {
-        return;
-      }
-
-      entries.sort((a, b) => a.name.localeCompare(b.name));
-      for (const entry of entries) {
-        const fullPath = path.join(directory, entry.name);
-        const resolved = path.resolve(fullPath);
-        if (resolved === migrationsRoot || resolved.startsWith(migrationsRoot + path.sep)) {
-          continue;
-        }
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-        } else if (entry.isFile() && path.extname(entry.name) === ".md") {
-          files.push(path.relative(root, fullPath).replace(/\\/g, "/"));
-        }
-      }
-    }
-
-    await walk(typesRoot);
-    return files;
+    return await this.scanner.scanTypeFiles(
+      this.config.settings.types_folder,
+      this.config.settings.migrations_folder,
+    );
   }
 
   /**
@@ -4629,33 +4508,27 @@ fields:
    */
   private async scanFiles(dir?: string): Promise<string[]> {
     if (dir && path.resolve(dir) !== path.resolve(this.root)) {
-      return await this.scanFilesRecursive(dir);
+      return await this.scanner.scanRecordFiles(dir);
     }
     const cached = this.runtimeCache.getFiles();
     if (cached) return cached;
-    return this.runtimeCache.setFiles(await this.scanFilesRecursive(this.root));
+    return this.runtimeCache.setFiles(await this.scanner.scanRecordFiles());
   }
 
   private async scanAllFiles(dir?: string): Promise<string[]> {
     if (dir && path.resolve(dir) !== path.resolve(this.root)) {
-      return await this.scanAllFilesRecursive(dir);
+      return await this.scanner.scanAllFiles(dir);
     }
     const cached = this.runtimeCache.getAllFiles();
     if (cached) return cached;
-    return this.runtimeCache.setAllFiles(await this.scanAllFilesRecursive(this.root));
+    return this.runtimeCache.setAllFiles(await this.scanner.scanAllFiles());
   }
 
   private buildNonMarkdownSet(allFiles: string[]): Set<string> {
     const cached = this.runtimeCache.getNonMarkdownFiles(allFiles);
     if (cached) return cached;
 
-    const nonMd = new Set<string>();
-    for (const filePath of allFiles) {
-      if (!this.isMarkdownFile(filePath)) {
-        nonMd.add(filePath);
-      }
-    }
-
+    const nonMd = this.scanner.nonRecordFiles(allFiles);
     return this.runtimeCache.setNonMarkdownFiles(allFiles, nonMd);
   }
 }
