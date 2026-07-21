@@ -163,11 +163,29 @@ export class OperationObserver {
 function getReturnedFailure(value: unknown): OperationFailure | undefined {
   if (!isRecord(value)) return undefined;
   if (isRecord(value.error)) return normalizeFailure(value.error, false);
-  if (value.valid === false && Array.isArray(value.diagnostics)) {
-    const diagnostic = value.diagnostics.find(
-      (item): item is Record<string, unknown> => isRecord(item) && item.severity === "error",
-    );
-    if (diagnostic) return normalizeFailure(diagnostic, false);
+  if (value.valid === false) {
+    for (const collection of [value.diagnostics, value.issues]) {
+      if (!Array.isArray(collection)) continue;
+      const failure = collection.find(
+        (item): item is Record<string, unknown> =>
+          isRecord(item) && (item.severity === "error" || item.severity === undefined),
+      );
+      if (failure) return normalizeFailure(failure, false);
+    }
+    return { code: "operation_invalid", message: "Operation returned valid: false" };
+  }
+  if (isRecord(value.batch_result) && typeof value.batch_result.failed === "number" && value.batch_result.failed > 0) {
+    const details = value.batch_result.details;
+    if (Array.isArray(details)) {
+      const failedDetail = details.find((detail) => isRecord(detail) && detail.status === "failed");
+      if (isRecord(failedDetail) && isRecord(failedDetail.error)) {
+        return normalizeFailure(failedDetail.error, false);
+      }
+    }
+    return {
+      code: "batch_partial_failure",
+      message: `Batch operation failed for ${value.batch_result.failed} item(s)`,
+    };
   }
   return undefined;
 }

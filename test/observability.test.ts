@@ -62,6 +62,39 @@ describe("OperationObserver", () => {
     }]);
   });
 
+  it("logs validation and partial batch failures without a top-level error", async () => {
+    const events: MdbaseLogEvent[] = [];
+    const observer = new OperationObserver({
+      performance: true,
+      errors: true,
+      logger: (event) => events.push(event),
+    });
+
+    await observer.trace("collection.validate", {}, async () => ({
+      valid: false,
+      issues: [{ code: "required_field_missing", message: "title is required", severity: "error" }],
+    }));
+    await observer.trace("collection.batch_update", {}, async () => ({
+      batch_result: {
+        total: 2,
+        succeeded: 1,
+        failed: 1,
+        details: [{
+          path: "bad.md",
+          status: "failed",
+          error: { code: "io_error", message: "write failed" },
+        }],
+      },
+    }));
+
+    expect(events.filter((event) => event.kind === "error")).toMatchObject([
+      { operation: "collection.validate", error: { code: "required_field_missing" } },
+      { operation: "collection.batch_update", error: { code: "io_error" } },
+    ]);
+    expect(events.filter((event) => event.kind === "performance").map((event) => event.outcome))
+      .toEqual(["error", "error"]);
+  });
+
   it("logs and rethrows unexpected errors, omitting stacks by default", async () => {
     const events: MdbaseLogEvent[] = [];
     const observer = new OperationObserver(
