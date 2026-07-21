@@ -23,7 +23,7 @@ import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateWhere, evaluateExpression } from "../expressions/evaluator.js";
 import { evaluateMdbaseCel } from "../expressions/cel.js";
-import { parseLink, ParsedLink } from "../links/parser.js";
+import { extractBodyLinks, parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 import { QueryInput, runQuery } from "./query-engine.js";
@@ -4895,6 +4895,10 @@ fields:
             tokens.add(target);
           }
         }
+      }
+
+      for (const bodyLink of extractBodyLinks(readResult.body ?? "")) {
+        tokens.add(this.extractLinkTarget(bodyLink.raw));
       }
 
       sourceToTokens.set(sourcePath, tokens);

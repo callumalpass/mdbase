@@ -72,6 +72,8 @@ describe("in-memory cache mutation regressions", () => {
     expect((await collection.computeBacklinksForFile("b.md")).map((entry) => entry.file.path)).toEqual([
       "source.md",
     ]);
+    const deleted = await collection.delete("b.md", { check_backlinks: true });
+    expect(deleted.broken_links).toEqual([{ path: "source.md" }]);
     await collection.close();
   });
 });

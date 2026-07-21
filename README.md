@@ -15,7 +15,7 @@ The v0.3 implementation is pre-1.0 and intentionally breaking. It also includes 
 - Link parsing + resolution (wikilinks, markdown links, bare paths)
 - Backlinks, tags, and embeds extraction from content
 - Batch operations and rename with optional reference updates
-- Cache support via a SQLite worker (async API)
+- Async SQLite-backed cache with coherent in-memory query indexes
 - Portable runtime contracts, provider registries, policy, and validation
 - Safe, report-first v0.2-to-v0.3 collection migration
 
@@ -30,6 +30,8 @@ npm install
 ```bash
 npm run build
 npm test
+npm run test:e2e   # pack, install, mutate, reopen, verify, and run the CLI
+npm run test:all   # source, package smoke, and packaged-process E2E suites
 ```
 
 ## Performance profiling

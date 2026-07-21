@@ -8,6 +8,11 @@
   optional `view_records` feature.
 - Bundle the canonical query and view schemas with generated v0.3 artifacts.
 - Add opt-in structured performance and error logging for collection operations.
+- Add a packed-package, two-process E2E suite covering persistence, queries,
+  views, backlinks, rename reference updates, cache rebuilds, concurrency, and
+  the installed CLI.
+- Preserve the parsed-file cache across coherent updates and include body links
+  in the delete backlink candidate index.
 
 ## 0.3.0-rc.1 - 2026-07-19
 - Publish the first v0.3 release candidate against the registry-hosted mdbase runtime package.
