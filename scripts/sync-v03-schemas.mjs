@@ -11,8 +11,10 @@ const schemas = {
   configSchema: "config.schema.json",
   diagnosticSchema: "diagnostic.schema.json",
   operationResultSchema: "operation-result.schema.json",
+  querySchema: "query.schema.json",
   queryResultSchema: "query-result.schema.json",
   typeFileSchema: "type-file.schema.json",
+  viewSchema: "view.schema.json",
 };
 
 const chunks = [

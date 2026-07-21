@@ -8,7 +8,10 @@ The v0.3 implementation is pre-1.0 and intentionally breaking. It also includes 
 
 - JSON Schema 2020-12 type wrappers with canonical diagnostics
 - Collection-level matching, defaults, links, uniqueness, paths, and lifecycle
-- CEL plus legacy query support with filters, ordering, formulas, and traversal
+- Canonical CEL queries with invocation context, named projections, grouping,
+  summaries, and selected result values
+- Ordinary Markdown view records with headless named-view execution
+- Legacy query support with formulas and traversal for v0.2 compatibility
 - Link parsing + resolution (wikilinks, markdown links, bare paths)
 - Backlinks, tags, and embeds extraction from content
 - Batch operations and rename with optional reference updates
@@ -64,10 +67,20 @@ const operations = collection.v03Operations();
 const read = await operations.read({ path: "notes/example.md" });
 if (!read.valid) throw new Error(read.diagnostics[0]?.message);
 
-const query = await collection.query({
+const query = await operations.query({
   types: ["task"],
   where: "status == \"open\" && priority >= 2",
+  projections: {
+    urgent: { expr: "priority >= 4" },
+  },
+  select: ["title", "projection.urgent"],
   order_by: [{ field: "priority", direction: "desc" }],
+});
+
+const savedView = await operations.executeView({
+  path: "views/tasks.md",
+  view: "open",
+  context: { path: "projects/alpha.md" },
 });
 
 await collection.close();
@@ -79,6 +92,8 @@ The canonical v0.3 facade returns `{ valid, result, diagnostics }` envelopes:
 
 - `collection.v03Operations().read({ path, effective? })`
 - `validate({ path? })`
+- `query({ types?, context?, projections?, where?, select?, order_by?, group_by?, summaries? })`
+- `executeView({ path, view, context?, limit?, offset?, render? })`
 - `create({ type|types, path?, frontmatter, body? })`
 - `update({ path, fields?, body?, if_revision? })`
 - `delete({ path, if_revision? })`
@@ -93,6 +108,8 @@ The broader direct `Collection` API remains available for v0.2 compatibility and
 - `delete(path, { check_backlinks? })`
 - `rename({ from, to, update_refs? })`
 - `query({ types?, where?, order_by?, limit?, offset?, include_body?, context_file?, formulas? })`
+- `queryCanonical(query)`
+- `executeView({ path, view, context?, limit?, offset?, render? })`
 - `batchDelete({ where, dry_run?, check_backlinks? })`
 - `batchUpdate({ where?, fields?, updates?, dry_run? })`
 - `backfill({ type?, where?, fields?, apply?, dry_run? })`

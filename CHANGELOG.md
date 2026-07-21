@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Implement the canonical v0.3 query-object schema, invocation-context `this`
+  binding, named projections, selection, grouping, and summaries.
+- Add headless execution of ordinary Markdown view records and advertise the
+  optional `view_records` feature.
+- Bundle the canonical query and view schemas with generated v0.3 artifacts.
+
 ## 0.3.0-rc.1 - 2026-07-19
 - Publish the first v0.3 release candidate against the registry-hosted mdbase runtime package.
 - Verify the installable package on Linux, macOS, and Windows, including a fresh-tarball import smoke test.

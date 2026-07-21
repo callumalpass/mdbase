@@ -19,13 +19,16 @@ export interface MdbaseCelDiagnostic {
 export interface MdbaseCelContext {
   record?: Record<string, unknown>;
   raw?: Record<string, unknown>;
+  knownFields?: Iterable<string>;
   old?: Record<string, unknown>;
   file?: Record<string, unknown>;
   event?: Record<string, unknown>;
   steps?: Record<string, unknown>;
   vars?: Record<string, unknown>;
   item?: unknown;
-  thisRecord?: Record<string, unknown>;
+  thisRecord?: Record<string, unknown> | null;
+  projection?: Record<string, unknown>;
+  values?: unknown[];
   operation?: Record<string, unknown>;
 }
 
@@ -102,8 +105,19 @@ export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string
   const record = context.record ?? {};
   const raw = context.raw ?? record;
   const old = context.old ?? {};
-  const knownFields = new Set([...Object.keys(record), ...Object.keys(raw), ...Object.keys(old)]);
+  const knownFields = new Set([
+    ...Object.keys(record),
+    ...Object.keys(raw),
+    ...Object.keys(old),
+    ...(context.knownFields ?? []),
+  ]);
+  const missingTopLevelFields = Object.fromEntries(
+    [...knownFields]
+      .filter((field) => !Object.prototype.hasOwnProperty.call(record, field))
+      .map((field) => [field, null]),
+  );
   const bindings: Record<string, unknown> = {
+    ...missingTopLevelFields,
     ...record,
     record,
     raw,
@@ -114,6 +128,9 @@ export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string
     steps: context.steps ?? {},
     vars: context.vars ?? {},
     operation: context.operation ?? {},
+    projection: context.projection ?? {},
+    values: context.values ?? [],
+    this: context.thisRecord ?? null,
     present: {
       record: buildPresenceMap(record, knownFields),
       raw: buildPresenceMap(raw, knownFields),
@@ -122,9 +139,6 @@ export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string
   };
   if (context.item !== undefined) {
     bindings.item = context.item;
-  }
-  if (context.thisRecord !== undefined) {
-    bindings.this = context.thisRecord;
   }
   return bindings;
 }

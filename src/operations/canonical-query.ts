@@ -1,0 +1,643 @@
+import { Ajv2020 } from "ajv/dist/2020.js";
+
+import { evaluateMdbaseCel } from "../expressions/cel.js";
+import { querySchema, viewSchema } from "../generated/v03-schemas.js";
+import type { TypeDefinition } from "../types/loader.js";
+import type { IndexedReadResult } from "./link-index.js";
+
+export interface CanonicalProjection {
+  expr: string;
+  description?: string;
+  [extension: `x-${string}`]: unknown;
+}
+
+export interface CanonicalSelectionExpression {
+  name: string;
+  expr: string;
+  label?: string;
+  description?: string;
+  [extension: `x-${string}`]: unknown;
+}
+
+export interface CanonicalQueryInput {
+  types?: string[];
+  context?: { this: { path: string } };
+  projections?: Record<string, CanonicalProjection>;
+  where?: string;
+  select?: Array<string | CanonicalSelectionExpression>;
+  order_by?: Array<{ field: string; direction?: "asc" | "desc" }>;
+  group_by?: Array<{ field: string; direction?: "asc" | "desc" }>;
+  summary_functions?: Record<string, { expr: string; description?: string }>;
+  summaries?: Array<{ field: string; function: string; name?: string; label?: string }>;
+  limit?: number;
+  offset?: number;
+  include_body?: boolean;
+  frontmatter?: "effective" | "raw" | "both";
+  [extension: `x-${string}`]: unknown;
+}
+
+export interface ExecuteViewInput {
+  path: string;
+  view: string;
+  context?: { path: string } | null;
+  limit?: number;
+  offset?: number;
+  render?: boolean;
+}
+
+export interface CanonicalDiagnostic {
+  severity: "error" | "warning" | "info";
+  code: string;
+  message: string;
+  path?: string;
+  field?: string;
+  details?: unknown;
+}
+
+export interface CanonicalQueryRow {
+  path?: string;
+  file: Record<string, unknown>;
+  frontmatter?: Record<string, unknown>;
+  raw_frontmatter?: Record<string, unknown>;
+  values?: Record<string, unknown>;
+  body?: string;
+}
+
+export interface CanonicalQueryResult {
+  results: CanonicalQueryRow[];
+  meta: {
+    total_count: number;
+    has_more: boolean;
+    context?: { path: string };
+    view?: { path: string; id: string };
+    groups?: Array<{
+      values: Record<string, unknown>;
+      count: number;
+      summaries: Record<string, unknown>;
+    }>;
+  };
+  diagnostics: CanonicalDiagnostic[];
+  error?: { code: string; message: string };
+}
+
+export interface CanonicalQueryDeps {
+  typeDefs: Map<string, TypeDefinition>;
+  scanFiles: () => Promise<string[]>;
+  read: (relativePath: string) => Promise<IndexedReadResult>;
+  buildFileCache?: (files: string[]) => Promise<Map<string, IndexedReadResult>>;
+}
+
+interface ContextRecord {
+  path: string;
+  effective: Record<string, unknown>;
+  raw: Record<string, unknown>;
+  file: Record<string, unknown>;
+  types: string[];
+  binding: Record<string, unknown>;
+}
+
+interface CandidateRow {
+  path: string;
+  effective: Record<string, unknown>;
+  raw: Record<string, unknown>;
+  file: Record<string, unknown>;
+  types: string[];
+  body: string;
+  projection: Record<string, unknown>;
+  values?: Record<string, unknown>;
+}
+
+const ajv = new Ajv2020({ allErrors: true, strict: false, allowUnionTypes: true });
+const validateQuery = ajv.compile(querySchema);
+const validateView = ajv.compile(viewSchema);
+
+export function validateCanonicalQueryInput(input: unknown): CanonicalDiagnostic[] {
+  if (validateQuery(input)) return [];
+  return [{
+    severity: "error",
+    code: "invalid_query",
+    message: formatSchemaErrors(validateQuery.errors),
+  }];
+}
+
+export function validateCanonicalViewRecord(
+  frontmatter: unknown,
+  path?: string,
+): CanonicalDiagnostic[] {
+  if (validateView(frontmatter)) return [];
+  return [{
+    severity: "error",
+    code: "invalid_view",
+    message: formatSchemaErrors(validateView.errors),
+    ...(path ? { path } : {}),
+  }];
+}
+
+export async function executeCanonicalQuery(
+  input: CanonicalQueryInput,
+  deps: CanonicalQueryDeps,
+): Promise<CanonicalQueryResult> {
+  const schemaDiagnostics = validateCanonicalQueryInput(input);
+  if (schemaDiagnostics.length > 0) return failedQuery(schemaDiagnostics);
+
+  const selectionError = validateSelectionNames(input.select);
+  if (selectionError) return failedQuery([selectionError]);
+
+  const projectionOrder = orderProjectionNames(input.projections ?? {});
+  if (projectionOrder.error) return failedQuery([projectionOrder.error]);
+
+  const summaryNameError = validateSummaryNames(input.summaries);
+  if (summaryNameError) return failedQuery([summaryNameError]);
+
+  const context = input.context
+    ? await readContext(input.context.this.path, deps)
+    : undefined;
+  if (context && "diagnostic" in context) return failedQuery([context.diagnostic]);
+  const contextRecord = context as ContextRecord | undefined;
+
+  const files = await deps.scanFiles();
+  const fileCache = deps.buildFileCache
+    ? await deps.buildFileCache(files)
+    : await buildFileCache(files, deps.read);
+  const diagnostics: CanonicalDiagnostic[] = [];
+  const candidates: CandidateRow[] = [];
+
+  for (const relativePath of files) {
+    const readResult = fileCache.get(relativePath);
+    if (!readResult || readResult.error) continue;
+    const types = readResult.types ?? [];
+    if (input.types && !input.types.some((type) => types.includes(type.toLowerCase()))) continue;
+
+    const effective = readResult.frontmatter ?? {};
+    const raw = readResult.rawFrontmatter ?? effective;
+    const file = buildFileBinding(
+      (readResult as Record<string, unknown>).file as Record<string, unknown> | undefined,
+      relativePath,
+      readResult.body,
+      effective,
+    );
+    const projection: Record<string, unknown> = {};
+
+    for (const name of projectionOrder.names) {
+      const definition = input.projections![name];
+      const evaluated = evaluateMdbaseCel(definition.expr, {
+        record: effective,
+        raw,
+        file,
+        thisRecord: contextRecord?.binding ?? null,
+        projection,
+      });
+      projection[name] = evaluated.value;
+      for (const diagnostic of evaluated.diagnostics) {
+        diagnostics.push({
+          severity: "warning",
+          code: diagnostic.code,
+          message: `Projection "${name}": ${diagnostic.message}`,
+          path: relativePath,
+          field: `projection.${name}`,
+        });
+      }
+    }
+
+    if (input.where) {
+      const evaluated = evaluateMdbaseCel(input.where, {
+        record: effective,
+        raw,
+        file,
+        thisRecord: contextRecord?.binding ?? null,
+        projection,
+      });
+      if (evaluated.diagnostics.length > 0 || evaluated.value !== true) {
+        for (const diagnostic of evaluated.diagnostics) {
+          diagnostics.push({
+            severity: "warning",
+            code: diagnostic.code,
+            message: diagnostic.message,
+            path: relativePath,
+            field: "where",
+          });
+        }
+        continue;
+      }
+    }
+
+    const row: CandidateRow = {
+      path: relativePath,
+      effective,
+      raw,
+      file,
+      types,
+      body: readResult.body ?? "",
+      projection,
+    };
+    if (input.select) {
+      row.values = evaluateSelection(input.select, row, contextRecord, diagnostics);
+    }
+    candidates.push(row);
+  }
+
+  if (input.order_by) {
+    candidates.sort((left, right) => compareRows(left, right, input.order_by!));
+  } else {
+    candidates.sort((left, right) => left.path.localeCompare(right.path));
+  }
+
+  const totalCount = candidates.length;
+  const groups = input.group_by || input.summaries
+    ? buildGroups(candidates, input, contextRecord, diagnostics)
+    : undefined;
+  const offset = input.offset ?? 0;
+  const end = input.limit === undefined ? candidates.length : offset + input.limit;
+  const page = candidates.slice(offset, end);
+  const results = page.map((row) => serializeRow(row, input));
+
+  return {
+    results,
+    meta: {
+      total_count: totalCount,
+      has_more: offset + results.length < totalCount,
+      ...(contextRecord ? { context: { path: contextRecord.path } } : {}),
+      ...(groups ? { groups } : {}),
+    },
+    diagnostics,
+  };
+}
+
+function failedQuery(diagnostics: CanonicalDiagnostic[]): CanonicalQueryResult {
+  const first = diagnostics[0] ?? {
+    severity: "error" as const,
+    code: "invalid_query",
+    message: "Invalid query",
+  };
+  return {
+    results: [],
+    meta: { total_count: 0, has_more: false },
+    diagnostics,
+    error: { code: first.code, message: first.message },
+  };
+}
+
+async function readContext(
+  path: string,
+  deps: CanonicalQueryDeps,
+): Promise<ContextRecord | { diagnostic: CanonicalDiagnostic }> {
+  const read = await deps.read(path);
+  if (read.error || !read.frontmatter) {
+    return {
+      diagnostic: {
+        severity: "error",
+        code: "context_not_found",
+        message: `Invocation context "${path}" was not found`,
+        path,
+      },
+    };
+  }
+  const effective = read.frontmatter;
+  const raw = read.rawFrontmatter ?? effective;
+  const file = buildFileBinding(
+    (read as Record<string, unknown>).file as Record<string, unknown> | undefined,
+    path,
+    read.body,
+    effective,
+  );
+  const known = new Set([...Object.keys(effective), ...Object.keys(raw)]);
+  const binding = {
+    ...effective,
+    record: effective,
+    note: effective,
+    raw,
+    present: {
+      record: presenceMap(effective, known),
+      raw: presenceMap(raw, known),
+    },
+    file,
+  };
+  return { path, effective, raw, file, types: read.types ?? [], binding };
+}
+
+function buildFileBinding(
+  file: Record<string, unknown> | undefined,
+  path: string,
+  body: string | null | undefined,
+  frontmatter: Record<string, unknown>,
+): Record<string, unknown> {
+  const tagsValue = frontmatter.tags;
+  const tags = Array.isArray(tagsValue)
+    ? tagsValue.map(String)
+    : typeof tagsValue === "string" ? [tagsValue] : [];
+  return { ...(file ?? {}), path, body: body ?? "", tags };
+}
+
+function presenceMap(
+  value: Record<string, unknown>,
+  keys: Set<string>,
+): Record<string, boolean> {
+  return Object.fromEntries([...keys].map((key) => [
+    key,
+    Object.prototype.hasOwnProperty.call(value, key),
+  ]));
+}
+
+function orderProjectionNames(
+  projections: Record<string, CanonicalProjection>,
+): { names: string[]; error?: CanonicalDiagnostic } {
+  const names = Object.keys(projections);
+  const nameSet = new Set(names);
+  const dependencies = new Map<string, Set<string>>();
+  for (const [name, definition] of Object.entries(projections)) {
+    const refs = new Set<string>();
+    for (const match of definition.expr.matchAll(/\bprojection\.([A-Za-z_][A-Za-z0-9_:-]*)\b/g)) {
+      if (nameSet.has(match[1])) refs.add(match[1]);
+    }
+    dependencies.set(name, refs);
+  }
+  const ordered: string[] = [];
+  const visiting = new Set<string>();
+  const visited = new Set<string>();
+  const visit = (name: string): boolean => {
+    if (visiting.has(name)) return false;
+    if (visited.has(name)) return true;
+    visiting.add(name);
+    for (const dependency of dependencies.get(name) ?? []) {
+      if (!visit(dependency)) return false;
+    }
+    visiting.delete(name);
+    visited.add(name);
+    ordered.push(name);
+    return true;
+  };
+  for (const name of names) {
+    if (!visit(name)) {
+      return {
+        names: [],
+        error: {
+          severity: "error",
+          code: "invalid_query",
+          message: "Named projections contain a direct or indirect cycle",
+          field: "projections",
+        },
+      };
+    }
+  }
+  return { names: ordered };
+}
+
+function validateSelectionNames(
+  select: CanonicalQueryInput["select"],
+): CanonicalDiagnostic | undefined {
+  if (!select) return undefined;
+  const names = select.map(selectionName);
+  const duplicate = names.find((name, index) => names.indexOf(name) !== index);
+  return duplicate ? {
+    severity: "error",
+    code: "invalid_query",
+    message: `Selection output name "${duplicate}" is duplicated`,
+    field: "select",
+  } : undefined;
+}
+
+function validateSummaryNames(
+  summaries: CanonicalQueryInput["summaries"],
+): CanonicalDiagnostic | undefined {
+  if (!summaries) return undefined;
+  const names = summaries.map((summary) => summary.name ?? summary.function);
+  const duplicate = names.find((name, index) => names.indexOf(name) !== index);
+  return duplicate ? {
+    severity: "error",
+    code: "invalid_query",
+    message: `Summary result name "${duplicate}" is duplicated`,
+    field: "summaries",
+  } : undefined;
+}
+
+function selectionName(selection: string | CanonicalSelectionExpression): string {
+  if (typeof selection !== "string") return selection.name;
+  const members = selection.split(".");
+  return members[members.length - 1];
+}
+
+function evaluateSelection(
+  select: NonNullable<CanonicalQueryInput["select"]>,
+  row: CandidateRow,
+  context: ContextRecord | undefined,
+  diagnostics: CanonicalDiagnostic[],
+): Record<string, unknown> {
+  const result: Record<string, unknown> = {};
+  for (const selection of select) {
+    const name = selectionName(selection);
+    if (typeof selection === "string") {
+      result[name] = resolveValue(selection, row);
+      continue;
+    }
+    const evaluated = evaluateMdbaseCel(selection.expr, {
+      record: row.effective,
+      raw: row.raw,
+      file: row.file,
+      thisRecord: context?.binding ?? null,
+      projection: row.projection,
+    });
+    result[name] = evaluated.value;
+    for (const diagnostic of evaluated.diagnostics) {
+      diagnostics.push({
+        severity: "warning",
+        code: diagnostic.code,
+        message: `Selection "${name}": ${diagnostic.message}`,
+        path: row.path,
+        field: `select.${name}`,
+      });
+    }
+  }
+  return result;
+}
+
+function resolveValue(field: string, row: CandidateRow): unknown {
+  if (field.startsWith("file.")) return getPath(row.file, field.slice(5));
+  if (field.startsWith("projection.")) return getPath(row.projection, field.slice(11));
+  if (row.values && Object.prototype.hasOwnProperty.call(row.values, field)) return row.values[field];
+  return getPath(row.effective, field);
+}
+
+function getPath(object: Record<string, unknown>, path: string): unknown {
+  let value: unknown = object;
+  for (const member of path.split(".")) {
+    if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+    value = (value as Record<string, unknown>)[member];
+  }
+  return value ?? null;
+}
+
+function compareRows(
+  left: CandidateRow,
+  right: CandidateRow,
+  orderBy: NonNullable<CanonicalQueryInput["order_by"]>,
+): number {
+  for (const order of orderBy) {
+    const direction = order.direction === "desc" ? -1 : 1;
+    const compared = compareValues(resolveValue(order.field, left), resolveValue(order.field, right));
+    if (compared !== 0) return compared * direction;
+  }
+  return left.path.localeCompare(right.path);
+}
+
+function compareValues(left: unknown, right: unknown): number {
+  if (left === right) return 0;
+  if (left === null || left === undefined) return 1;
+  if (right === null || right === undefined) return -1;
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  if (Array.isArray(left) || Array.isArray(right)) {
+    return (Array.isArray(left) ? left.length : 0) - (Array.isArray(right) ? right.length : 0);
+  }
+  if (isObject(left) || isObject(right)) {
+    return (isObject(left) ? Object.keys(left).length : 0) - (isObject(right) ? Object.keys(right).length : 0);
+  }
+  return String(left).localeCompare(String(right));
+}
+
+function buildGroups(
+  rows: CandidateRow[],
+  input: CanonicalQueryInput,
+  context: ContextRecord | undefined,
+  diagnostics: CanonicalDiagnostic[],
+): NonNullable<CanonicalQueryResult["meta"]["groups"]> {
+  const groupBy = input.group_by ?? [];
+  const buckets = new Map<string, { values: Record<string, unknown>; rows: CandidateRow[] }>();
+  for (const row of rows) {
+    const values = Object.fromEntries(groupBy.map((group) => [
+      selectionName(group.field),
+      resolveValue(group.field, row),
+    ]));
+    const key = JSON.stringify(Object.values(values));
+    const bucket = buckets.get(key);
+    if (bucket) bucket.rows.push(row);
+    else buckets.set(key, { values, rows: [row] });
+  }
+  if (rows.length === 0 && groupBy.length === 0) {
+    buckets.set("[]", { values: {}, rows: [] });
+  }
+  const groups = [...buckets.values()];
+  groups.sort((left, right) => {
+    for (const group of groupBy) {
+      const name = selectionName(group.field);
+      const compared = compareValues(left.values[name], right.values[name]);
+      if (compared !== 0) return compared * (group.direction === "desc" ? -1 : 1);
+    }
+    return 0;
+  });
+  return groups.map((group) => ({
+    values: group.values,
+    count: group.rows.length,
+    summaries: evaluateSummaries(group.rows, input, context, diagnostics),
+  }));
+}
+
+function evaluateSummaries(
+  rows: CandidateRow[],
+  input: CanonicalQueryInput,
+  context: ContextRecord | undefined,
+  diagnostics: CanonicalDiagnostic[],
+): Record<string, unknown> {
+  const results: Record<string, unknown> = {};
+  for (const summary of input.summaries ?? []) {
+    const name = summary.name ?? summary.function;
+    const values = rows.map((row) => resolveValue(summary.field, row));
+    if (input.summary_functions?.[summary.function]) {
+      const evaluated = evaluateMdbaseCel(input.summary_functions[summary.function].expr, {
+        thisRecord: context?.binding ?? null,
+        values,
+      });
+      results[name] = evaluated.value;
+      for (const diagnostic of evaluated.diagnostics) {
+        diagnostics.push({
+          severity: "warning",
+          code: diagnostic.code,
+          message: `Summary "${name}": ${diagnostic.message}`,
+          field: `summaries.${name}`,
+        });
+      }
+    } else {
+      results[name] = builtInSummary(summary.function, values, diagnostics, name);
+    }
+  }
+  return results;
+}
+
+function builtInSummary(
+  functionName: string,
+  values: unknown[],
+  diagnostics: CanonicalDiagnostic[],
+  name: string,
+): unknown {
+  if (functionName === "count") return values.length;
+  if (functionName === "empty") return values.filter(isEmptyValue).length;
+  if (functionName === "filled") return values.filter((value) => !isEmptyValue(value)).length;
+  const populated = values.filter((value) => value !== null && value !== undefined);
+  if (populated.length === 0) return null;
+  if (functionName === "sum" || functionName === "average") {
+    if (!populated.every((value) => typeof value === "number")) {
+      diagnostics.push({
+        severity: "warning",
+        code: "expression_evaluation_error",
+        message: `Summary "${name}" received an incompatible non-number value`,
+        field: `summaries.${name}`,
+      });
+      return null;
+    }
+    const sum = (populated as number[]).reduce((total, value) => total + value, 0);
+    return functionName === "average" ? sum / populated.length : sum;
+  }
+  if (["minimum", "earliest"].includes(functionName)) {
+    return populated.reduce((best, value) => compareValues(value, best) < 0 ? value : best);
+  }
+  if (["maximum", "latest"].includes(functionName)) {
+    return populated.reduce((best, value) => compareValues(value, best) > 0 ? value : best);
+  }
+  diagnostics.push({
+    severity: "warning",
+    code: "expression_evaluation_error",
+    message: `Unknown summary function "${functionName}"`,
+    field: `summaries.${name}`,
+  });
+  return null;
+}
+
+function isEmptyValue(value: unknown): boolean {
+  return value === null || value === undefined || value === "" ||
+    (Array.isArray(value) && value.length === 0) ||
+    (isObject(value) && Object.keys(value).length === 0);
+}
+
+function serializeRow(row: CandidateRow, input: CanonicalQueryInput): CanonicalQueryRow {
+  const frontmatterMode = input.frontmatter ?? "effective";
+  return {
+    path: row.path,
+    file: row.file,
+    frontmatter: frontmatterMode === "raw" ? row.raw : row.effective,
+    ...(frontmatterMode === "both" ? { raw_frontmatter: row.raw } : {}),
+    ...(row.values ? { values: row.values } : {}),
+    ...(input.include_body ? { body: row.body } : {}),
+  };
+}
+
+async function buildFileCache(
+  files: string[],
+  read: CanonicalQueryDeps["read"],
+): Promise<Map<string, IndexedReadResult>> {
+  const cache = new Map<string, IndexedReadResult>();
+  for (const file of files) {
+    const result = await read(file);
+    if (!result.error) cache.set(file, result);
+  }
+  return cache;
+}
+
+function formatSchemaErrors(errors: typeof validateQuery.errors): string {
+  if (!errors || errors.length === 0) return "Schema validation failed";
+  return errors.map((error) => {
+    const location = error.instancePath || "/";
+    return `${location} ${error.message ?? error.keyword}`;
+  }).join("; ");
+}
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value);
+}

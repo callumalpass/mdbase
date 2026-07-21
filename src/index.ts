@@ -34,6 +34,16 @@ export type {
 export { validateJsonSchemaFrontmatter } from "./validation/json-schema.js";
 export { buildMdbaseCelBindings, evaluateMdbaseCel } from "./expressions/cel.js";
 export type { MdbaseCelContext, MdbaseCelDiagnostic, MdbaseCelResult } from "./expressions/cel.js";
+export {
+  executeCanonicalQuery,
+  validateCanonicalQueryInput,
+  validateCanonicalViewRecord,
+} from "./operations/canonical-query.js";
+export type {
+  CanonicalQueryInput,
+  CanonicalQueryResult,
+  ExecuteViewInput,
+} from "./operations/canonical-query.js";
 export { migrateV02TypeFileToV03, migrateV02TypeToV03, renderV03TypeFile } from "./migrations/type-migration.js";
 export type {
   TypeMigrationMapping,

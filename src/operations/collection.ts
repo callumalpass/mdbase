@@ -27,6 +27,13 @@ import { parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 import { QueryInput, runQuery } from "./query-engine.js";
+import {
+  CanonicalQueryInput,
+  CanonicalQueryResult,
+  ExecuteViewInput,
+  executeCanonicalQuery,
+  validateCanonicalViewRecord,
+} from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import {
   buildRuntimePackage,
@@ -601,7 +608,7 @@ fields:
     const matchedTypes: string[] = [];
     for (const [typeName, typeDef] of this.typeDefs) {
       if (!typeDef.match) continue;
-      if (this.matchesType(relativePath, frontmatter, typeDef.match)) {
+      if (this.matchesType(relativePath, frontmatter, typeDef)) {
         matchedTypes.push(typeName);
       }
     }
@@ -615,8 +622,9 @@ fields:
   private matchesType(
     relativePath: string,
     frontmatter: Record<string, unknown>,
-    match: MatchRules,
+    typeDef: TypeDefinition,
   ): boolean {
+    const match = typeDef.match!;
     // path_glob
     if (match.path_glob !== undefined) {
       const patterns = Array.isArray(match.path_glob) ? match.path_glob : [match.path_glob];
@@ -644,12 +652,37 @@ fields:
       const result = evaluateMdbaseCel(match.expr.$expr, {
         record: frontmatter,
         raw: frontmatter,
+        knownFields: this.getTypeFieldNames(typeDef),
+        file: this.buildMatchFileBinding(relativePath),
       });
       if (result.diagnostics.length > 0) return false;
       return result.value === true;
     }
 
     return true;
+  }
+
+  private getTypeFieldNames(typeDef: TypeDefinition): string[] {
+    const schemaProperties = typeDef.schema?.value?.properties;
+    return [
+      ...Object.keys(typeDef.fields ?? {}),
+      ...(schemaProperties !== null && typeof schemaProperties === "object" && !Array.isArray(schemaProperties)
+        ? Object.keys(schemaProperties)
+        : []),
+    ];
+  }
+
+  private buildMatchFileBinding(relativePath: string): Record<string, unknown> {
+    const name = path.posix.basename(relativePath);
+    const extension = path.posix.extname(name).replace(/^\./, "");
+    const folder = path.posix.dirname(relativePath);
+    return {
+      path: relativePath,
+      name,
+      basename: extension ? name.slice(0, -(extension.length + 1)) : name,
+      extension,
+      folder: folder === "." ? "" : folder,
+    };
   }
 
   /**
@@ -1033,7 +1066,11 @@ fields:
     context: { oldFrontmatter?: Record<string, unknown>; relativePath?: string } = {},
   ): MdbaseError[] {
     const issues: MdbaseError[] = [];
-    const assignments = new Map<string, unknown>();
+    const assignments = new Map<string, {
+      value: unknown;
+      typeName: string;
+      lifecyclePath: string;
+    }>();
 
     for (const typeName of types) {
       const typeDef = this.typeDefs.get(typeName);
@@ -1053,7 +1090,7 @@ fields:
           });
           if (guard.diagnostics.length > 0) {
             issues.push({
-              code: "expression_evaluation_error",
+              code: "lifecycle_expression_error",
               message: `Lifecycle guard on ${typeName}.${event}[${index}] failed: ${guard.diagnostics[0].message}`,
               severity: "error",
             });
@@ -1065,19 +1102,21 @@ fields:
         }
         for (const [fieldPath, lifecycleValue] of Object.entries(action.set)) {
           const value = this.evaluateLifecycleValue(lifecycleValue, frontmatter, context);
+          const lifecyclePath = `${typeName}.lifecycle.${event}[${index}].set.${fieldPath}`;
           if (assignments.has(fieldPath)) {
-            const previous = assignments.get(fieldPath);
-            if (JSON.stringify(previous) !== JSON.stringify(value)) {
+            const previous = assignments.get(fieldPath)!;
+            if (JSON.stringify(previous.value) !== JSON.stringify(value)) {
               issues.push({
-                code: "lifecycle_conflict",
-                message: `Conflicting lifecycle assignment for "${fieldPath}" on ${event}`,
+                code: "type_conflict",
+                message: `Conflicting lifecycle assignments for "${fieldPath}": ${previous.lifecyclePath} and ${lifecyclePath}`,
                 field: fieldPath,
+                type: `${previous.typeName},${typeName}`,
                 severity: "error",
               });
               continue;
             }
           }
-          assignments.set(fieldPath, value);
+          assignments.set(fieldPath, { value, typeName, lifecyclePath });
         }
       }
     }
@@ -1086,9 +1125,9 @@ fields:
       return issues;
     }
 
-    for (const [fieldPath, value] of assignments) {
+    for (const [fieldPath, assignment] of assignments) {
       try {
-        setFieldPathValue(frontmatter, fieldPath, value);
+        setFieldPathValue(frontmatter, fieldPath, assignment.value);
       } catch (error) {
         issues.push({
           code: "invalid_lifecycle_path",
@@ -1741,7 +1780,7 @@ fields:
     for (const typeName of typeNames) {
       const typeDef = this.typeDefs.get(typeName);
       if (typeDef?.match) {
-        if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef.match)) {
+        if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef)) {
           return {
             error: { code: "match_failed", message: `Created file would not satisfy match rules for type "${typeName}"` },
           };
@@ -2864,6 +2903,168 @@ fields:
       omitBodyWhenExcluded: this.config.spec_profile === "v0.3",
     });
     return result as QueryResult & { error?: { code: string; message: string } };
+  }
+
+  /** Execute the strict portable v0.3 query-object contract. */
+  async queryCanonical(input: CanonicalQueryInput): Promise<CanonicalQueryResult> {
+    return await executeCanonicalQuery(input, {
+      typeDefs: this.typeDefs,
+      scanFiles: () => this.scanFiles(),
+      read: (relativePath: string) => this.read(relativePath),
+      buildFileCache: async (files: string[]) => {
+        const built = await this.buildFileCache(files);
+        return built as Map<string, IndexedReadResult>;
+      },
+    });
+  }
+
+  /** Resolve and execute an ordinary `type: view` Markdown record. */
+  async executeView(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
+    const resolved = await this.resolveViewRecord(input.path);
+    if (!resolved) {
+      return canonicalQueryFailure("view_not_found", `View record "${input.path}" was not found`);
+    }
+    const { path: viewPath, read } = resolved;
+    const frontmatter = read.frontmatter ?? {};
+    const schemaDiagnostics = validateCanonicalViewRecord(frontmatter, viewPath);
+    if (schemaDiagnostics.length > 0) {
+      return canonicalQueryFailure("invalid_view", schemaDiagnostics[0].message, schemaDiagnostics);
+    }
+
+    const viewRecord = frontmatter as Record<string, unknown>;
+    const views = viewRecord.views as Array<Record<string, unknown>>;
+    const ids = views.map((view) => String(view.id));
+    if (new Set(ids).size !== ids.length) {
+      return canonicalQueryFailure(
+        "invalid_view",
+        `View record "${viewPath}" contains duplicate named-view IDs`,
+      );
+    }
+    const namedView = views.find((view) => view.id === input.view);
+    if (!namedView) {
+      return canonicalQueryFailure(
+        "view_not_found",
+        `Named view "${input.view}" was not found in "${viewPath}"`,
+      );
+    }
+
+    if (input.render === true && namedView.presentation) {
+      return canonicalQueryFailure(
+        "unsupported_presentation",
+        `The collection library provides headless execution only`,
+      );
+    }
+
+    const sharedProjections = objectValue(viewRecord.projections);
+    const localProjections = objectValue(namedView.projections);
+    for (const name of Object.keys(sharedProjections)) {
+      if (
+        Object.prototype.hasOwnProperty.call(localProjections, name) &&
+        canonicalJson(sharedProjections[name]) !== canonicalJson(localProjections[name])
+      ) {
+        return canonicalQueryFailure(
+          "invalid_view",
+          `Projection "${name}" has conflicting shared and named-view definitions`,
+        );
+      }
+    }
+
+    const contextDeclaration = objectValue(
+      Object.prototype.hasOwnProperty.call(namedView, "context")
+        ? namedView.context
+        : viewRecord.context,
+    );
+    const thisDeclaration = objectValue(contextDeclaration.this);
+    let contextPath: string | undefined;
+    if (input.context && typeof input.context.path === "string") {
+      contextPath = input.context.path;
+    } else {
+      const onMissing = typeof thisDeclaration.on_missing === "string"
+        ? thisDeclaration.on_missing
+        : "view";
+      if (onMissing === "error") {
+        return canonicalQueryFailure(
+          "context_required",
+          `Named view "${input.view}" requires an invocation context`,
+        );
+      }
+      if (onMissing === "view") contextPath = viewPath;
+    }
+
+    if (contextPath && Array.isArray(thisDeclaration.types)) {
+      const contextRead = await this.read(contextPath);
+      if (contextRead.error) {
+        return canonicalQueryFailure(
+          "context_not_found",
+          `Invocation context "${contextPath}" was not found`,
+        );
+      }
+      const required = thisDeclaration.types.map(String).map((type) => type.toLowerCase());
+      const actual = contextRead.types ?? [];
+      if (!required.some((type) => actual.includes(type))) {
+        return canonicalQueryFailure(
+          "context_type_mismatch",
+          `Invocation context "${contextPath}" does not match an allowed context type`,
+        );
+      }
+    }
+
+    const sharedWhere = typeof viewRecord.where === "string" ? viewRecord.where : undefined;
+    const localWhere = typeof namedView.where === "string" ? namedView.where : undefined;
+    const query: CanonicalQueryInput = {
+      ...(Array.isArray(namedView.types)
+        ? { types: namedView.types.map(String) }
+        : Array.isArray(viewRecord.types)
+          ? { types: viewRecord.types.map(String) }
+          : {}),
+      ...(contextPath ? { context: { this: { path: contextPath } } } : {}),
+      ...((Object.keys(sharedProjections).length > 0 || Object.keys(localProjections).length > 0)
+        ? { projections: { ...sharedProjections, ...localProjections } as CanonicalQueryInput["projections"] }
+        : {}),
+      ...(sharedWhere && localWhere
+        ? { where: `(${sharedWhere}) && (${localWhere})` }
+        : sharedWhere || localWhere
+          ? { where: sharedWhere ?? localWhere }
+          : {}),
+      ...(Array.isArray(namedView.select) ? { select: namedView.select as CanonicalQueryInput["select"] } : {}),
+      ...(Array.isArray(namedView.order_by) ? { order_by: namedView.order_by as CanonicalQueryInput["order_by"] } : {}),
+      ...(Array.isArray(namedView.group_by) ? { group_by: namedView.group_by as CanonicalQueryInput["group_by"] } : {}),
+      ...(Object.keys(objectValue(viewRecord.summary_functions)).length > 0
+        ? { summary_functions: objectValue(viewRecord.summary_functions) as CanonicalQueryInput["summary_functions"] }
+        : {}),
+      ...(Array.isArray(namedView.summaries) ? { summaries: namedView.summaries as CanonicalQueryInput["summaries"] } : {}),
+      ...(typeof namedView.limit === "number" ? { limit: namedView.limit } : {}),
+      ...(typeof namedView.offset === "number" ? { offset: namedView.offset } : {}),
+      ...(typeof namedView.include_body === "boolean" ? { include_body: namedView.include_body } : {}),
+      ...(typeof namedView.frontmatter === "string"
+        ? { frontmatter: namedView.frontmatter as CanonicalQueryInput["frontmatter"] }
+        : {}),
+      ...(typeof input.limit === "number" ? { limit: input.limit } : {}),
+      ...(typeof input.offset === "number" ? { offset: input.offset } : {}),
+    };
+    const result = await this.queryCanonical(query);
+    result.meta.view = { path: viewPath, id: input.view };
+    return result;
+  }
+
+  private async resolveViewRecord(
+    identifier: string,
+  ): Promise<{ path: string; read: ReadResult } | undefined> {
+    const direct = await this.read(identifier);
+    if (!direct.error && direct.frontmatter?.type === "view") {
+      return { path: identifier, read: direct };
+    }
+    for (const candidate of await this.scanFiles()) {
+      const read = await this.read(candidate);
+      if (
+        !read.error &&
+        read.frontmatter?.type === "view" &&
+        read.frontmatter.id === identifier
+      ) {
+        return { path: candidate, read };
+      }
+    }
+    return undefined;
   }
 
   private computeQuerySummaries(
@@ -5100,6 +5301,25 @@ fields:
   }
 }
 
+function canonicalQueryFailure(
+  code: string,
+  message: string,
+  diagnostics?: CanonicalQueryResult["diagnostics"],
+): CanonicalQueryResult {
+  return {
+    results: [],
+    meta: { total_count: 0, has_more: false },
+    diagnostics: diagnostics ?? [{ severity: "error", code, message }],
+    error: { code, message },
+  };
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
 export interface V03Diagnostic {
   severity: "info" | "warning" | "error";
   code: string;
@@ -5170,6 +5390,14 @@ export class V03Operations {
 
   async validate(input: V03ValidateInput = {}): Promise<V03OperationResult> {
     return await this.normalize("validate", input, await this.collection.validate(input.path));
+  }
+
+  async query(input: CanonicalQueryInput): Promise<V03OperationResult> {
+    return canonicalQueryOperationResult(await this.collection.queryCanonical(input));
+  }
+
+  async executeView(input: ExecuteViewInput): Promise<V03OperationResult> {
+    return canonicalQueryOperationResult(await this.collection.executeView(input));
   }
 
   async create(input: V03CreateInput): Promise<V03OperationResult> {
@@ -5259,6 +5487,15 @@ export class V03Operations {
       diagnostics: deduplicateV03Diagnostics(diagnostics),
     };
   }
+}
+
+function canonicalQueryOperationResult(query: CanonicalQueryResult): V03OperationResult {
+  const { error, ...result } = query;
+  return {
+    valid: error === undefined && !query.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+    result,
+    diagnostics: query.diagnostics,
+  };
 }
 
 function collectV03Diagnostics(raw: Record<string, unknown>, fallbackPath?: string): V03Diagnostic[] {

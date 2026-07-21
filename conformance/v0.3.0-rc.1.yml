@@ -11,10 +11,13 @@ spec_version: 0.3.0
 profiles:
   - core_read
   - collection_semantics
+  - cel
   - cel_query
   - links
   - core_write
   - lifecycle
+optional_features:
+  - view_records
 json_schema:
   dialect: https://json-schema.org/draft/2020-12/schema
   keywords:
@@ -66,7 +69,7 @@ evidence:
   - kind: conformance_suite
     command: npm run test -- test/v03-conformance.test.ts
     result: pass
-    verified_at: "2026-07-19T20:50:00+10:00"
+    verified_at: "2026-07-21T23:55:02+10:00"
     artifact: test/v03-conformance.test.ts
     environment: Linux x86_64, Node.js 22
   - kind: test_suite
