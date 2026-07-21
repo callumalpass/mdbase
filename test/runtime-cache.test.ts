@@ -33,6 +33,15 @@ describe("CollectionRuntimeCache", () => {
     expect(cache.getBacklinkTokens()).toBeUndefined();
   });
 
+  it("updates an existing cached record without discarding the collection index", () => {
+    const cache = new CollectionRuntimeCache<{ title: string }>();
+    cache.setFileCache(["a.md"], new Map([["a.md", { title: "old" }]]));
+
+    cache.updateFile("a.md", { title: "new" });
+
+    expect(cache.getFileCache(["a.md"])?.get("a.md")).toEqual({ title: "new" });
+  });
+
   it("removes a backlink source from both sides of the token index", () => {
     const cache = new CollectionRuntimeCache<object>();
     cache.setBacklinkTokens({

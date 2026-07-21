@@ -2040,7 +2040,6 @@ fields:
 
     await fs.promises.writeFile(fullPath, content);
     await this.updateCacheForPath(relativePath);
-    this.invalidateRuntimeCaches({ fileLists: false });
 
     // Evaluate computed fields on the effective frontmatter for the return value
     this.evaluateComputedFields(effectiveFrontmatter, types, relativePath, body);
@@ -2056,6 +2055,19 @@ fields:
     if (warnings.length > 0) {
       result.warnings = warnings;
     }
+    this.runtimeCache.updateFile(relativePath, {
+      valid: true,
+      frontmatter: effectiveFrontmatter,
+      rawFrontmatter: diskFrontmatter,
+      body,
+      types,
+      revision: result.revision,
+    });
+    this.invalidateRuntimeCaches({
+      fileLists: false,
+      fileCache: false,
+      nonMarkdown: false,
+    });
     return result;
   }
 

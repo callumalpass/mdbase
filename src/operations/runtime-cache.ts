@@ -71,6 +71,10 @@ export class CollectionRuntimeCache<TRead> {
     return cache;
   }
 
+  updateFile(path: string, value: TRead): void {
+    if (this.fileCache?.has(path)) this.fileCache.set(path, value);
+  }
+
   getNonMarkdownFiles(files: string[]): Set<string> | undefined {
     return this.nonMarkdownFiles && samePaths(files, this.nonMarkdownSource)
       ? this.nonMarkdownFiles
