@@ -2957,6 +2957,9 @@ fields:
     types: string[],
   ): Promise<MdbaseError[]> {
     const issues: MdbaseError[] = [];
+    if (!this.hasUniquenessValues(updatingPath, frontmatter, types)) {
+      return issues;
+    }
     const files = await this.scanFiles();
     const fileCache = await this.buildFileCache(files);
 
@@ -3038,6 +3041,30 @@ fields:
     }
 
     return issues;
+  }
+
+  /** Avoid a collection scan when the candidate supplies no constrained value. */
+  private hasUniquenessValues(
+    relativePath: string,
+    frontmatter: Record<string, unknown>,
+    types: string[],
+  ): boolean {
+    const idValue = frontmatter[this.config.settings.id_field];
+    if (idValue !== null && idValue !== undefined) return true;
+
+    for (const typeName of types) {
+      const typeDef = this.typeDefs.get(typeName);
+      for (const [fieldName, fieldDef] of Object.entries(typeDef?.fields ?? {})) {
+        const value = frontmatter[fieldName];
+        if (fieldDef.unique && value !== null && value !== undefined) return true;
+      }
+      for (const rule of typeDef?.collection?.unique ?? []) {
+        if (!this.v03UniqueRuleApplies(rule, typeName, relativePath, types)) continue;
+        const value = getFieldPathValue(frontmatter, rule.field);
+        if (value.present && value.value !== null && value.value !== undefined) return true;
+      }
+    }
+    return false;
   }
 
   /**

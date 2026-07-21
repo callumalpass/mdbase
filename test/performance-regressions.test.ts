@@ -15,7 +15,11 @@ async function fixture(): Promise<Collection> {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "mdbase-cache-regression-"));
   roots.push(root);
   await fs.mkdir(path.join(root, "_types"), { recursive: true });
-  await fs.writeFile(path.join(root, "mdbase.yaml"), 'spec_version: "0.3.0"\n', "utf8");
+  await fs.writeFile(
+    path.join(root, "mdbase.yaml"),
+    'spec_version: "0.3.0"\nsettings:\n  validation: error\n',
+    "utf8",
+  );
   for (const type of ["task", "note"]) {
     await fs.writeFile(path.join(root, `_types/${type}.md`), `---
 kind: mdbase.type
@@ -74,6 +78,47 @@ describe("in-memory cache mutation regressions", () => {
     ]);
     const deleted = await collection.delete("b.md", { check_backlinks: true });
     expect(deleted.broken_links).toEqual([{ path: "source.md" }]);
+    await collection.close();
+  });
+
+  it("does not scan existing records when a write has no uniqueness values", async () => {
+    const collection = await fixture();
+    let nestedReads = 0;
+    const read = collection.read.bind(collection);
+    collection.read = async (relativePath: string) => {
+      nestedReads++;
+      return await read(relativePath);
+    };
+
+    const created = await collection.create({
+      path: "without-unique-values.md",
+      type: "task",
+      frontmatter: { title: "No constrained values" },
+    });
+
+    expect(created.error).toBeUndefined();
+    expect(nestedReads).toBe(0);
+    await collection.close();
+  });
+
+  it("still scans and rejects a supplied duplicate ID", async () => {
+    const collection = await fixture();
+    const first = await collection.create({
+      path: "first-id.md",
+      type: "task",
+      frontmatter: { id: "shared-id", title: "First" },
+    });
+    expect(first.error).toBeUndefined();
+
+    const duplicate = await collection.create({
+      path: "duplicate-id.md",
+      type: "task",
+      frontmatter: { id: "shared-id", title: "Duplicate" },
+    });
+    expect(duplicate.error?.code).toBe("validation_failed");
+    expect(duplicate.issues).toEqual(expect.arrayContaining([
+      expect.objectContaining({ code: "duplicate_id", field: "id" }),
+    ]));
     await collection.close();
   });
 });
