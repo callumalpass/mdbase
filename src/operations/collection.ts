@@ -65,6 +65,7 @@ import {
   executeCanonicalView,
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
+import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
 import {
   BacklinkTokenIndex,
   CollectionRuntimeCache,
@@ -107,12 +108,6 @@ export type {
   ValidateResult,
 } from "./contracts.js";
 
-interface LinkResolutionIndex {
-  fileSet: Set<string>;
-  basenameToFiles: Map<string, string[]>;
-  idToFiles: Map<string, string[]>;
-}
-
 const DEFAULT_SPEC_VERSION = SUPPORTED_SPEC_VERSION;
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -140,6 +135,7 @@ export class Collection {
   private cache: CacheStoreAsync | null;
   private readonly runtimeCache: CollectionRuntimeCache<ReadResult>;
   private readonly observer: OperationObserver;
+  private readonly linkResolver: LinkResolver;
 
   /**
    * Hook called after reading a file but before writing.
@@ -184,6 +180,10 @@ export class Collection {
     this.cache = null;
     this.runtimeCache = new CollectionRuntimeCache();
     this.observer = new OperationObserver(options.observability);
+    this.linkResolver = new LinkResolver({
+      idField: config.settings.id_field,
+      recordExtensions: config.settings.record_extensions,
+    });
   }
 
   /** Return the canonical v0.3 operation surface for this collection. */
@@ -2790,18 +2790,19 @@ fields:
       ) => {
         let resolutionIndex = resolutionIndexByCache.get(fileCache);
         if (!resolutionIndex) {
-          resolutionIndex = this.buildLinkResolutionIndex(files, fileCache as Map<string, ReadResult>);
+          resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
           resolutionIndexByCache.set(fileCache, resolutionIndex);
         }
-        return this.resolveLinkFullWithFiles(
+        return this.linkResolver.resolve(
           linkValue,
           fromPath,
           files,
-          undefined,
-          fileCache as Map<string, ReadResult>,
-          nonMarkdownFiles,
-          resolutionIndex.fileSet,
-          resolutionIndex,
+          {
+            fileCache,
+            nonMarkdownFiles,
+            knownFileSet: resolutionIndex.fileSet,
+            resolutionIndex,
+          },
         );
       },
       evaluateStructuredWhere: (
@@ -3278,7 +3279,7 @@ fields:
     const fileCache = this.skipDependents ? await this.buildFileCache(files) : undefined;
     const nonMdSet = this.skipDependents ? this.buildNonMarkdownSet(await this.scanAllFiles()) : undefined;
     const resolutionIndex = this.skipDependents && fileCache
-      ? this.buildLinkResolutionIndex(files, fileCache)
+      ? this.linkResolver.buildIndex(files, fileCache)
       : undefined;
 
     for (const relativePath of matchingPaths) {
@@ -3316,15 +3317,16 @@ fields:
               // Also try full link resolution
               if (!dependsOnFailed) {
                 try {
-                  const resolved = this.resolveLinkFullWithFiles(
+                  const resolved = this.linkResolver.resolve(
                     linkVal,
                     relativePath,
                     files,
-                    undefined,
-                    fileCache,
-                    nonMdSet,
-                    resolutionIndex?.fileSet,
-                    resolutionIndex,
+                    {
+                      fileCache,
+                      nonMarkdownFiles: nonMdSet,
+                      knownFileSet: resolutionIndex?.fileSet,
+                      resolutionIndex,
+                    },
                   );
                   if (resolved.resolved && failedPaths.has(resolved.resolved)) {
                     dependsOnFailed = true;
@@ -4205,19 +4207,25 @@ fields:
     const fileCache = await this.buildFileCache(files);
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
-    const resolutionIndex = this.buildLinkResolutionIndex(files, fileCache);
-    return this.resolveLinkFullWithFiles(
+    const resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
+    return this.linkResolver.resolve(
       linkValue,
       fromPath,
       files,
-      targetType,
-      fileCache,
-      nonMdSet,
-      resolutionIndex.fileSet,
-      resolutionIndex,
+      {
+        targetType,
+        fileCache,
+        nonMarkdownFiles: nonMdSet,
+        knownFileSet: resolutionIndex.fileSet,
+        resolutionIndex,
+      },
     );
   }
 
+  /**
+   * Snapshot adapter retained for internal evaluators and the conformance
+   * harness. Resolution policy lives in LinkResolver.
+   */
   private resolveLinkFullWithFiles(
     linkValue: string,
     fromPath: string,
@@ -4228,297 +4236,13 @@ fields:
     knownFileSet?: Set<string>,
     resolutionIndex?: LinkResolutionIndex,
   ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
-    // Parse the link to get the target
-    let parsed: ParsedLink | null;
-    try {
-      parsed = parseLink(linkValue);
-    } catch {
-      return { resolved: null };
-    }
-
-    const target = parsed ? parsed.target : linkValue;
-    const format = parsed ? parsed.format : "wikilink";
-    const isRelative = parsed ? parsed.is_relative : false;
-
-    const fromDir = path.dirname(fromPath);
-
-    // Strip anchor from target for resolution
-    const resolveTarget = target;
-    const fileSet = knownFileSet ?? resolutionIndex?.fileSet ?? new Set(files);
-    const index = resolutionIndex ?? this.buildLinkResolutionIndex(files, fileCache, fileSet);
-
-    // Helper to check if a file exists (markdown files in scan list, or any file on disk)
-    const fileExists = (p: string): boolean => {
-      if (fileSet.has(p)) return true;
-      return nonMarkdownFiles ? nonMarkdownFiles.has(p) : false;
-    };
-
-    // Step 1: Path-based resolution
-    if (format === "markdown" || format === "path") {
-      // Markdown/path links resolve relative to containing file directory
-      let resolved: string;
-      if (resolveTarget.startsWith("/")) {
-        // Root-relative
-        resolved = resolveTarget.slice(1);
-      } else if (isRelative || !resolveTarget.startsWith("/")) {
-        // Relative to containing file
-        resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
-      } else {
-        resolved = resolveTarget;
-      }
-      resolved = resolved.replace(/\\/g, "/");
-
-      // Check if file exists
-      if (fileExists(resolved)) {
-        return this.checkTargetType(resolved, targetType, fileCache);
-      }
-      // Try with extensions
-      for (const ext of this.getExtensions()) {
-        if (fileExists(resolved + ext)) {
-          return this.checkTargetType(resolved + ext, targetType, fileCache);
-        }
-      }
-      return { resolved: null };
-    }
-
-    // Wikilink resolution
-    if (format === "wikilink") {
-      // Relative wikilinks (./, ../)
-      if (isRelative) {
-        let resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
-        resolved = resolved.replace(/\\/g, "/");
-        if (fileExists(resolved)) {
-          return this.checkTargetType(resolved, targetType, fileCache);
-        }
-        for (const ext of this.getExtensions()) {
-          if (fileSet.has(resolved + ext)) {
-            return this.checkTargetType(resolved + ext, targetType, fileCache);
-          }
-        }
-        return { resolved: null };
-      }
-
-      // Root-relative (/path)
-      if (resolveTarget.startsWith("/")) {
-        const resolved = resolveTarget.slice(1);
-        if (fileExists(resolved)) {
-          return this.checkTargetType(resolved, targetType, fileCache);
-        }
-        for (const ext of this.getExtensions()) {
-          if (fileSet.has(resolved + ext)) {
-            return this.checkTargetType(resolved + ext, targetType, fileCache);
-          }
-        }
-        return { resolved: null };
-      }
-
-      // Contains slash (absolute from root)
-      if (resolveTarget.includes("/")) {
-        if (fileExists(resolveTarget)) {
-          return this.checkTargetType(resolveTarget, targetType, fileCache);
-        }
-        for (const ext of this.getExtensions()) {
-          if (fileExists(resolveTarget + ext)) {
-            return this.checkTargetType(resolveTarget + ext, targetType, fileCache);
-          }
-        }
-        return { resolved: null };
-      }
-
-      // Simple name resolution
-      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache, index);
-    }
-
-    // Fallback: try as simple name
-    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache, index);
-  }
-
-  /**
-   * Resolve a simple name (no path separators) using ID field match, then filename match.
-   */
-  private resolveSimpleName(
-    name: string,
-    fromPath: string,
-    files: string[],
-    targetType?: string,
-    fileCache?: Map<string, ReadResult>,
-    resolutionIndex?: LinkResolutionIndex,
-  ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
-    const fromDir = path.dirname(fromPath);
-
-    // Determine scope: if target constraint, limit to files of that type
-    let scopeFiles = files;
-    if (targetType) {
-      scopeFiles = files.filter((f) => {
-        const readResult = fileCache?.get(f);
-        if (!readResult?.types) return false;
-        return readResult.types.includes(targetType);
-      });
-    }
-
-    // Step 1: ID field match
-    const idField = this.config.settings.id_field;
-    const scopeSet = targetType ? new Set(scopeFiles) : undefined;
-    const idCandidates = idField
-      ? (resolutionIndex?.idToFiles.get(name) ?? this.scanIdMatchesByName(name, files, fileCache, idField))
-      : [];
-    const idMatches = scopeSet
-      ? idCandidates.filter((filePath) => scopeSet.has(filePath))
-      : idCandidates;
-
-    if (idMatches.length === 1) {
-      return this.checkTargetType(idMatches[0], targetType, fileCache);
-    }
-    if (idMatches.length > 1) {
-      return { resolved: null, ambiguous: true };
-    }
-
-    // Step 2: Filename match
-    const basenameCandidates = resolutionIndex?.basenameToFiles.get(name) ?? this.scanBasenameMatches(name, files);
-    const filenameMatches = scopeSet
-      ? basenameCandidates.filter((filePath) => scopeSet.has(filePath))
-      : basenameCandidates;
-
-    if (filenameMatches.length === 0) {
-      // If there's a target constraint and no match found, check if a match exists outside scope
-      if (targetType) {
-        if (basenameCandidates.length > 0) {
-          return { resolved: null, wrongType: true };
-        }
-        // Also check ID match outside scope
-        if (idField && idCandidates.length > 0) {
-          return { resolved: null, wrongType: true };
-        }
-      }
-      return { resolved: null };
-    }
-
-    if (filenameMatches.length === 1) {
-      return this.checkTargetType(filenameMatches[0], targetType, fileCache);
-    }
-
-    // Apply tiebreakers
-    // 1. Same directory preference
-    const sameDir = filenameMatches.filter((f) => path.dirname(f) === fromDir);
-    if (sameDir.length === 1) {
-      return this.checkTargetType(sameDir[0], targetType, fileCache);
-    }
-
-    // 2. Shortest path
-    const sorted = [...filenameMatches].sort((a, b) => {
-      const depthA = a.split("/").length;
-      const depthB = b.split("/").length;
-      if (depthA !== depthB) return depthA - depthB;
-      // 3. Alphabetical
-      return a.localeCompare(b);
+    return this.linkResolver.resolve(linkValue, fromPath, files, {
+      targetType,
+      fileCache,
+      nonMarkdownFiles,
+      knownFileSet,
+      resolutionIndex,
     });
-
-    // If multiple with same depth after sort, check if it's ambiguous
-    const shortestDepth = sorted[0].split("/").length;
-    const shortestPaths = sorted.filter((f) => f.split("/").length === shortestDepth);
-    if (shortestPaths.length > 1) {
-      // Alphabetical tiebreaker
-      return this.checkTargetType(shortestPaths.sort()[0], targetType, fileCache);
-    }
-
-    return this.checkTargetType(sorted[0], targetType, fileCache);
-  }
-
-  private scanBasenameMatches(name: string, files: string[]): string[] {
-    const matches: string[] = [];
-    for (const filePath of files) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      if (basename === name) {
-        matches.push(filePath);
-      }
-    }
-    return matches;
-  }
-
-  private scanIdMatchesByName(
-    name: string,
-    files: string[],
-    fileCache: Map<string, ReadResult> | undefined,
-    idField: string,
-  ): string[] {
-    const matches: string[] = [];
-    for (const filePath of files) {
-      const readResult = fileCache?.get(filePath);
-      if (!readResult?.frontmatter) continue;
-      const idValue = readResult.frontmatter[idField];
-      if (idValue !== null && idValue !== undefined && String(idValue) === name) {
-        matches.push(filePath);
-      }
-    }
-    return matches;
-  }
-
-  private buildLinkResolutionIndex(
-    files: string[],
-    fileCache?: Map<string, ReadResult>,
-    fileSet?: Set<string>,
-  ): LinkResolutionIndex {
-    const basenameToFiles = new Map<string, string[]>();
-    const idToFiles = new Map<string, string[]>();
-    const idField = this.config.settings.id_field;
-
-    for (const filePath of files) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      const existingByName = basenameToFiles.get(basename);
-      if (existingByName) {
-        existingByName.push(filePath);
-      } else {
-        basenameToFiles.set(basename, [filePath]);
-      }
-
-      if (!idField) continue;
-      const readResult = fileCache?.get(filePath);
-      const idValue = readResult?.frontmatter?.[idField];
-      if (idValue === null || idValue === undefined) continue;
-      const key = String(idValue);
-      const existingById = idToFiles.get(key);
-      if (existingById) {
-        existingById.push(filePath);
-      } else {
-        idToFiles.set(key, [filePath]);
-      }
-    }
-
-    return {
-      fileSet: fileSet ?? new Set(files),
-      basenameToFiles,
-      idToFiles,
-    };
-  }
-
-  /**
-   * Check if the resolved file matches the target type constraint.
-   */
-  private checkTargetType(
-    resolvedPath: string,
-    targetType?: string,
-    fileCache?: Map<string, ReadResult>,
-  ): { resolved: string; wrongType?: boolean } {
-    if (!targetType) {
-      return { resolved: resolvedPath };
-    }
-
-    const readResult = fileCache?.get(resolvedPath);
-    if (!readResult?.types || !readResult.types.includes(targetType)) {
-      return { resolved: resolvedPath, wrongType: true };
-    }
-    return { resolved: resolvedPath };
-  }
-
-  /**
-   * Get configured file extensions to try for link resolution.
-   */
-  private getExtensions(): string[] {
-    const configExts = this.config.settings?.record_extensions ?? ["md"];
-    const normalized = configExts.map((e: string) => e.startsWith(".") ? e : `.${e}`);
-    return normalized.includes(".md")
-      ? [".md", ...normalized.filter((e: string) => e !== ".md")]
-      : normalized;
   }
 
   /**
@@ -4690,21 +4414,22 @@ fields:
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
     const fileCache = await this.buildFileCache(files);
-    const resolutionIndex = this.buildLinkResolutionIndex(files, fileCache);
+    const resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
     const linkIndex = buildLinkIndex({
       files,
       fileCache,
       typeDefs: this.typeDefs,
       resolveLink: (linkValue: string, fromPath: string) =>
-        this.resolveLinkFullWithFiles(
+        this.linkResolver.resolve(
           linkValue,
           fromPath,
           files,
-          undefined,
-          fileCache,
-          nonMdSet,
-          resolutionIndex.fileSet,
-          resolutionIndex,
+          {
+            fileCache,
+            nonMarkdownFiles: nonMdSet,
+            knownFileSet: resolutionIndex.fileSet,
+            resolutionIndex,
+          },
         ),
     });
     return linkIndex.backlinksFor(targetPath);
