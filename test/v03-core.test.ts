@@ -1405,7 +1405,7 @@ assignee: null
     expect(query.diagnostics).toEqual([]);
   });
 
-  it("treats a view record's types member as query scope, not record membership", async () => {
+  it("keeps a view's nested query types separate from record membership", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
     await write(root, "_types/view.md", `---
@@ -1431,7 +1431,8 @@ type: view
 id: task.views
 version: 1
 name: Tasks
-types: [task]
+query:
+  types: [task]
 views:
   - id: all
     name: All tasks

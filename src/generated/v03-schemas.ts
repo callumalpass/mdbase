@@ -1271,17 +1271,8 @@ export const viewSchema: Record<string, unknown> = {
     "description": {
       "type": "string"
     },
-    "types": {
-      "$ref": "#/$defs/typeList"
-    },
-    "where": {
-      "$ref": "#/$defs/expression"
-    },
-    "context": {
-      "$ref": "#/$defs/viewContext"
-    },
-    "projections": {
-      "$ref": "#/$defs/projectionSet"
+    "query": {
+      "$ref": "#/$defs/sharedQuery"
     },
     "properties": {
       "$ref": "#/$defs/propertyMetadataSet"
@@ -1331,6 +1322,29 @@ export const viewSchema: Record<string, unknown> = {
       "items": {
         "$ref": "#/$defs/typeName"
       }
+    },
+    "sharedQuery": {
+      "type": "object",
+      "properties": {
+        "types": {
+          "$ref": "#/$defs/typeList"
+        },
+        "where": {
+          "$ref": "#/$defs/expression"
+        },
+        "context": {
+          "$ref": "#/$defs/viewContext"
+        },
+        "projections": {
+          "$ref": "#/$defs/projectionSet"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
     },
     "viewContext": {
       "type": "object",

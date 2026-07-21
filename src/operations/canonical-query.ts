@@ -181,7 +181,8 @@ export async function executeCanonicalView(
     );
   }
 
-  const sharedProjections = objectValue(viewRecord.projections);
+  const sharedQuery = objectValue(viewRecord.query);
+  const sharedProjections = objectValue(sharedQuery.projections);
   const localProjections = objectValue(namedView.projections);
   for (const name of Object.keys(sharedProjections)) {
     if (
@@ -198,7 +199,7 @@ export async function executeCanonicalView(
   const contextDeclaration = objectValue(
     Object.prototype.hasOwnProperty.call(namedView, "context")
       ? namedView.context
-      : viewRecord.context,
+      : sharedQuery.context,
   );
   const thisDeclaration = objectValue(contextDeclaration.this);
   const contextPath = resolveContextPath(input, viewPath, thisDeclaration);
@@ -225,6 +226,7 @@ export async function executeCanonicalView(
   const query = buildViewQuery(
     input,
     viewRecord,
+    sharedQuery,
     namedView,
     sharedProjections,
     localProjections,
@@ -276,18 +278,19 @@ function resolveContextPath(
 function buildViewQuery(
   input: ExecuteViewInput,
   viewRecord: Record<string, unknown>,
+  sharedQuery: Record<string, unknown>,
   namedView: Record<string, unknown>,
   sharedProjections: Record<string, unknown>,
   localProjections: Record<string, unknown>,
   contextPath?: string,
 ): CanonicalQueryInput {
-  const sharedWhere = typeof viewRecord.where === "string" ? viewRecord.where : undefined;
+  const sharedWhere = typeof sharedQuery.where === "string" ? sharedQuery.where : undefined;
   const localWhere = typeof namedView.where === "string" ? namedView.where : undefined;
   return {
     ...(Array.isArray(namedView.types)
       ? { types: namedView.types.map(String) }
-      : Array.isArray(viewRecord.types)
-        ? { types: viewRecord.types.map(String) }
+      : Array.isArray(sharedQuery.types)
+        ? { types: sharedQuery.types.map(String) }
         : {}),
     ...(contextPath ? { context: { this: { path: contextPath } } } : {}),
     ...((Object.keys(sharedProjections).length > 0 || Object.keys(localProjections).length > 0)
