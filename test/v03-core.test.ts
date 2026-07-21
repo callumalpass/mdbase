@@ -1404,4 +1404,45 @@ assignee: null
     expect(query.meta).toEqual({ total_count: 1, has_more: false });
     expect(query.diagnostics).toEqual([]);
   });
+
+  it("treats a view record's types member as query scope, not record membership", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "_types/view.md", `---
+kind: mdbase.type
+name: view
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value: { type: object }
+---
+`);
+    await write(root, "_types/task.md", `---
+kind: mdbase.type
+name: task
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value: { type: object }
+---
+`);
+    await write(root, "views/tasks.md", `---
+type: view
+id: task.views
+version: 1
+name: Tasks
+types: [task]
+views:
+  - id: all
+    name: All tasks
+---
+`);
+    await write(root, "tasks/a.md", "---\ntype: task\ntitle: A\n---\n");
+
+    const collection = await open(root);
+    expect((await collection.read("views/tasks.md")).types).toEqual(["view"]);
+    expect((await collection.queryCanonical({ types: ["task"] })).results.map((row) => row.path)).toEqual([
+      "tasks/a.md",
+    ]);
+  });
 });

@@ -53,7 +53,7 @@ import {
   CanonicalQueryResult,
   ExecuteViewInput,
   executeCanonicalQuery,
-  validateCanonicalViewRecord,
+  executeCanonicalView,
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import {
@@ -504,6 +504,13 @@ fields:
    * Get the file types declared explicitly in frontmatter.
    */
   private getExplicitTypes(frontmatter: Record<string, unknown>): string[] | null {
+    // In the canonical view schema, `types` is the query scope rather than a
+    // record type declaration. The record itself is always selected by its
+    // singular `type: view` discriminator.
+    if (this.config.spec_profile === "v0.3" && frontmatter.type === "view") {
+      return ["view"];
+    }
+
     // Check array-valued keys first (types takes precedence over type)
     for (const key of this.config.settings.explicit_type_keys) {
       if (key in frontmatter) {
@@ -2860,151 +2867,11 @@ fields:
 
   /** Resolve and execute an ordinary `type: view` Markdown record. */
   async executeView(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
-    const resolved = await this.resolveViewRecord(input.path);
-    if (!resolved) {
-      return canonicalQueryFailure("view_not_found", `View record "${input.path}" was not found`);
-    }
-    const { path: viewPath, read } = resolved;
-    const frontmatter = read.frontmatter ?? {};
-    const schemaDiagnostics = validateCanonicalViewRecord(frontmatter, viewPath);
-    if (schemaDiagnostics.length > 0) {
-      return canonicalQueryFailure("invalid_view", schemaDiagnostics[0].message, schemaDiagnostics);
-    }
-
-    const viewRecord = frontmatter as Record<string, unknown>;
-    const views = viewRecord.views as Array<Record<string, unknown>>;
-    const ids = views.map((view) => String(view.id));
-    if (new Set(ids).size !== ids.length) {
-      return canonicalQueryFailure(
-        "invalid_view",
-        `View record "${viewPath}" contains duplicate named-view IDs`,
-      );
-    }
-    const namedView = views.find((view) => view.id === input.view);
-    if (!namedView) {
-      return canonicalQueryFailure(
-        "view_not_found",
-        `Named view "${input.view}" was not found in "${viewPath}"`,
-      );
-    }
-
-    if (input.render === true && namedView.presentation) {
-      return canonicalQueryFailure(
-        "unsupported_presentation",
-        `The collection library provides headless execution only`,
-      );
-    }
-
-    const sharedProjections = objectValue(viewRecord.projections);
-    const localProjections = objectValue(namedView.projections);
-    for (const name of Object.keys(sharedProjections)) {
-      if (
-        Object.prototype.hasOwnProperty.call(localProjections, name) &&
-        canonicalJson(sharedProjections[name]) !== canonicalJson(localProjections[name])
-      ) {
-        return canonicalQueryFailure(
-          "invalid_view",
-          `Projection "${name}" has conflicting shared and named-view definitions`,
-        );
-      }
-    }
-
-    const contextDeclaration = objectValue(
-      Object.prototype.hasOwnProperty.call(namedView, "context")
-        ? namedView.context
-        : viewRecord.context,
-    );
-    const thisDeclaration = objectValue(contextDeclaration.this);
-    let contextPath: string | undefined;
-    if (input.context && typeof input.context.path === "string") {
-      contextPath = input.context.path;
-    } else {
-      const onMissing = typeof thisDeclaration.on_missing === "string"
-        ? thisDeclaration.on_missing
-        : "view";
-      if (onMissing === "error") {
-        return canonicalQueryFailure(
-          "context_required",
-          `Named view "${input.view}" requires an invocation context`,
-        );
-      }
-      if (onMissing === "view") contextPath = viewPath;
-    }
-
-    if (contextPath && Array.isArray(thisDeclaration.types)) {
-      const contextRead = await this.read(contextPath);
-      if (contextRead.error) {
-        return canonicalQueryFailure(
-          "context_not_found",
-          `Invocation context "${contextPath}" was not found`,
-        );
-      }
-      const required = thisDeclaration.types.map(String).map((type) => type.toLowerCase());
-      const actual = contextRead.types ?? [];
-      if (!required.some((type) => actual.includes(type))) {
-        return canonicalQueryFailure(
-          "context_type_mismatch",
-          `Invocation context "${contextPath}" does not match an allowed context type`,
-        );
-      }
-    }
-
-    const sharedWhere = typeof viewRecord.where === "string" ? viewRecord.where : undefined;
-    const localWhere = typeof namedView.where === "string" ? namedView.where : undefined;
-    const query: CanonicalQueryInput = {
-      ...(Array.isArray(namedView.types)
-        ? { types: namedView.types.map(String) }
-        : Array.isArray(viewRecord.types)
-          ? { types: viewRecord.types.map(String) }
-          : {}),
-      ...(contextPath ? { context: { this: { path: contextPath } } } : {}),
-      ...((Object.keys(sharedProjections).length > 0 || Object.keys(localProjections).length > 0)
-        ? { projections: { ...sharedProjections, ...localProjections } as CanonicalQueryInput["projections"] }
-        : {}),
-      ...(sharedWhere && localWhere
-        ? { where: `(${sharedWhere}) && (${localWhere})` }
-        : sharedWhere || localWhere
-          ? { where: sharedWhere ?? localWhere }
-          : {}),
-      ...(Array.isArray(namedView.select) ? { select: namedView.select as CanonicalQueryInput["select"] } : {}),
-      ...(Array.isArray(namedView.order_by) ? { order_by: namedView.order_by as CanonicalQueryInput["order_by"] } : {}),
-      ...(Array.isArray(namedView.group_by) ? { group_by: namedView.group_by as CanonicalQueryInput["group_by"] } : {}),
-      ...(Object.keys(objectValue(viewRecord.summary_functions)).length > 0
-        ? { summary_functions: objectValue(viewRecord.summary_functions) as CanonicalQueryInput["summary_functions"] }
-        : {}),
-      ...(Array.isArray(namedView.summaries) ? { summaries: namedView.summaries as CanonicalQueryInput["summaries"] } : {}),
-      ...(typeof namedView.limit === "number" ? { limit: namedView.limit } : {}),
-      ...(typeof namedView.offset === "number" ? { offset: namedView.offset } : {}),
-      ...(typeof namedView.include_body === "boolean" ? { include_body: namedView.include_body } : {}),
-      ...(typeof namedView.frontmatter === "string"
-        ? { frontmatter: namedView.frontmatter as CanonicalQueryInput["frontmatter"] }
-        : {}),
-      ...(typeof input.limit === "number" ? { limit: input.limit } : {}),
-      ...(typeof input.offset === "number" ? { offset: input.offset } : {}),
-    };
-    const result = await this.queryCanonical(query);
-    result.meta.view = { path: viewPath, id: input.view };
-    return result;
-  }
-
-  private async resolveViewRecord(
-    identifier: string,
-  ): Promise<{ path: string; read: ReadResult } | undefined> {
-    const direct = await this.read(identifier);
-    if (!direct.error && direct.frontmatter?.type === "view") {
-      return { path: identifier, read: direct };
-    }
-    for (const candidate of await this.scanFiles()) {
-      const read = await this.read(candidate);
-      if (
-        !read.error &&
-        read.frontmatter?.type === "view" &&
-        read.frontmatter.id === identifier
-      ) {
-        return { path: candidate, read };
-      }
-    }
-    return undefined;
+    return await executeCanonicalView(input, {
+      scanFiles: () => this.scanFiles(),
+      read: (relativePath) => this.read(relativePath),
+      executeQuery: (query) => this.queryCanonical(query),
+    });
   }
 
   private computeQuerySummaries(
@@ -5239,25 +5106,6 @@ fields:
 
     return nonMd;
   }
-}
-
-function canonicalQueryFailure(
-  code: string,
-  message: string,
-  diagnostics?: CanonicalQueryResult["diagnostics"],
-): CanonicalQueryResult {
-  return {
-    results: [],
-    meta: { total_count: 0, has_more: false },
-    diagnostics: diagnostics ?? [{ severity: "error", code, message }],
-    error: { code, message },
-  };
-}
-
-function objectValue(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : {};
 }
 
 export class V03ProfileError extends Error {
