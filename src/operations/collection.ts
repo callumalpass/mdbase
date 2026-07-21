@@ -17,7 +17,7 @@ import {
   MdbaseConfig,
   SUPPORTED_SPEC_VERSION,
 } from "../config/loader.js";
-import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules, V03Migration } from "../types/loader.js";
+import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../types/loader.js";
 import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
@@ -27,6 +27,27 @@ import { parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 import { QueryInput, runQuery } from "./query-engine.js";
+import type {
+  BatchResult,
+  BatchResultDetail,
+  CacheOpResult,
+  CreateResult,
+  DeleteResult,
+  QueryGroupResult,
+  QueryResult,
+  ReadResult,
+  TypeMigrationEntry,
+  UpdateResult,
+  V03CreateInput,
+  V03DeleteInput,
+  V03Diagnostic,
+  V03OperationResult,
+  V03ReadInput,
+  V03RenameInput,
+  V03UpdateInput,
+  V03ValidateInput,
+  ValidateResult,
+} from "./contracts.js";
 import {
   CanonicalQueryInput,
   CanonicalQueryResult,
@@ -46,108 +67,27 @@ import {
   RuntimeValidationResult,
 } from "../runtime/contracts.js";
 
-export interface ReadResult {
-  valid?: boolean;
-  frontmatter?: Record<string, unknown>;
-  rawFrontmatter?: Record<string, unknown>;
-  body?: string | null;
-  types?: string[];
-  file?: Record<string, unknown>;
-  revision?: string;
-  warnings?: Array<{ code: string; message: string }>;
-  error?: { code: string; message: string };
-}
-
-export interface ValidateResult {
-  valid: boolean;
-  issues: MdbaseError[];
-  warnings?: string[];
-  error?: { code: string; message: string };
-}
-
-export interface CreateResult {
-  valid?: boolean;
-  frontmatter?: Record<string, unknown>;
-  body?: string;
-  path?: string;
-  revision?: string;
-  types?: string[];
-  error?: { code: string; message: string };
-}
-
-export interface UpdateResult {
-  valid?: boolean;
-  frontmatter?: Record<string, unknown>;
-  body?: string;
-  path?: string;
-  revision?: string;
-  types?: string[];
-  error?: { code: string; message: string };
-}
-
-export interface DeleteResult {
-  valid?: boolean;
-  broken_links?: Array<{ path: string }>;
-  error?: { code: string; message: string };
-}
-
-export interface QueryGroupResult {
-  key: unknown;
-  results: Array<{
-    path: string;
-    file: Record<string, unknown>;
-    frontmatter: Record<string, unknown>;
-    types: string[];
-    body?: string | null;
-  }>;
-  summaries?: Record<string, unknown>;
-}
-
-export interface QueryResult {
-  results?: Array<{
-    path: string;
-    file: Record<string, unknown>;
-    frontmatter: Record<string, unknown>;
-    types: string[];
-    body?: string | null;
-  }>;
-  groups?: QueryGroupResult[];
-  summaries?: Record<string, unknown>;
-  meta?: {
-    total_count: number;
-    has_more?: boolean;
-  };
-  diagnostics?: Array<Record<string, unknown>>;
-}
-
-export interface BatchResultDetail {
-  path: string;
-  status: "success" | "failed" | "skipped";
-  error?: { code: string; message: string };
-}
-
-export interface BatchResult {
-  batch_result: {
-    total: number;
-    succeeded: number;
-    failed: number;
-    skipped?: number;
-    details: BatchResultDetail[];
-  };
-  broken_links?: Array<{ target: string; referrer: string }>;
-  error?: { code: string; message: string };
-}
-
-export interface CacheOpResult {
-  success: boolean;
-  error?: { code: string; message: string };
-}
-
-export interface TypeMigrationEntry {
-  type: string;
-  source_path?: string;
-  migration: V03Migration;
-}
+export type {
+  BatchResult,
+  BatchResultDetail,
+  CacheOpResult,
+  CreateResult,
+  DeleteResult,
+  QueryGroupResult,
+  QueryResult,
+  ReadResult,
+  TypeMigrationEntry,
+  UpdateResult,
+  V03CreateInput,
+  V03DeleteInput,
+  V03Diagnostic,
+  V03OperationResult,
+  V03ReadInput,
+  V03RenameInput,
+  V03UpdateInput,
+  V03ValidateInput,
+  ValidateResult,
+} from "./contracts.js";
 
 interface BacklinkTokenIndex {
   tokenToSources: Map<string, Set<string>>;
@@ -896,7 +836,7 @@ fields:
           types: [],
           file,
           revision,
-        } as unknown as ReadResult;
+        };
       }
       if (this.config.settings.default_validation === "warn") {
         // At "warn" level: treat as empty with warning
@@ -915,7 +855,7 @@ fields:
           warnings: [{ code: "invalid_frontmatter", message: parsed.error.message }],
           file,
           revision,
-        } as unknown as ReadResult;
+        };
       }
       // At "error" level: return error
       return {
@@ -1622,7 +1562,7 @@ fields:
         valid: false,
         error: { code: "validation_failed", message: "Lifecycle validation failed on create" },
         issues: createLifecycleIssues,
-      } as unknown as CreateResult;
+      };
     }
     const postLifecycleTypes = this.getTypesForFile(input.path ?? "", frontmatter);
     if (this.config.spec_profile === "v0.3" && !sameStringSet(typeNames, postLifecycleTypes)) {
@@ -1800,7 +1740,7 @@ fields:
             valid: false,
             error: { code: "validation_failed", message: "Validation failed on create" },
             issues: valResult.issues,
-          } as unknown as CreateResult;
+          };
         }
       }
       const policyIssues = await this.validateCollectionPoliciesForWrite(relativePath, frontmatter, effectiveFrontmatter, typeNames);
@@ -1809,7 +1749,7 @@ fields:
           valid: false,
           error: { code: "validation_failed", message: "Collection policy validation failed on create" },
           issues: policyIssues,
-        } as unknown as CreateResult;
+        };
       }
     }
     this.applyV03ReadDefaults(effectiveFrontmatter, typeNames);
@@ -1844,7 +1784,7 @@ fields:
     if (await this.fileExists(fullPath)) {
       return {
         error: { code: "path_conflict", message: `File appeared concurrently: ${relativePath}` },
-      } as unknown as CreateResult;
+      };
     }
 
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
@@ -1852,7 +1792,7 @@ fields:
     await this.updateCacheForPath(relativePath);
     this.invalidateRuntimeCaches();
 
-    const result: Record<string, unknown> = {
+    const result: CreateResult = {
       valid: true,
       frontmatter: effectiveFrontmatter,
       body,
@@ -1863,7 +1803,7 @@ fields:
     if (warnings.length > 0) {
       result.warnings = warnings;
     }
-    return result as unknown as CreateResult;
+    return result;
   }
 
   /**
@@ -1932,7 +1872,7 @@ fields:
       return {
         error: { code: "validation_failed", message: "Lifecycle validation failed on update" },
         issues: updateLifecycleIssues,
-      } as unknown as UpdateResult;
+      };
     }
     const postLifecycleTypes = this.getTypesForFile(relativePath, frontmatter);
     if (this.config.spec_profile === "v0.3" && !sameStringSet(types, postLifecycleTypes)) {
@@ -1962,7 +1902,7 @@ fields:
           return {
             error: { code: "validation_failed", message: "Validation failed on update" },
             issues: valResult.issues,
-          } as unknown as UpdateResult;
+          };
         }
       }
 
@@ -1975,7 +1915,7 @@ fields:
         return {
           error: { code: "validation_failed", message: "Collection policy validation failed on update" },
           issues: effectivePolicyIssues,
-        } as unknown as UpdateResult;
+        };
       }
     }
 
@@ -2050,7 +1990,7 @@ fields:
     if (writeMtime !== readMtime) {
       return {
         error: { code: "concurrent_modification", message: `File "${relativePath}" was modified externally during update` },
-      } as unknown as UpdateResult;
+      };
     }
 
     await fs.promises.writeFile(fullPath, content);
@@ -2060,7 +2000,7 @@ fields:
     // Evaluate computed fields on the effective frontmatter for the return value
     this.evaluateComputedFields(effectiveFrontmatter, types, relativePath, body);
 
-    const result: Record<string, unknown> = {
+    const result: UpdateResult = {
       valid: true,
       frontmatter: effectiveFrontmatter,
       body,
@@ -2071,7 +2011,7 @@ fields:
     if (warnings.length > 0) {
       result.warnings = warnings;
     }
-    return result as unknown as UpdateResult;
+    return result;
   }
 
   /**
@@ -5318,59 +5258,6 @@ function objectValue(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : {};
-}
-
-export interface V03Diagnostic {
-  severity: "info" | "warning" | "error";
-  code: string;
-  message: string;
-  path?: string;
-  field?: string;
-  type?: string;
-  schema_location?: string;
-  details?: unknown;
-}
-
-export interface V03OperationResult<T = Record<string, unknown>> {
-  valid: boolean;
-  result: T;
-  diagnostics: V03Diagnostic[];
-}
-
-export interface V03ReadInput {
-  path: string;
-}
-
-export interface V03ValidateInput {
-  path?: string;
-}
-
-export interface V03CreateInput {
-  type?: string;
-  types?: string[];
-  path?: string;
-  frontmatter?: Record<string, unknown>;
-  body?: string;
-}
-
-export interface V03UpdateInput {
-  path: string;
-  fields?: Record<string, unknown>;
-  body?: string;
-  if_revision?: string;
-}
-
-export interface V03DeleteInput {
-  path: string;
-  check_backlinks?: boolean;
-  if_revision?: string;
-}
-
-export interface V03RenameInput {
-  from: string;
-  to: string;
-  update_refs?: boolean;
-  if_revision?: string;
 }
 
 export class V03ProfileError extends Error {
