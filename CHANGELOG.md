@@ -13,6 +13,12 @@
   the installed CLI.
 - Preserve the parsed-file cache across coherent updates and include body links
   in the delete backlink candidate index.
+- Cache compiled CEL programs in a bounded LRU and skip collection-wide
+  uniqueness scans when a write supplies no constrained value.
+- Separate query, structured-filter, link-resolution, filesystem-scanning, and
+  runtime-cache policy from the public collection facade.
+- Add deterministic warm-cache equivalence and focused resolver/scanner/cache
+  stress coverage alongside the packaged E2E suite.
 
 ## 0.3.0-rc.1 - 2026-07-19
 - Publish the first v0.3 release candidate against the registry-hosted mdbase runtime package.

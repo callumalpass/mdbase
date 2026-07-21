@@ -212,6 +212,11 @@ The package ships its machine-readable v0.3 conformance claim under `conformance
 
 - `src/operations/collection.ts` collection facade and operation orchestration
 - `src/operations/contracts.ts` public operation contracts
+- `src/operations/query-engine.ts` legacy query execution
+- `src/operations/canonical-query.ts` canonical v0.3 query and view execution
+- `src/operations/link-resolver.ts` indexed link-resolution policy
+- `src/operations/collection-scanner.ts` filesystem and collection-boundary policy
+- `src/operations/runtime-cache.ts` coherent process-local derived state
 - `src/observability.ts` opt-in structured diagnostics
 - `src/expressions/` query language + evaluation
 - `src/links/` link parsing and body extraction
