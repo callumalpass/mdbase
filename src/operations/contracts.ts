@@ -97,6 +97,66 @@ export interface CacheOpResult {
   error?: OperationError;
 }
 
+export interface CreateInput {
+  type?: string;
+  types?: string[];
+  path?: string;
+  frontmatter?: Record<string, unknown>;
+  body?: string;
+}
+
+export interface UpdateInput {
+  path: string;
+  fields?: Record<string, unknown>;
+  frontmatter?: Record<string, unknown>;
+  body?: string;
+  if_revision?: string;
+}
+
+export interface DeleteOptions {
+  check_backlinks?: boolean;
+  if_revision?: string;
+}
+
+export interface CreateTypeInput {
+  name: string;
+  description?: string;
+  extends?: string;
+  parent?: string;
+  strict?: boolean | "warn";
+  fields?: Record<string, unknown>;
+  path_pattern?: string;
+  filename_pattern?: string;
+}
+
+export interface RenameInput {
+  from: string;
+  to: string;
+  update_refs?: boolean;
+  if_revision?: string;
+}
+
+export interface BatchDeleteInput {
+  where: string;
+  dry_run?: boolean;
+  check_backlinks?: boolean;
+}
+
+export interface BatchUpdateInput {
+  where?: string;
+  fields?: Record<string, unknown>;
+  updates?: Array<{ path: string; fields: Record<string, unknown> }>;
+  dry_run?: boolean;
+}
+
+export interface BackfillInput {
+  type?: string;
+  where?: string | Record<string, unknown>;
+  fields?: string[];
+  apply?: { defaults?: boolean; generated?: boolean };
+  dry_run?: boolean;
+}
+
 export interface TypeMigrationEntry {
   type: string;
   source_path?: string;

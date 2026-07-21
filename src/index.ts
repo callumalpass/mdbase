@@ -7,6 +7,16 @@
 
 export { MdbaseOperationError } from "./errors.js";
 export type { MdbaseError, ValidationResult, ErrorSeverity } from "./errors.js";
+export { OperationObserver } from "./observability.js";
+export type {
+  CollectionOptions,
+  ErrorLogEvent,
+  ErrorLoggingOptions,
+  MdbaseLogEvent,
+  ObservabilityOptions,
+  PerformanceLogEvent,
+  PerformanceLoggingOptions,
+} from "./observability.js";
 export {
   isSupportedV03SpecVersion,
   LEGACY_SPEC_VERSION,

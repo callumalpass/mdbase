@@ -27,17 +27,26 @@ import { parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 import { QueryInput, runQuery } from "./query-engine.js";
+import { CollectionOptions, OperationObserver } from "../observability.js";
 import type {
+  BackfillInput,
+  BatchDeleteInput,
   BatchResult,
   BatchResultDetail,
+  BatchUpdateInput,
   CacheOpResult,
+  CreateInput,
   CreateResult,
+  CreateTypeInput,
+  DeleteOptions,
   DeleteResult,
   QueryGroupResult,
   QueryResult,
   ReadResult,
+  RenameInput,
   TypeMigrationEntry,
   UpdateResult,
+  UpdateInput,
   V03CreateInput,
   V03DeleteInput,
   V03Diagnostic,
@@ -131,6 +140,7 @@ export class Collection {
   private cachedFileCache: Map<string, ReadResult> | null;
   private cachedFileCacheFiles: string[] | null;
   private cachedBacklinkTokenIndex: BacklinkTokenIndex | null;
+  private readonly observer: OperationObserver;
 
   /**
    * Hook called after reading a file but before writing.
@@ -153,6 +163,7 @@ export class Collection {
     private root: string,
     config: MdbaseConfig,
     typeDefs: Map<string, TypeDefinition>,
+    options: CollectionOptions = {},
   ) {
     this.config = config;
     this.typeDefs = typeDefs;
@@ -178,6 +189,7 @@ export class Collection {
     this.cachedFileCache = null;
     this.cachedFileCacheFiles = null;
     this.cachedBacklinkTokenIndex = null;
+    this.observer = new OperationObserver(options.observability);
   }
 
   /** Return the canonical v0.3 operation surface for this collection. */
@@ -237,7 +249,23 @@ export class Collection {
     return true;
   }
 
-  static async init(collectionRoot: string, input?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  static async init(
+    collectionRoot: string,
+    input?: Record<string, unknown>,
+    options: CollectionOptions = {},
+  ): Promise<Record<string, unknown>> {
+    const observer = new OperationObserver(options.observability);
+    return await observer.trace(
+      "collection.init",
+      { root: path.resolve(collectionRoot) },
+      () => this.initUnobserved(collectionRoot, input),
+    );
+  }
+
+  private static async initUnobserved(
+    collectionRoot: string,
+    input?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const suppliedConfig = input?.config;
     if (suppliedConfig !== undefined && !isPlainObject(suppliedConfig)) {
       throw new Error("config must be a mapping");
@@ -433,24 +461,35 @@ fields:
     };
   }
 
-  static async open(collectionRoot: string): Promise<{ collection?: Collection; error?: { code: string; message: string } }> {
-    const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
-    if (!configResult.valid || !configResult.config) {
-      return { error: configResult.error };
-    }
+  static async open(
+    collectionRoot: string,
+    options: CollectionOptions = {},
+  ): Promise<{ collection?: Collection; error?: { code: string; message: string } }> {
+    const observer = new OperationObserver(options.observability);
+    return await observer.trace(
+      "collection.open",
+      { root: path.resolve(collectionRoot) },
+      async () => {
+        const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
+        if (!configResult.valid || !configResult.config) {
+          return { error: configResult.error };
+        }
 
-    const typesResult = await loadTypesAsync(collectionRoot, configResult.config);
-    if (!typesResult.valid) {
-      return { error: typesResult.error };
-    }
+        const typesResult = await loadTypesAsync(collectionRoot, configResult.config);
+        if (!typesResult.valid) {
+          return { error: typesResult.error };
+        }
 
-    const collection = new Collection(
-      collectionRoot,
-      configResult.config,
-      typesResult.types!,
+        const collection = new Collection(
+          collectionRoot,
+          configResult.config,
+          typesResult.types!,
+          options,
+        );
+        await collection.initCache();
+        return { collection };
+      },
     );
-    await collection.initCache();
-    return { collection };
   }
 
   private async initCache(): Promise<void> {
@@ -504,13 +543,6 @@ fields:
    * Get the file types declared explicitly in frontmatter.
    */
   private getExplicitTypes(frontmatter: Record<string, unknown>): string[] | null {
-    // In the canonical view schema, `types` is the query scope rather than a
-    // record type declaration. The record itself is always selected by its
-    // singular `type: view` discriminator.
-    if (this.config.spec_profile === "v0.3" && frontmatter.type === "view") {
-      return ["view"];
-    }
-
     // Check array-valued keys first (types takes precedence over type)
     for (const key of this.config.settings.explicit_type_keys) {
       if (key in frontmatter) {
@@ -739,6 +771,14 @@ fields:
    * Read a file from the collection.
    */
   async read(relativePath: string): Promise<ReadResult> {
+    return await this.observer.trace(
+      "collection.read",
+      { path: relativePath },
+      () => this.readUnobserved(relativePath),
+    );
+  }
+
+  private async readUnobserved(relativePath: string): Promise<ReadResult> {
     if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
@@ -1115,6 +1155,14 @@ fields:
    * Validate a single file or the entire collection.
    */
   async validate(relativePath?: string): Promise<ValidateResult> {
+    return await this.observer.trace(
+      "collection.validate",
+      { path: relativePath },
+      () => this.validateUnobserved(relativePath),
+    );
+  }
+
+  private async validateUnobserved(relativePath?: string): Promise<ValidateResult> {
     if (relativePath) {
       return await this.validateFile(relativePath);
     }
@@ -1344,6 +1392,14 @@ fields:
   }
 
   async loadRuntimeContracts(options: LoadRuntimeContractsOptions = {}): Promise<RuntimePackage> {
+    return await this.observer.trace(
+      "collection.load_runtime_contracts",
+      { include_type_files: options.includeTypeFiles },
+      () => this.loadRuntimeContractsUnobserved(options),
+    );
+  }
+
+  private async loadRuntimeContractsUnobserved(options: LoadRuntimeContractsOptions): Promise<RuntimePackage> {
     const records: RuntimeMarkdownRecord[] = [];
 
     if (options.includeTypeFiles !== false) {
@@ -1388,6 +1444,14 @@ fields:
   }
 
   async getRuntimeRegistry(options: LoadRuntimeContractsOptions = {}): Promise<RuntimeRegistry> {
+    return await this.observer.trace(
+      "collection.get_runtime_registry",
+      {},
+      () => this.getRuntimeRegistryUnobserved(options),
+    );
+  }
+
+  private async getRuntimeRegistryUnobserved(options: LoadRuntimeContractsOptions): Promise<RuntimeRegistry> {
     const runtimePackage = await this.loadRuntimeContracts(options);
     const selectedPath = typeof this.config.runtime?.policy === "string"
       ? this.config.runtime.policy.replace(/\\/g, "/").replace(/^\.\//, "")
@@ -1407,6 +1471,16 @@ fields:
 
   async preflightRuntimeWorkflows(
     options: LoadRuntimeContractsOptions = {},
+  ): Promise<RuntimeValidationResult> {
+    return await this.observer.trace(
+      "collection.preflight_runtime_workflows",
+      {},
+      () => this.preflightRuntimeWorkflowsUnobserved(options),
+    );
+  }
+
+  private async preflightRuntimeWorkflowsUnobserved(
+    options: LoadRuntimeContractsOptions,
   ): Promise<RuntimeValidationResult> {
     const registry = await this.getRuntimeRegistry(options);
     return preflightRuntimeWorkflows(registry);
@@ -1516,13 +1590,15 @@ fields:
   /**
    * Create a new file in the collection.
    */
-  async create(input: {
-    type?: string;
-    types?: string[];
-    path?: string;
-    frontmatter?: Record<string, unknown>;
-    body?: string;
-  }): Promise<CreateResult> {
+  async create(input: CreateInput): Promise<CreateResult> {
+    return await this.observer.trace(
+      "collection.create",
+      { path: input.path, type: input.type, type_count: input.types?.length },
+      () => this.createUnobserved(input),
+    );
+  }
+
+  private async createUnobserved(input: CreateInput): Promise<CreateResult> {
     // Determine types from input parameters or frontmatter
     const typeNames: string[] = [];
     if (input.type) typeNames.push(input.type.toLowerCase());
@@ -1816,12 +1892,15 @@ fields:
   /**
    * Update an existing file in the collection.
    */
-  async update(input: {
-    path: string;
-    fields?: Record<string, unknown>;
-    body?: string;
-    if_revision?: string;
-  }): Promise<UpdateResult> {
+  async update(input: UpdateInput): Promise<UpdateResult> {
+    return await this.observer.trace(
+      "collection.update",
+      { path: input.path, field_count: Object.keys(input.fields ?? input.frontmatter ?? {}).length },
+      () => this.updateUnobserved(input),
+    );
+  }
+
+  private async updateUnobserved(input: UpdateInput): Promise<UpdateResult> {
     const relativePath = input.path;
     if (this.isInvalidRelativePath(relativePath)) {
       return {
@@ -1852,8 +1931,9 @@ fields:
     const frontmatter: Record<string, unknown> = { ...existing.frontmatter };
 
     // Apply field updates
-    if (input.fields) {
-      Object.assign(frontmatter, input.fields);
+    const updates = input.fields ?? input.frontmatter;
+    if (updates) {
+      Object.assign(frontmatter, updates);
     }
 
     // Determine types
@@ -2024,7 +2104,15 @@ fields:
   /**
    * Delete a file from the collection.
    */
-  async delete(relativePath: string, input?: { check_backlinks?: boolean; if_revision?: string }): Promise<DeleteResult> {
+  async delete(relativePath: string, input?: DeleteOptions): Promise<DeleteResult> {
+    return await this.observer.trace(
+      "collection.delete",
+      { path: relativePath, check_backlinks: input?.check_backlinks },
+      () => this.deleteUnobserved(relativePath, input),
+    );
+  }
+
+  private async deleteUnobserved(relativePath: string, input?: DeleteOptions): Promise<DeleteResult> {
     if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
@@ -2078,15 +2166,15 @@ fields:
   /**
    * Create a new type definition file.
    */
-  async createType(input: {
-    name: string;
-    description?: string;
-    extends?: string;
-    parent?: string;
-    strict?: boolean | "warn";
-    fields?: Record<string, unknown>;
-    path_pattern?: string;
-  }): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
+  async createType(input: CreateTypeInput): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
+    return await this.observer.trace(
+      "collection.create_type",
+      { type: input.name },
+      () => this.createTypeUnobserved(input),
+    );
+  }
+
+  private async createTypeUnobserved(input: CreateTypeInput): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
     const name = input.name.toLowerCase();
 
     // Validate type name
@@ -2160,7 +2248,8 @@ fields:
     if (parentType) typeFrontmatter.extends = parentType;
     if (input.strict !== undefined) typeFrontmatter.strict = input.strict;
     if (input.fields) typeFrontmatter.fields = input.fields;
-    if (input.path_pattern) typeFrontmatter.path_pattern = input.path_pattern;
+    const pathPattern = input.path_pattern ?? input.filename_pattern;
+    if (pathPattern) typeFrontmatter.path_pattern = pathPattern;
 
     // Write the type file
     const typesFolder = path.join(this.root, this.config.settings.types_folder);
@@ -2195,12 +2284,15 @@ fields:
   /**
    * Rename/move a file in the collection, optionally updating references.
    */
-  async rename(input: {
-    from: string;
-    to: string;
-    update_refs?: boolean;
-    if_revision?: string;
-  }): Promise<Record<string, unknown>> {
+  async rename(input: RenameInput): Promise<Record<string, unknown>> {
+    return await this.observer.trace(
+      "collection.rename",
+      { from: input.from, to: input.to, update_refs: input.update_refs },
+      () => this.renameUnobserved(input),
+    );
+  }
+
+  private async renameUnobserved(input: RenameInput): Promise<Record<string, unknown>> {
     const fromPath = path.join(this.root, input.from);
     const toPath = path.join(this.root, input.to);
 
@@ -2799,6 +2891,14 @@ fields:
    * Query the collection.
    */
   async query(input: QueryInput): Promise<QueryResult & { error?: { code: string; message: string } }> {
+    return await this.observer.trace(
+      "collection.query",
+      { limit: input.limit, offset: input.offset, type_count: input.types?.length },
+      () => this.queryUnobserved(input),
+    );
+  }
+
+  private async queryUnobserved(input: QueryInput): Promise<QueryResult & { error?: { code: string; message: string } }> {
     const resolutionIndexByCache = new WeakMap<Map<string, IndexedReadResult>, LinkResolutionIndex>();
     const result = await runQuery(input, {
       typeDefs: this.typeDefs,
@@ -2854,6 +2954,14 @@ fields:
 
   /** Execute the strict portable v0.3 query-object contract. */
   async queryCanonical(input: CanonicalQueryInput): Promise<CanonicalQueryResult> {
+    return await this.observer.trace(
+      "collection.query_canonical",
+      { limit: input.limit, offset: input.offset, type_count: input.types?.length },
+      () => this.queryCanonicalUnobserved(input),
+    );
+  }
+
+  private async queryCanonicalUnobserved(input: CanonicalQueryInput): Promise<CanonicalQueryResult> {
     return await executeCanonicalQuery(input, {
       typeDefs: this.typeDefs,
       scanFiles: () => this.scanFiles(),
@@ -2867,6 +2975,14 @@ fields:
 
   /** Resolve and execute an ordinary `type: view` Markdown record. */
   async executeView(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
+    return await this.observer.trace(
+      "collection.execute_view",
+      { path: input.path, view: input.view, render: input.render },
+      () => this.executeViewUnobserved(input),
+    );
+  }
+
+  private async executeViewUnobserved(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
     return await executeCanonicalView(input, {
       scanFiles: () => this.scanFiles(),
       read: (relativePath) => this.read(relativePath),
@@ -3255,11 +3371,15 @@ fields:
   /**
    * Batch delete: delete all files matching a where expression.
    */
-  async batchDelete(input: {
-    where: string;
-    dry_run?: boolean;
-    check_backlinks?: boolean;
-  }): Promise<BatchResult> {
+  async batchDelete(input: BatchDeleteInput): Promise<BatchResult> {
+    return await this.observer.trace(
+      "collection.batch_delete",
+      { dry_run: input.dry_run, check_backlinks: input.check_backlinks },
+      () => this.batchDeleteUnobserved(input),
+    );
+  }
+
+  private async batchDeleteUnobserved(input: BatchDeleteInput): Promise<BatchResult> {
     // Find matching files
     const files = await this.scanFiles();
     const fileCache = await this.buildFileCache(files);
@@ -3355,12 +3475,15 @@ fields:
    *   1. where + fields: update all matching files with the same fields
    *   2. updates[]: array of {path, fields} for per-file updates
    */
-  async batchUpdate(input: {
-    where?: string;
-    fields?: Record<string, unknown>;
-    updates?: Array<{ path: string; fields: Record<string, unknown> }>;
-    dry_run?: boolean;
-  }): Promise<BatchResult> {
+  async batchUpdate(input: BatchUpdateInput): Promise<BatchResult> {
+    return await this.observer.trace(
+      "collection.batch_update",
+      { dry_run: input.dry_run, update_count: input.updates?.length },
+      () => this.batchUpdateUnobserved(input),
+    );
+  }
+
+  private async batchUpdateUnobserved(input: BatchUpdateInput): Promise<BatchResult> {
     // Mode 1: updates array (pre-validation all-or-nothing)
     if (input.updates) {
       return await this.batchUpdateByList(input.updates, input.dry_run);
@@ -3664,13 +3787,15 @@ fields:
   /**
    * Backfill defaults and/or generated fields for matching files.
    */
-  async backfill(input: {
-    type?: string;
-    where?: string | Record<string, unknown>;
-    fields?: string[];
-    apply?: { defaults?: boolean; generated?: boolean };
-    dry_run?: boolean;
-  }): Promise<BatchResult> {
+  async backfill(input: BackfillInput): Promise<BatchResult> {
+    return await this.observer.trace(
+      "collection.backfill",
+      { type: input.type, dry_run: input.dry_run, field_count: input.fields?.length },
+      () => this.backfillUnobserved(input),
+    );
+  }
+
+  private async backfillUnobserved(input: BackfillInput): Promise<BatchResult> {
     const applyDefaults = input.apply?.defaults !== false;
     const applyGenerated = input.apply?.generated !== false;
     const typeName = input.type ? String(input.type).toLowerCase() : undefined;
@@ -3984,6 +4109,14 @@ fields:
    * Run a migration manifest by id.
    */
   async migrate(input: { id?: string; dry_run?: boolean }): Promise<Record<string, unknown>> {
+    return await this.observer.trace(
+      "collection.migrate",
+      { migration: input.id, dry_run: input.dry_run },
+      () => this.migrateUnobserved(input),
+    );
+  }
+
+  private async migrateUnobserved(input: { id?: string; dry_run?: boolean }): Promise<Record<string, unknown>> {
     if (!input.id) {
       return { error: { code: "invalid_request", message: "migrate requires id" } };
     }
@@ -4075,6 +4208,14 @@ fields:
    * Rebuild cache from disk.
    */
   async cacheRebuild(): Promise<CacheOpResult> {
+    return await this.observer.trace(
+      "collection.cache_rebuild",
+      {},
+      () => this.cacheRebuildUnobserved(),
+    );
+  }
+
+  private async cacheRebuildUnobserved(): Promise<CacheOpResult> {
     if (!this.cache) {
       return { success: false, error: { code: "cache_unavailable", message: "Cache store is unavailable" } };
     }
@@ -4098,6 +4239,14 @@ fields:
    * Clear cache from disk.
    */
   async cacheClear(): Promise<CacheOpResult> {
+    return await this.observer.trace(
+      "collection.cache_clear",
+      {},
+      () => this.cacheClearUnobserved(),
+    );
+  }
+
+  private async cacheClearUnobserved(): Promise<CacheOpResult> {
     if (!this.cache) {
       return { success: true };
     }
@@ -4108,6 +4257,14 @@ fields:
   }
 
   async close(): Promise<void> {
+    return await this.observer.trace(
+      "collection.close",
+      {},
+      () => this.closeUnobserved(),
+    );
+  }
+
+  private async closeUnobserved(): Promise<void> {
     if (!this.cache) return;
     try {
       await this.cache.close();
@@ -4836,6 +4993,14 @@ fields:
    * Returns one entry per source file (deduplicated).
    */
   async computeBacklinksForFile(targetPath: string): Promise<BacklinkEntry[]> {
+    return await this.observer.trace(
+      "collection.compute_backlinks",
+      { path: targetPath },
+      () => this.computeBacklinksForFileUnobserved(targetPath),
+    );
+  }
+
+  private async computeBacklinksForFileUnobserved(targetPath: string): Promise<BacklinkEntry[]> {
     const files = await this.scanFiles();
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);

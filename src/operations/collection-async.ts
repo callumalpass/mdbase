@@ -1,4 +1,5 @@
 import { Collection } from "./collection.js";
+import type { CollectionOptions } from "../observability.js";
 import type {
   ReadResult,
   ValidateResult,
@@ -17,8 +18,11 @@ export class CollectionAsync {
     this.inner = collection;
   }
 
-  static async open(collectionRoot: string): Promise<{ collection?: CollectionAsync; error?: { code: string; message: string } }> {
-    const result = await Collection.open(collectionRoot);
+  static async open(
+    collectionRoot: string,
+    options: CollectionOptions = {},
+  ): Promise<{ collection?: CollectionAsync; error?: { code: string; message: string } }> {
+    const result = await Collection.open(collectionRoot, options);
     if (!result.collection) return { error: result.error };
     return { collection: new CollectionAsync(result.collection) };
   }

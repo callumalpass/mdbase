@@ -7,6 +7,7 @@
 - Add headless execution of ordinary Markdown view records and advertise the
   optional `view_records` feature.
 - Bundle the canonical query and view schemas with generated v0.3 artifacts.
+- Add opt-in structured performance and error logging for collection operations.
 
 ## 0.3.0-rc.1 - 2026-07-19
 - Publish the first v0.3 release candidate against the registry-hosted mdbase runtime package.
