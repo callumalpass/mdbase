@@ -62,6 +62,7 @@ export type {
   SavedNamedViewDescriptor,
   SavedViewDescriptor,
   SavedViewListResult,
+  SavedViewPropertyDescriptor,
   SavedViewSourceDescriptor,
 } from "./operations/canonical-query.js";
 export { migrateV02TypeFileToV03, migrateV02TypeToV03, renderV03TypeFile } from "./migrations/type-migration.js";
