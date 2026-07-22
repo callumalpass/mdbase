@@ -930,7 +930,7 @@ fields:
             const previous = assignments.get(fieldPath)!;
             if (JSON.stringify(previous.value) !== JSON.stringify(value)) {
               issues.push({
-                code: "type_conflict",
+                code: "lifecycle_conflict",
                 message: `Conflicting lifecycle assignments for "${fieldPath}": ${previous.lifecyclePath} and ${lifecyclePath}`,
                 field: fieldPath,
                 type: `${previous.typeName},${typeName}`,
