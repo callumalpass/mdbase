@@ -1,6 +1,11 @@
 import { Ajv2020 } from "ajv/dist/2020.js";
+import { createHash } from "node:crypto";
 
-import { evaluateMdbaseCel } from "../expressions/cel.js";
+import {
+  collectMdbaseCelProjectionReferences,
+  evaluateMdbaseCel,
+  validateMdbaseCelSyntax,
+} from "../expressions/cel.js";
 import { querySchema, viewSchema } from "../generated/v03-schemas.js";
 import type { TypeDefinition } from "../types/loader.js";
 import type { IndexedReadResult } from "./link-index.js";
@@ -43,6 +48,32 @@ export interface ExecuteViewInput {
   limit?: number;
   offset?: number;
   render?: boolean;
+}
+
+export interface SavedViewSourceDescriptor {
+  path: string;
+  format: "mdbase.view" | (string & {});
+  revision: string;
+  writable: boolean;
+}
+
+export interface SavedNamedViewDescriptor {
+  id: string;
+  name: string;
+  presentation?: Record<string, unknown>;
+}
+
+export interface SavedViewDescriptor {
+  id: string;
+  name: string;
+  source: SavedViewSourceDescriptor;
+  views: SavedNamedViewDescriptor[];
+}
+
+export interface SavedViewListResult {
+  views: SavedViewDescriptor[];
+  meta: { total_count: number };
+  diagnostics: CanonicalDiagnostic[];
 }
 
 export interface CanonicalDiagnostic {
@@ -90,6 +121,7 @@ export interface CanonicalQueryDeps {
 export interface CanonicalViewDeps {
   scanFiles: () => Promise<string[]>;
   read: (relativePath: string) => Promise<IndexedReadResult>;
+  buildFileCache?: (files: string[]) => Promise<Map<string, IndexedReadResult>>;
   executeQuery: (input: CanonicalQueryInput) => Promise<CanonicalQueryResult>;
 }
 
@@ -140,6 +172,63 @@ export function validateCanonicalViewRecord(
   }];
 }
 
+/** Discover valid canonical view records in deterministic source order. */
+export async function listCanonicalViews(
+  deps: Pick<CanonicalViewDeps, "scanFiles" | "read" | "buildFileCache">,
+): Promise<SavedViewListResult> {
+  const files = (await deps.scanFiles()).slice().sort((left, right) => left.localeCompare(right));
+  const fileCache = deps.buildFileCache
+    ? await deps.buildFileCache(files)
+    : await buildFileCache(files, deps.read);
+  const views: SavedViewDescriptor[] = [];
+  const diagnostics: CanonicalDiagnostic[] = [];
+
+  for (const path of files) {
+    const read = fileCache.get(path);
+    if (!read || read.error || !isViewRecord(read)) continue;
+    const frontmatter = read.frontmatter ?? {};
+    const invalid = validateCanonicalViewRecord(frontmatter, path);
+    const namedViews = Array.isArray(frontmatter.views)
+      ? frontmatter.views as Array<Record<string, unknown>>
+      : [];
+    const ids = namedViews.map((view) => String(view.id));
+    if (new Set(ids).size !== ids.length) {
+      invalid.push({
+        severity: "error",
+        code: "invalid_view",
+        message: `View record "${path}" contains duplicate named-view IDs`,
+        path,
+        field: "views",
+      });
+    }
+    if (invalid.length > 0) {
+      diagnostics.push(...invalid.map((diagnostic) => ({
+        ...diagnostic,
+        severity: "warning" as const,
+      })));
+      continue;
+    }
+    views.push({
+      id: String(frontmatter.id),
+      name: String(frontmatter.name),
+      source: {
+        path,
+        format: "mdbase.view",
+        revision: read.revision ?? fallbackViewRevision(read),
+        writable: true,
+      },
+      views: namedViews.map((view) => ({
+        id: String(view.id),
+        name: String(view.name),
+        ...(isObject(view.presentation)
+          ? { presentation: structuredClone(view.presentation) }
+          : {}),
+      })),
+    });
+  }
+  return { views, meta: { total_count: views.length }, diagnostics };
+}
+
 /** Resolve and execute an ordinary `type: view` Markdown record. */
 export async function executeCanonicalView(
   input: ExecuteViewInput,
@@ -174,7 +263,7 @@ export async function executeCanonicalView(
     );
   }
 
-  if (input.render === true && namedView.presentation) {
+  if (input.render === true) {
     return failedView(
       "unsupported_presentation",
       "The collection library provides headless execution only",
@@ -242,12 +331,12 @@ async function resolveViewRecord(
   deps: Pick<CanonicalViewDeps, "read" | "scanFiles">,
 ): Promise<{ path: string; read: IndexedReadResult } | undefined> {
   const direct = await deps.read(identifier);
-  if (!direct.error && direct.frontmatter?.type === "view") {
+  if (!direct.error && isViewRecord(direct)) {
     return { path: identifier, read: direct };
   }
   for (const candidate of await deps.scanFiles()) {
     const read = await deps.read(candidate);
-    if (!read.error && read.frontmatter?.type === "view" && read.frontmatter.id === identifier) {
+    if (!read.error && isViewRecord(read) && read.frontmatter?.id === identifier) {
       return { path: candidate, read };
     }
   }
@@ -261,6 +350,9 @@ function resolveContextPath(
 ): { path?: string; error?: CanonicalQueryResult } {
   if (input.context && typeof input.context.path === "string") {
     return { path: input.context.path };
+  }
+  if (Object.prototype.hasOwnProperty.call(input, "context") && input.context === null) {
+    return {};
   }
 
   const onMissing = typeof declaration.on_missing === "string" ? declaration.on_missing : "view";
@@ -325,6 +417,9 @@ export async function executeCanonicalQuery(
 ): Promise<CanonicalQueryResult> {
   const schemaDiagnostics = validateCanonicalQueryInput(input);
   if (schemaDiagnostics.length > 0) return failedQuery(schemaDiagnostics);
+
+  const expressionDiagnostics = validateQueryExpressions(input);
+  if (expressionDiagnostics.length > 0) return failedQuery(expressionDiagnostics);
 
   const selectionError = validateSelectionNames(input.select);
   if (selectionError) return failedQuery([selectionError]);
@@ -494,6 +589,21 @@ function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
 
+function isViewRecord(read: IndexedReadResult): boolean {
+  return (read.types ?? []).some((type) => type.toLowerCase() === "view");
+}
+
+function fallbackViewRevision(read: IndexedReadResult): string {
+  // A deterministic fallback keeps dependency-level use useful. Collection
+  // reads supply the opaque raw-byte revision used for concurrency control.
+  return createHash("sha256")
+    .update(canonicalJson({
+      frontmatter: read.rawFrontmatter ?? read.frontmatter ?? {},
+      body: read.body ?? "",
+    }))
+    .digest("hex");
+}
+
 async function readContext(
   path: string,
   deps: CanonicalQueryDeps,
@@ -589,8 +699,8 @@ function orderProjectionNames(
   const dependencies = new Map<string, Set<string>>();
   for (const [name, definition] of Object.entries(projections)) {
     const refs = new Set<string>();
-    for (const match of definition.expr.matchAll(/\bprojection\.([A-Za-z_][A-Za-z0-9_:-]*)\b/g)) {
-      if (nameSet.has(match[1])) refs.add(match[1]);
+    for (const reference of collectMdbaseCelProjectionReferences(definition.expr)) {
+      if (nameSet.has(reference)) refs.add(reference);
     }
     dependencies.set(name, refs);
   }
@@ -623,6 +733,35 @@ function orderProjectionNames(
     }
   }
   return { names: ordered };
+}
+
+function validateQueryExpressions(input: CanonicalQueryInput): CanonicalDiagnostic[] {
+  const expressions: Array<{ expression: string; field: string }> = [];
+  for (const [name, projection] of Object.entries(input.projections ?? {})) {
+    expressions.push({ expression: projection.expr, field: `projections.${name}.expr` });
+  }
+  if (input.where !== undefined) expressions.push({ expression: input.where, field: "where" });
+  for (const [index, selection] of (input.select ?? []).entries()) {
+    if (typeof selection !== "string") {
+      expressions.push({ expression: selection.expr, field: `select.${index}.expr` });
+    }
+  }
+  for (const [name, summary] of Object.entries(input.summary_functions ?? {})) {
+    expressions.push({ expression: summary.expr, field: `summary_functions.${name}.expr` });
+  }
+  const diagnostics: CanonicalDiagnostic[] = [];
+  for (const { expression, field } of expressions) {
+    for (const diagnostic of validateMdbaseCelSyntax(expression)) {
+      diagnostics.push({
+        severity: "error",
+        code: "invalid_query",
+        message: diagnostic.message,
+        field,
+        details: { expression_code: diagnostic.code },
+      });
+    }
+  }
+  return diagnostics;
 }
 
 function validateSelectionNames(

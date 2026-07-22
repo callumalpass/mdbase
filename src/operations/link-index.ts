@@ -10,6 +10,7 @@ export interface IndexedReadResult {
   types?: string[];
   body?: string | null;
   file?: Record<string, unknown>;
+  revision?: string;
   error?: { code: string; message: string };
 }
 

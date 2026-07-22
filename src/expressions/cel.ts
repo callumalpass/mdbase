@@ -141,6 +141,61 @@ export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext)
   }
 }
 
+/** Parse a CEL expression without evaluating it against an arbitrary record. */
+export function validateMdbaseCelSyntax(expression: string): MdbaseCelDiagnostic[] {
+  try {
+    parse(expression);
+    return [];
+  } catch (error) {
+    return [{
+      code: "expression_parse_error",
+      message: error instanceof Error ? error.message : "CEL expression could not be parsed",
+      expression,
+    }];
+  }
+}
+
+/** Return named-projection references from the parsed CEL syntax tree. */
+export function collectMdbaseCelProjectionReferences(expression: string): Set<string> {
+  const parsed = parse(expression) as unknown;
+  const references = new Set<string>();
+  walkCelObjects(parsed, (node) => {
+    if (node.$typeName !== "cel.expr.Expr") return;
+    const kind = objectValue(node.exprKind);
+    if (kind.case === "selectExpr") {
+      const selection = objectValue(kind.value);
+      const operand = objectValue(selection.operand);
+      const operandKind = objectValue(operand.exprKind);
+      const identifier = objectValue(operandKind.value);
+      if (operandKind.case === "identExpr" && identifier.name === "projection") {
+        if (typeof selection.field === "string") references.add(selection.field);
+      }
+      return;
+    }
+    if (kind.case === "callExpr") {
+      const call = objectValue(kind.value);
+      const args = Array.isArray(call.args) ? call.args.map(objectValue) : [];
+      if (call.function === "_[_]" && args.length >= 2) {
+        const objectKind = objectValue(args[0].exprKind);
+        const identifier = objectValue(objectKind.value);
+        const keyKind = objectValue(args[1].exprKind);
+        const constant = objectValue(keyKind.value);
+        const constantKind = objectValue(constant.constantKind);
+        if (
+          objectKind.case === "identExpr" &&
+          identifier.name === "projection" &&
+          keyKind.case === "constExpr" &&
+          constantKind.case === "stringValue" &&
+          typeof constantKind.value === "string"
+        ) {
+          references.add(constantKind.value);
+        }
+      }
+    }
+  });
+  return references;
+}
+
 export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string, unknown> {
   const record = context.record ?? {};
   const raw = context.raw ?? record;
@@ -198,4 +253,26 @@ function normalizeCelValue(value: CelValue): unknown {
 
 function isObjectWithRaw(value: unknown): value is { raw: string } {
   return typeof value === "object" && value !== null && "raw" in value && typeof (value as { raw?: unknown }).raw === "string";
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function walkCelObjects(
+  value: unknown,
+  visit: (value: Record<string, unknown>) => void,
+  seen = new Set<object>(),
+): void {
+  if (typeof value !== "object" || value === null || seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) walkCelObjects(item, visit, seen);
+    return;
+  }
+  const object = value as Record<string, unknown>;
+  visit(object);
+  for (const child of Object.values(object)) walkCelObjects(child, visit, seen);
 }

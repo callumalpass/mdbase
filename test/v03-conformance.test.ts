@@ -256,6 +256,17 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
         }
       });
 
+    case "list_views":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const result = await collection.v03Operations().listViews();
+          return adapterResult(result, result.result as Dict);
+        } finally {
+          await collection.close();
+        }
+      });
+
     case "create":
       return await withOperationRoot(context, input, async (root) => {
         const collection = await open(root);
@@ -942,6 +953,9 @@ async function assertExpectation(actual: Dict, expected: Dict, testName: string,
     (expected.results as Dict[]).forEach((expectedResult, index) => {
       assertSubset(actualResults?.[index], expectedResult, `${testName}: results[${index}]`);
     });
+  }
+  if (expected.views) {
+    assertSubset(actual.views, expected.views, `${testName}: views`);
   }
   if (expected.paths) {
     expect(actual.paths, `${testName}: paths`).toEqual(expected.paths);

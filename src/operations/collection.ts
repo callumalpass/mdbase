@@ -61,8 +61,10 @@ import {
   CanonicalQueryInput,
   CanonicalQueryResult,
   ExecuteViewInput,
+  SavedViewListResult,
   executeCanonicalQuery,
   executeCanonicalView,
+  listCanonicalViews,
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
@@ -2814,6 +2816,22 @@ fields:
     });
   }
 
+  /** Discover valid canonical saved-view records. */
+  async listViews(): Promise<SavedViewListResult> {
+    return await this.observer.trace(
+      "collection.list_views",
+      {},
+      async () => await listCanonicalViews({
+        scanFiles: () => this.scanFiles(),
+        read: (relativePath) => this.read(relativePath),
+        buildFileCache: async (files) => {
+          const built = await this.buildFileCache(files);
+          return built as Map<string, IndexedReadResult>;
+        },
+      }),
+    );
+  }
+
   /** Resolve and execute an ordinary `type: view` Markdown record. */
   async executeView(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
     return await this.observer.trace(
@@ -2827,6 +2845,10 @@ fields:
     return await executeCanonicalView(input, {
       scanFiles: () => this.scanFiles(),
       read: (relativePath) => this.read(relativePath),
+      buildFileCache: async (files) => {
+        const built = await this.buildFileCache(files);
+        return built as Map<string, IndexedReadResult>;
+      },
       executeQuery: (query) => this.queryCanonical(query),
     });
   }
@@ -4581,6 +4603,15 @@ export class V03Operations {
 
   async query(input: CanonicalQueryInput): Promise<V03OperationResult> {
     return canonicalQueryOperationResult(await this.collection.queryCanonical(input));
+  }
+
+  async listViews(): Promise<V03OperationResult> {
+    const listed = await this.collection.listViews();
+    return {
+      valid: !listed.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+      result: { views: listed.views, meta: listed.meta },
+      diagnostics: listed.diagnostics,
+    };
   }
 
   async executeView(input: ExecuteViewInput): Promise<V03OperationResult> {
