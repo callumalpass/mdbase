@@ -60,7 +60,16 @@ export interface SavedViewSourceDescriptor {
 export interface SavedNamedViewDescriptor {
   id: string;
   name: string;
+  properties: SavedViewPropertyDescriptor[];
   presentation?: Record<string, unknown>;
+}
+
+export interface SavedViewPropertyDescriptor {
+  key: string;
+  label?: string;
+  description?: string;
+  format?: string;
+  hidden?: boolean;
 }
 
 export interface SavedViewDescriptor {
@@ -220,6 +229,7 @@ export async function listCanonicalViews(
       views: namedViews.map((view) => ({
         id: String(view.id),
         name: String(view.name),
+        properties: canonicalViewProperties(frontmatter, view),
         ...(isObject(view.presentation)
           ? { presentation: structuredClone(view.presentation) }
           : {}),
@@ -227,6 +237,46 @@ export async function listCanonicalViews(
     });
   }
   return { views, meta: { total_count: views.length }, diagnostics };
+}
+
+function canonicalViewProperties(
+  record: Record<string, unknown>,
+  view: Record<string, unknown>,
+): SavedViewPropertyDescriptor[] {
+  if (!Array.isArray(view.select)) return [];
+  const metadata = objectValue(record.properties);
+  return view.select.flatMap((selection) => {
+    if (typeof selection === "string") {
+      return [propertyDescriptor(selectionName(selection), metadata[selection] ?? metadata[selectionName(selection)])];
+    }
+    if (!isObject(selection) || typeof selection.name !== "string") return [];
+    return [propertyDescriptor(selection.name, metadata[selection.name], selection)];
+  });
+}
+
+function propertyDescriptor(
+  key: string,
+  metadataValue: unknown,
+  selection?: Record<string, unknown>,
+): SavedViewPropertyDescriptor {
+  const metadata = objectValue(metadataValue);
+  const label = typeof selection?.label === "string"
+    ? selection.label
+    : typeof metadata.label === "string"
+      ? metadata.label
+      : undefined;
+  const description = typeof selection?.description === "string"
+    ? selection.description
+    : typeof metadata.description === "string"
+      ? metadata.description
+      : undefined;
+  return {
+    key,
+    ...(label ? { label } : {}),
+    ...(description ? { description } : {}),
+    ...(typeof metadata.format === "string" ? { format: metadata.format } : {}),
+    ...(typeof metadata.hidden === "boolean" ? { hidden: metadata.hidden } : {}),
+  };
 }
 
 /** Resolve and execute an ordinary `type: view` Markdown record. */
