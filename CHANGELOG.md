@@ -1,5 +1,25 @@
 # Changelog
 
+## Unreleased
+
+- Implement the canonical v0.3 query-object schema, invocation-context `this`
+  binding, named projections, selection, grouping, and summaries.
+- Add headless execution of ordinary Markdown view records and advertise the
+  optional `view_records` feature.
+- Bundle the canonical query and view schemas with generated v0.3 artifacts.
+- Add opt-in structured performance and error logging for collection operations.
+- Add a packed-package, two-process E2E suite covering persistence, queries,
+  views, backlinks, rename reference updates, cache rebuilds, concurrency, and
+  the installed CLI.
+- Preserve the parsed-file cache across coherent updates and include body links
+  in the delete backlink candidate index.
+- Cache compiled CEL programs in a bounded LRU and skip collection-wide
+  uniqueness scans when a write supplies no constrained value.
+- Separate query, structured-filter, link-resolution, filesystem-scanning, and
+  runtime-cache policy from the public collection facade.
+- Add deterministic warm-cache equivalence and focused resolver/scanner/cache
+  stress coverage alongside the packaged E2E suite.
+
 ## 0.3.0-rc.1 - 2026-07-19
 - Publish the first v0.3 release candidate against the registry-hosted mdbase runtime package.
 - Verify the installable package on Linux, macOS, and Windows, including a fresh-tarball import smoke test.

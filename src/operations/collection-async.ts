@@ -1,24 +1,42 @@
 import { Collection } from "./collection.js";
+import type { CollectionOptions } from "../observability.js";
 import type {
-  ReadResult,
-  ValidateResult,
+  BatchDeleteInput,
+  BatchResult,
+  BatchUpdateInput,
+  CacheOpResult,
+  CreateInput,
   CreateResult,
-  UpdateResult,
+  CreateTypeInput,
+  DeleteOptions,
   DeleteResult,
   QueryResult,
-  BatchResult,
-  CacheOpResult,
-} from "./collection.js";
+  ReadResult,
+  RenameInput,
+  UpdateInput,
+  UpdateResult,
+  ValidateResult,
+} from "./contracts.js";
+import type { QueryInput } from "./query-engine.js";
 
+export interface CollectionAsyncCreateInput extends CreateInput {
+  /** Legacy alias for frontmatter. */
+  fields?: Record<string, unknown>;
+}
+
+/** @deprecated Collection already exposes a fully asynchronous API. */
 export class CollectionAsync {
-  private inner: Collection;
+  private readonly inner: Collection;
 
   private constructor(collection: Collection) {
     this.inner = collection;
   }
 
-  static async open(collectionRoot: string): Promise<{ collection?: CollectionAsync; error?: { code: string; message: string } }> {
-    const result = await Collection.open(collectionRoot);
+  static async open(
+    collectionRoot: string,
+    options: CollectionOptions = {},
+  ): Promise<{ collection?: CollectionAsync; error?: { code: string; message: string } }> {
+    const result = await Collection.open(collectionRoot, options);
     if (!result.collection) return { error: result.error };
     return { collection: new CollectionAsync(result.collection) };
   }
@@ -31,73 +49,39 @@ export class CollectionAsync {
     return this.inner.validate(relativePath);
   }
 
-  create(input: {
-    path: string;
-    frontmatter?: Record<string, unknown>;
-    fields?: Record<string, unknown>;
-    body?: string;
-    types?: string[];
-  }): Promise<CreateResult> {
-    return this.inner.create(input);
+  create(input: CollectionAsyncCreateInput): Promise<CreateResult> {
+    const { fields, ...createInput } = input;
+    return this.inner.create({
+      ...createInput,
+      frontmatter: createInput.frontmatter ?? fields,
+    });
   }
 
-  createType(input: {
-    name: string;
-    description?: string;
-    extends?: string;
-    parent?: string;
-    strict?: boolean | "warn";
-    fields?: Record<string, unknown>;
-    path_pattern?: string;
-    filename_pattern?: string;
-  }): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
+  createType(input: CreateTypeInput): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
     return this.inner.createType(input);
   }
 
-  update(input: {
-    path: string;
-    fields?: Record<string, unknown>;
-    frontmatter?: Record<string, unknown>;
-    body?: string;
-  }): Promise<UpdateResult> {
+  update(input: UpdateInput): Promise<UpdateResult> {
     return this.inner.update(input);
   }
 
-  delete(relativePath: string, input?: { check_backlinks?: boolean }): Promise<DeleteResult> {
+  delete(relativePath: string, input?: DeleteOptions): Promise<DeleteResult> {
     return this.inner.delete(relativePath, input);
   }
 
-  rename(input: { from: string; to: string; update_refs?: boolean }): Promise<Record<string, unknown>> {
+  rename(input: RenameInput): Promise<Record<string, unknown>> {
     return this.inner.rename(input);
   }
 
-  query(input: {
-    types?: string[];
-    where?: string | Record<string, unknown>;
-    order_by?: Array<{ field: string; direction?: "asc" | "desc" }>;
-    folder?: string;
-    limit?: number;
-    offset?: number;
-    include_body?: boolean;
-    context_file?: string;
-    formulas?: Record<string, string>;
-    group_by?: { property: string; direction?: "asc" | "desc" | "ASC" | "DESC" };
-    property_summaries?: Record<string, string>;
-    summaries?: Record<string, string>;
-  }): Promise<QueryResult> {
+  query(input: QueryInput): Promise<QueryResult> {
     return this.inner.query(input);
   }
 
-  batchDelete(input: { where: string; dry_run?: boolean; check_backlinks?: boolean }): Promise<BatchResult> {
+  batchDelete(input: BatchDeleteInput): Promise<BatchResult> {
     return this.inner.batchDelete(input);
   }
 
-  batchUpdate(input: {
-    where?: string;
-    fields?: Record<string, unknown>;
-    updates?: Array<{ path: string; fields: Record<string, unknown> }>;
-    dry_run?: boolean;
-  }): Promise<BatchResult> {
+  batchUpdate(input: BatchUpdateInput): Promise<BatchResult> {
     return this.inner.batchUpdate(input);
   }
 

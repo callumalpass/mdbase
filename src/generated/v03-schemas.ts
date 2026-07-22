@@ -51,7 +51,6 @@ export const configSchema: Record<string, unknown> = {
         },
         "explicit_type_keys": {
           "type": "array",
-          "minItems": 1,
           "uniqueItems": true,
           "items": {
             "type": "string",
@@ -181,6 +180,298 @@ export const operationResultSchema: Record<string, unknown> = {
   "additionalProperties": false
 };
 
+export const querySchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/v0.3/query.schema.json",
+  "title": "mdbase v0.3 query object",
+  "type": "object",
+  "properties": {
+    "types": {
+      "$ref": "#/$defs/typeList"
+    },
+    "context": {
+      "$ref": "#/$defs/queryContext"
+    },
+    "projections": {
+      "$ref": "#/$defs/projectionSet"
+    },
+    "where": {
+      "$ref": "#/$defs/expression"
+    },
+    "select": {
+      "$ref": "#/$defs/select"
+    },
+    "order_by": {
+      "$ref": "#/$defs/orderBy"
+    },
+    "group_by": {
+      "$ref": "#/$defs/groupBy"
+    },
+    "summary_functions": {
+      "$ref": "#/$defs/summaryFunctionSet"
+    },
+    "summaries": {
+      "$ref": "#/$defs/summaries"
+    },
+    "limit": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "offset": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "include_body": {
+      "type": "boolean",
+      "default": false
+    },
+    "frontmatter": {
+      "enum": [
+        "effective",
+        "raw",
+        "both"
+      ],
+      "default": "effective"
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+      "$ref": "#/$defs/extension"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "typeName": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,127}$"
+    },
+    "fieldName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_:-]*$"
+    },
+    "expression": {
+      "type": "string",
+      "minLength": 1
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "typeList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/typeName"
+      }
+    },
+    "queryContext": {
+      "type": "object",
+      "required": [
+        "this"
+      ],
+      "properties": {
+        "this": {
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectionSet": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/fieldName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/projection"
+      }
+    },
+    "projection": {
+      "type": "object",
+      "required": [
+        "expr"
+      ],
+      "properties": {
+        "expr": {
+          "$ref": "#/$defs/expression"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "select": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "$ref": "#/$defs/selectExpression"
+          }
+        ]
+      }
+    },
+    "selectExpression": {
+      "type": "object",
+      "required": [
+        "name",
+        "expr"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/fieldName"
+        },
+        "expr": {
+          "$ref": "#/$defs/expression"
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "orderBy": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "field"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "minLength": 1
+          },
+          "direction": {
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "default": "asc"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "groupBy": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "field"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "minLength": 1
+          },
+          "direction": {
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "default": "asc"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "summaryFunctionSet": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/fieldName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/summaryFunction"
+      }
+    },
+    "summaryFunction": {
+      "type": "object",
+      "required": [
+        "expr"
+      ],
+      "properties": {
+        "expr": {
+          "$ref": "#/$defs/expression"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/summary"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "field",
+        "function"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "function": {
+          "$ref": "#/$defs/identifier"
+        },
+        "name": {
+          "$ref": "#/$defs/fieldName"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+};
+
 export const queryResultSchema: Record<string, unknown> = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mdbase.dev/schemas/v0.3/query-result.schema.json",
@@ -216,6 +507,12 @@ export const queryResultSchema: Record<string, unknown> = {
           "frontmatter": {
             "type": "object"
           },
+          "raw_frontmatter": {
+            "type": "object"
+          },
+          "values": {
+            "type": "object"
+          },
           "body": {
             "type": "string"
           }
@@ -236,6 +533,43 @@ export const queryResultSchema: Record<string, unknown> = {
         },
         "has_more": {
           "type": "boolean"
+        },
+        "context": {
+          "type": "object",
+          "required": [
+            "path"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "view": {
+          "type": "object",
+          "required": [
+            "path",
+            "id"
+          ],
+          "properties": {
+            "path": {
+              "type": "string",
+              "minLength": 1
+            },
+            "id": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "groups": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/group"
+          }
         }
       },
       "additionalProperties": true
@@ -247,7 +581,30 @@ export const queryResultSchema: Record<string, unknown> = {
       }
     }
   },
-  "additionalProperties": false
+  "additionalProperties": false,
+  "$defs": {
+    "group": {
+      "type": "object",
+      "required": [
+        "values",
+        "count",
+        "summaries"
+      ],
+      "properties": {
+        "values": {
+          "type": "object"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "summaries": {
+          "type": "object"
+        }
+      },
+      "additionalProperties": false
+    }
+  }
 };
 
 export const typeFileSchema: Record<string, unknown> = {
@@ -880,6 +1237,470 @@ export const typeFileSchema: Record<string, unknown> = {
         "boolean",
         "null"
       ]
+    }
+  }
+};
+
+export const viewSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/v0.3/view.schema.json",
+  "title": "mdbase v0.3 view record",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "name",
+    "views"
+  ],
+  "properties": {
+    "type": {
+      "const": "view"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "query": {
+      "$ref": "#/$defs/sharedQuery"
+    },
+    "properties": {
+      "$ref": "#/$defs/propertyMetadataSet"
+    },
+    "summary_functions": {
+      "$ref": "#/$defs/summaryFunctionSet"
+    },
+    "views": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/view"
+      }
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+      "$ref": "#/$defs/extension"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "typeName": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,127}$"
+    },
+    "fieldName": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_:-]*$"
+    },
+    "expression": {
+      "type": "string",
+      "minLength": 1
+    },
+    "extension": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "typeList": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/typeName"
+      }
+    },
+    "sharedQuery": {
+      "type": "object",
+      "properties": {
+        "types": {
+          "$ref": "#/$defs/typeList"
+        },
+        "where": {
+          "$ref": "#/$defs/expression"
+        },
+        "context": {
+          "$ref": "#/$defs/viewContext"
+        },
+        "projections": {
+          "$ref": "#/$defs/projectionSet"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "viewContext": {
+      "type": "object",
+      "required": [
+        "this"
+      ],
+      "properties": {
+        "this": {
+          "$ref": "#/$defs/thisContext"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "thisContext": {
+      "type": "object",
+      "properties": {
+        "on_missing": {
+          "enum": [
+            "view",
+            "null",
+            "error"
+          ],
+          "default": "view"
+        },
+        "types": {
+          "$ref": "#/$defs/typeList"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "projectionSet": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/fieldName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/projection"
+      }
+    },
+    "projection": {
+      "type": "object",
+      "required": [
+        "expr"
+      ],
+      "properties": {
+        "expr": {
+          "$ref": "#/$defs/expression"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "propertyMetadataSet": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/propertyMetadata"
+      }
+    },
+    "propertyMetadata": {
+      "type": "object",
+      "properties": {
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        },
+        "format": {
+          "type": "string"
+        },
+        "hidden": {
+          "type": "boolean"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "summaryFunctionSet": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/fieldName"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/summaryFunction"
+      }
+    },
+    "summaryFunction": {
+      "type": "object",
+      "required": [
+        "expr"
+      ],
+      "properties": {
+        "expr": {
+          "$ref": "#/$defs/expression"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "view": {
+      "type": "object",
+      "required": [
+        "id",
+        "name"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "types": {
+          "$ref": "#/$defs/typeList"
+        },
+        "where": {
+          "$ref": "#/$defs/expression"
+        },
+        "context": {
+          "$ref": "#/$defs/viewContext"
+        },
+        "projections": {
+          "$ref": "#/$defs/projectionSet"
+        },
+        "select": {
+          "$ref": "#/$defs/select"
+        },
+        "order_by": {
+          "$ref": "#/$defs/orderBy"
+        },
+        "group_by": {
+          "$ref": "#/$defs/groupBy"
+        },
+        "summaries": {
+          "$ref": "#/$defs/summaries"
+        },
+        "limit": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "offset": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "include_body": {
+          "type": "boolean",
+          "default": false
+        },
+        "frontmatter": {
+          "enum": [
+            "effective",
+            "raw",
+            "both"
+          ],
+          "default": "effective"
+        },
+        "presentation": {
+          "$ref": "#/$defs/presentation"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "select": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "oneOf": [
+          {
+            "type": "string",
+            "minLength": 1
+          },
+          {
+            "$ref": "#/$defs/selectExpression"
+          }
+        ]
+      }
+    },
+    "selectExpression": {
+      "type": "object",
+      "required": [
+        "name",
+        "expr"
+      ],
+      "properties": {
+        "name": {
+          "$ref": "#/$defs/fieldName"
+        },
+        "expr": {
+          "$ref": "#/$defs/expression"
+        },
+        "label": {
+          "type": "string"
+        },
+        "description": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "orderBy": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "field"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "minLength": 1
+          },
+          "direction": {
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "default": "asc"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "groupBy": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": [
+          "field"
+        ],
+        "properties": {
+          "field": {
+            "type": "string",
+            "minLength": 1
+          },
+          "direction": {
+            "enum": [
+              "asc",
+              "desc"
+            ],
+            "default": "asc"
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "summaries": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/summary"
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": [
+        "field",
+        "function"
+      ],
+      "properties": {
+        "field": {
+          "type": "string",
+          "minLength": 1
+        },
+        "function": {
+          "$ref": "#/$defs/identifier"
+        },
+        "name": {
+          "$ref": "#/$defs/fieldName"
+        },
+        "label": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "presentation": {
+      "type": "object",
+      "required": [
+        "type"
+      ],
+      "properties": {
+        "type": {
+          "$ref": "#/$defs/identifier"
+        },
+        "fallback": {
+          "$ref": "#/$defs/identifier"
+        },
+        "mappings": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/fieldName"
+          },
+          "additionalProperties": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "options": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/extension"
+        }
+      },
+      "additionalProperties": false
     }
   }
 };

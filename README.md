@@ -8,11 +8,14 @@ The v0.3 implementation is pre-1.0 and intentionally breaking. It also includes 
 
 - JSON Schema 2020-12 type wrappers with canonical diagnostics
 - Collection-level matching, defaults, links, uniqueness, paths, and lifecycle
-- CEL plus legacy query support with filters, ordering, formulas, and traversal
+- Canonical CEL queries with invocation context, named projections, grouping,
+  summaries, and selected result values
+- Ordinary Markdown view records with headless named-view execution
+- Legacy query support with formulas and traversal for v0.2 compatibility
 - Link parsing + resolution (wikilinks, markdown links, bare paths)
 - Backlinks, tags, and embeds extraction from content
 - Batch operations and rename with optional reference updates
-- Cache support via a SQLite worker (async API)
+- Async SQLite-backed cache with coherent in-memory query indexes
 - Portable runtime contracts, provider registries, policy, and validation
 - Safe, report-first v0.2-to-v0.3 collection migration
 
@@ -27,6 +30,8 @@ npm install
 ```bash
 npm run build
 npm test
+npm run test:e2e   # pack, install, mutate, reopen, verify, and run the CLI
+npm run test:all   # source, package smoke, and packaged-process E2E suites
 ```
 
 ## Performance profiling
@@ -64,14 +69,45 @@ const operations = collection.v03Operations();
 const read = await operations.read({ path: "notes/example.md" });
 if (!read.valid) throw new Error(read.diagnostics[0]?.message);
 
-const query = await collection.query({
+const query = await operations.query({
   types: ["task"],
   where: "status == \"open\" && priority >= 2",
+  projections: {
+    urgent: { expr: "priority >= 4" },
+  },
+  select: ["title", "projection.urgent"],
   order_by: [{ field: "priority", direction: "desc" }],
+});
+
+const savedView = await operations.executeView({
+  path: "views/tasks.md",
+  view: "open",
+  context: { path: "projects/alpha.md" },
 });
 
 await collection.close();
 ```
+
+### Optional performance and error logging
+
+Collection diagnostics are disabled by default. Enable structured performance
+and/or error events when opening a collection:
+
+```ts
+const opened = await Collection.open("/path/to/collection", {
+  observability: {
+    performance: { threshold_ms: 10 },
+    errors: true,
+    logger: (event) => telemetry.write(event),
+  },
+});
+```
+
+Events contain operation names, durations, outcomes, and safe scalar metadata;
+record bodies and frontmatter are never logged. Without a custom logger,
+newline-delimited JSON is written to stderr. Nested operations are suppressed
+unless `performance.include_nested` is enabled. Error stack traces are omitted
+unless `errors.include_stack` is enabled.
 
 ## Operations
 
@@ -79,6 +115,8 @@ The canonical v0.3 facade returns `{ valid, result, diagnostics }` envelopes:
 
 - `collection.v03Operations().read({ path, effective? })`
 - `validate({ path? })`
+- `query({ types?, context?, projections?, where?, select?, order_by?, group_by?, summaries? })`
+- `executeView({ path, view, context?, limit?, offset?, render? })`
 - `create({ type|types, path?, frontmatter, body? })`
 - `update({ path, fields?, body?, if_revision? })`
 - `delete({ path, if_revision? })`
@@ -93,6 +131,8 @@ The broader direct `Collection` API remains available for v0.2 compatibility and
 - `delete(path, { check_backlinks? })`
 - `rename({ from, to, update_refs? })`
 - `query({ types?, where?, order_by?, limit?, offset?, include_body?, context_file?, formulas? })`
+- `queryCanonical(query)`
+- `executeView({ path, view, context?, limit?, offset?, render? })`
 - `batchDelete({ where, dry_run?, check_backlinks? })`
 - `batchUpdate({ where?, fields?, updates?, dry_run? })`
 - `backfill({ type?, where?, fields?, apply?, dry_run? })`
@@ -101,7 +141,7 @@ The broader direct `Collection` API remains available for v0.2 compatibility and
 - `cacheClear()`
 - `close()`
 
-See `src/operations/collection.ts` for the authoritative behavior.
+Public operation and observability contracts are exported from the package.
 
 ## Config
 
@@ -154,7 +194,9 @@ Use `mdbase-cli migrate v0.3 analyze` before changing a v0.2 collection. The mig
 
 ## Cache
 
-Cache is async and backed by SQLite in a worker (`src/cache/worker.js`). It is used opportunistically to speed up reads; correctness does not depend on cache presence. Use `cacheRebuild()` and `cacheClear()` for tests or maintenance.
+Cache is async and backed by SQLite. It is used opportunistically to speed up
+reads; correctness does not depend on cache presence. Use `cacheRebuild()` and
+`cacheClear()` for tests or maintenance.
 
 ## Conformance
 
@@ -168,7 +210,14 @@ The package ships its machine-readable v0.3 conformance claim under `conformance
 
 ## Repository layout
 
-- `src/operations/collection.ts` main implementation
+- `src/operations/collection.ts` collection facade and operation orchestration
+- `src/operations/contracts.ts` public operation contracts
+- `src/operations/query-engine.ts` legacy query execution
+- `src/operations/canonical-query.ts` canonical v0.3 query and view execution
+- `src/operations/link-resolver.ts` indexed link-resolution policy
+- `src/operations/collection-scanner.ts` filesystem and collection-boundary policy
+- `src/operations/runtime-cache.ts` coherent process-local derived state
+- `src/observability.ts` opt-in structured diagnostics
 - `src/expressions/` query language + evaluation
 - `src/links/` link parsing and body extraction
 - `src/config/` config loading

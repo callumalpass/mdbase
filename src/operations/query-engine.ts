@@ -5,6 +5,7 @@ import { TypeDefinition } from "../types/loader.js";
 
 import { buildLinkIndex } from "./link-index.js";
 import { IndexedReadResult, LinkResolutionResult } from "./link-index.js";
+import { computeLegacyQuerySummaries, detectCircularFormulas } from "./legacy-query-support.js";
 
 export interface QueryInput {
   types?: string[];
@@ -80,12 +81,6 @@ export interface QueryEngineDeps {
     fileTypes: string[],
     body?: string | null,
   ) => boolean;
-  detectCircularFormulas: (formulas: Record<string, string>) => { code: string; message: string } | null;
-  computeQuerySummaries: (
-    rows: Array<{ frontmatter: Record<string, unknown> }>,
-    propertySummaries: Record<string, string>,
-    customSummaries: Record<string, string>,
-  ) => Record<string, unknown>;
   useCel?: boolean;
   omitBodyWhenExcluded?: boolean;
 }
@@ -148,7 +143,7 @@ export async function runQuery(
     let formulaValues: Record<string, unknown> | undefined;
     if (input.formulas) {
       if (results.length === 0) {
-        const circularError = deps.detectCircularFormulas(input.formulas);
+        const circularError = detectCircularFormulas(input.formulas);
         if (circularError) {
           return {
             results: [],
@@ -309,7 +304,7 @@ export async function runQuery(
         results: group.rows,
       };
       if (input.property_summaries && Object.keys(input.property_summaries).length > 0) {
-        out.summaries = deps.computeQuerySummaries(
+        out.summaries = computeLegacyQuerySummaries(
           group.sourceRows,
           input.property_summaries,
           input.summaries ?? {},
@@ -360,7 +355,7 @@ export async function runQuery(
   };
 
   if (input.property_summaries && Object.keys(input.property_summaries).length > 0) {
-    out.summaries = deps.computeQuerySummaries(
+    out.summaries = computeLegacyQuerySummaries(
       summarySource,
       input.property_summaries,
       input.summaries ?? {},

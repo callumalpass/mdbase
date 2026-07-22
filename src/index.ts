@@ -7,6 +7,16 @@
 
 export { MdbaseOperationError } from "./errors.js";
 export type { MdbaseError, ValidationResult, ErrorSeverity } from "./errors.js";
+export { OperationObserver } from "./observability.js";
+export type {
+  CollectionOptions,
+  ErrorLogEvent,
+  ErrorLoggingOptions,
+  MdbaseLogEvent,
+  ObservabilityOptions,
+  PerformanceLogEvent,
+  PerformanceLoggingOptions,
+} from "./observability.js";
 export {
   isSupportedV03SpecVersion,
   LEGACY_SPEC_VERSION,
@@ -32,8 +42,28 @@ export type {
   V03UniqueRule,
 } from "./types/loader.js";
 export { validateJsonSchemaFrontmatter } from "./validation/json-schema.js";
-export { buildMdbaseCelBindings, evaluateMdbaseCel } from "./expressions/cel.js";
+export {
+  buildMdbaseCelBindings,
+  collectMdbaseCelProjectionReferences,
+  evaluateMdbaseCel,
+  validateMdbaseCelSyntax,
+} from "./expressions/cel.js";
 export type { MdbaseCelContext, MdbaseCelDiagnostic, MdbaseCelResult } from "./expressions/cel.js";
+export {
+  executeCanonicalQuery,
+  listCanonicalViews,
+  validateCanonicalQueryInput,
+  validateCanonicalViewRecord,
+} from "./operations/canonical-query.js";
+export type {
+  CanonicalQueryInput,
+  CanonicalQueryResult,
+  ExecuteViewInput,
+  SavedNamedViewDescriptor,
+  SavedViewDescriptor,
+  SavedViewListResult,
+  SavedViewSourceDescriptor,
+} from "./operations/canonical-query.js";
 export { migrateV02TypeFileToV03, migrateV02TypeToV03, renderV03TypeFile } from "./migrations/type-migration.js";
 export type {
   TypeMigrationMapping,
@@ -103,3 +133,28 @@ export type {
   V03ValidateInput,
 } from "./operations/collection.js";
 export { CollectionAsync } from "./operations/collection-async.js";
+export type { CollectionAsyncCreateInput } from "./operations/collection-async.js";
+export type {
+  BackfillInput,
+  BatchDeleteInput,
+  BatchResult,
+  BatchResultDetail,
+  BatchUpdateInput,
+  CacheOpResult,
+  CreateInput,
+  CreateResult,
+  CreateTypeInput,
+  DeleteOptions,
+  DeleteResult,
+  OperationError,
+  OperationWarning,
+  QueryGroupResult,
+  QueryResult,
+  QueryResultRow,
+  ReadResult,
+  RenameInput,
+  UpdateInput,
+  UpdateResult,
+  ValidateResult,
+  WriteResult,
+} from "./operations/contracts.js";

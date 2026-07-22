@@ -1,10 +1,13 @@
 import {
   CelScalar,
+  celEnv,
   celMethod,
   isCelError,
   isCelList,
   mapType,
-  run,
+  parse,
+  plan,
+  type CelResult,
   type CelValue,
   type CelInput,
 } from "@bufbuild/cel";
@@ -19,13 +22,16 @@ export interface MdbaseCelDiagnostic {
 export interface MdbaseCelContext {
   record?: Record<string, unknown>;
   raw?: Record<string, unknown>;
+  knownFields?: Iterable<string>;
   old?: Record<string, unknown>;
   file?: Record<string, unknown>;
   event?: Record<string, unknown>;
   steps?: Record<string, unknown>;
   vars?: Record<string, unknown>;
   item?: unknown;
-  thisRecord?: Record<string, unknown>;
+  thisRecord?: Record<string, unknown> | null;
+  projection?: Record<string, unknown>;
+  values?: unknown[];
   operation?: Record<string, unknown>;
 }
 
@@ -72,9 +78,46 @@ const mdbaseCelFuncs = [
   }),
 ];
 
+export const MDBASE_CEL_PROGRAM_CACHE_LIMIT = 512;
+
+type CelProgram = (bindings: Record<string, CelInput>) => CelResult;
+
+const mdbaseCelEnvironment = celEnv({ funcs: mdbaseCelFuncs });
+const programCache = new Map<string, CelProgram>();
+
+function compileMdbaseCel(expression: string): CelProgram {
+  const cached = programCache.get(expression);
+  if (cached) {
+    // Refresh insertion order so the bounded map behaves as an LRU cache.
+    programCache.delete(expression);
+    programCache.set(expression, cached);
+    return cached;
+  }
+
+  const compiled = plan(mdbaseCelEnvironment, parse(expression)) as CelProgram;
+  if (programCache.size >= MDBASE_CEL_PROGRAM_CACHE_LIMIT) {
+    const leastRecentlyUsed = programCache.keys().next().value;
+    if (leastRecentlyUsed !== undefined) programCache.delete(leastRecentlyUsed);
+  }
+  programCache.set(expression, compiled);
+  return compiled;
+}
+
+/** Clear process-local compiled CEL programs, primarily for deterministic tests. */
+export function clearMdbaseCelProgramCache(): void {
+  programCache.clear();
+}
+
+/** Return the current bounded cache size without exposing cached expressions. */
+export function getMdbaseCelProgramCacheSize(): number {
+  return programCache.size;
+}
+
 export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext): MdbaseCelResult {
   try {
-    const value = run(expression, buildMdbaseCelBindings(context) as Record<string, CelInput>, { funcs: mdbaseCelFuncs });
+    const value = compileMdbaseCel(expression)(
+      buildMdbaseCelBindings(context) as Record<string, CelInput>,
+    );
     if (isCelError(value)) {
       return {
         value: null,
@@ -98,12 +141,78 @@ export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext)
   }
 }
 
+/** Parse a CEL expression without evaluating it against an arbitrary record. */
+export function validateMdbaseCelSyntax(expression: string): MdbaseCelDiagnostic[] {
+  try {
+    parse(expression);
+    return [];
+  } catch (error) {
+    return [{
+      code: "expression_parse_error",
+      message: error instanceof Error ? error.message : "CEL expression could not be parsed",
+      expression,
+    }];
+  }
+}
+
+/** Return named-projection references from the parsed CEL syntax tree. */
+export function collectMdbaseCelProjectionReferences(expression: string): Set<string> {
+  const parsed = parse(expression) as unknown;
+  const references = new Set<string>();
+  walkCelObjects(parsed, (node) => {
+    if (node.$typeName !== "cel.expr.Expr") return;
+    const kind = objectValue(node.exprKind);
+    if (kind.case === "selectExpr") {
+      const selection = objectValue(kind.value);
+      const operand = objectValue(selection.operand);
+      const operandKind = objectValue(operand.exprKind);
+      const identifier = objectValue(operandKind.value);
+      if (operandKind.case === "identExpr" && identifier.name === "projection") {
+        if (typeof selection.field === "string") references.add(selection.field);
+      }
+      return;
+    }
+    if (kind.case === "callExpr") {
+      const call = objectValue(kind.value);
+      const args = Array.isArray(call.args) ? call.args.map(objectValue) : [];
+      if (call.function === "_[_]" && args.length >= 2) {
+        const objectKind = objectValue(args[0].exprKind);
+        const identifier = objectValue(objectKind.value);
+        const keyKind = objectValue(args[1].exprKind);
+        const constant = objectValue(keyKind.value);
+        const constantKind = objectValue(constant.constantKind);
+        if (
+          objectKind.case === "identExpr" &&
+          identifier.name === "projection" &&
+          keyKind.case === "constExpr" &&
+          constantKind.case === "stringValue" &&
+          typeof constantKind.value === "string"
+        ) {
+          references.add(constantKind.value);
+        }
+      }
+    }
+  });
+  return references;
+}
+
 export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string, unknown> {
   const record = context.record ?? {};
   const raw = context.raw ?? record;
   const old = context.old ?? {};
-  const knownFields = new Set([...Object.keys(record), ...Object.keys(raw), ...Object.keys(old)]);
+  const knownFields = new Set([
+    ...Object.keys(record),
+    ...Object.keys(raw),
+    ...Object.keys(old),
+    ...(context.knownFields ?? []),
+  ]);
+  const missingTopLevelFields = Object.fromEntries(
+    [...knownFields]
+      .filter((field) => !Object.prototype.hasOwnProperty.call(record, field))
+      .map((field) => [field, null]),
+  );
   const bindings: Record<string, unknown> = {
+    ...missingTopLevelFields,
     ...record,
     record,
     raw,
@@ -114,6 +223,9 @@ export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string
     steps: context.steps ?? {},
     vars: context.vars ?? {},
     operation: context.operation ?? {},
+    projection: context.projection ?? {},
+    values: context.values ?? [],
+    this: context.thisRecord ?? null,
     present: {
       record: buildPresenceMap(record, knownFields),
       raw: buildPresenceMap(raw, knownFields),
@@ -122,9 +234,6 @@ export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string
   };
   if (context.item !== undefined) {
     bindings.item = context.item;
-  }
-  if (context.thisRecord !== undefined) {
-    bindings.this = context.thisRecord;
   }
   return bindings;
 }
@@ -144,4 +253,26 @@ function normalizeCelValue(value: CelValue): unknown {
 
 function isObjectWithRaw(value: unknown): value is { raw: string } {
   return typeof value === "object" && value !== null && "raw" in value && typeof (value as { raw?: unknown }).raw === "string";
+}
+
+function objectValue(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function walkCelObjects(
+  value: unknown,
+  visit: (value: Record<string, unknown>) => void,
+  seen = new Set<object>(),
+): void {
+  if (typeof value !== "object" || value === null || seen.has(value)) return;
+  seen.add(value);
+  if (Array.isArray(value)) {
+    for (const item of value) walkCelObjects(item, visit, seen);
+    return;
+  }
+  const object = value as Record<string, unknown>;
+  visit(object);
+  for (const child of Object.values(object)) walkCelObjects(child, visit, seen);
 }

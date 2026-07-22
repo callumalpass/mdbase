@@ -17,17 +17,67 @@ import {
   MdbaseConfig,
   SUPPORTED_SPEC_VERSION,
 } from "../config/loader.js";
-import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules, V03Migration } from "../types/loader.js";
+import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../types/loader.js";
 import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
-import { evaluateWhere, evaluateExpression } from "../expressions/evaluator.js";
+import { evaluateExpression } from "../expressions/evaluator.js";
 import { evaluateMdbaseCel } from "../expressions/cel.js";
-import { parseLink, ParsedLink } from "../links/parser.js";
+import { extractBodyLinks, parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
 import { QueryInput, runQuery } from "./query-engine.js";
+import { CollectionOptions, OperationObserver } from "../observability.js";
+import type {
+  BackfillInput,
+  BatchDeleteInput,
+  BatchResult,
+  BatchResultDetail,
+  BatchUpdateInput,
+  CacheOpResult,
+  CreateInput,
+  CreateResult,
+  CreateTypeInput,
+  DeleteOptions,
+  DeleteResult,
+  QueryGroupResult,
+  QueryResult,
+  ReadResult,
+  RenameInput,
+  TypeMigrationEntry,
+  UpdateResult,
+  UpdateInput,
+  V03CreateInput,
+  V03DeleteInput,
+  V03Diagnostic,
+  V03OperationResult,
+  V03ReadInput,
+  V03RenameInput,
+  V03UpdateInput,
+  V03ValidateInput,
+  ValidateResult,
+} from "./contracts.js";
+import {
+  CanonicalQueryInput,
+  CanonicalQueryResult,
+  ExecuteViewInput,
+  SavedViewListResult,
+  executeCanonicalQuery,
+  executeCanonicalView,
+  listCanonicalViews,
+} from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
+import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
+import { CollectionScanner } from "./collection-scanner.js";
+import {
+  BacklinkTokenIndex,
+  CollectionRuntimeCache,
+  RuntimeCacheInvalidation,
+} from "./runtime-cache.js";
+import {
+  evaluateStructuredWhere as evaluateWhereClause,
+  matchesFieldConditions,
+} from "./structured-where.js";
 import {
   buildRuntimePackage,
   composeRuntimeRegistry,
@@ -39,119 +89,27 @@ import {
   RuntimeValidationResult,
 } from "../runtime/contracts.js";
 
-export interface ReadResult {
-  valid?: boolean;
-  frontmatter?: Record<string, unknown>;
-  rawFrontmatter?: Record<string, unknown>;
-  body?: string | null;
-  types?: string[];
-  file?: Record<string, unknown>;
-  revision?: string;
-  warnings?: Array<{ code: string; message: string }>;
-  error?: { code: string; message: string };
-}
-
-export interface ValidateResult {
-  valid: boolean;
-  issues: MdbaseError[];
-  warnings?: string[];
-  error?: { code: string; message: string };
-}
-
-export interface CreateResult {
-  valid?: boolean;
-  frontmatter?: Record<string, unknown>;
-  body?: string;
-  path?: string;
-  revision?: string;
-  types?: string[];
-  error?: { code: string; message: string };
-}
-
-export interface UpdateResult {
-  valid?: boolean;
-  frontmatter?: Record<string, unknown>;
-  body?: string;
-  path?: string;
-  revision?: string;
-  types?: string[];
-  error?: { code: string; message: string };
-}
-
-export interface DeleteResult {
-  valid?: boolean;
-  broken_links?: Array<{ path: string }>;
-  error?: { code: string; message: string };
-}
-
-export interface QueryGroupResult {
-  key: unknown;
-  results: Array<{
-    path: string;
-    file: Record<string, unknown>;
-    frontmatter: Record<string, unknown>;
-    types: string[];
-    body?: string | null;
-  }>;
-  summaries?: Record<string, unknown>;
-}
-
-export interface QueryResult {
-  results?: Array<{
-    path: string;
-    file: Record<string, unknown>;
-    frontmatter: Record<string, unknown>;
-    types: string[];
-    body?: string | null;
-  }>;
-  groups?: QueryGroupResult[];
-  summaries?: Record<string, unknown>;
-  meta?: {
-    total_count: number;
-    has_more?: boolean;
-  };
-  diagnostics?: Array<Record<string, unknown>>;
-}
-
-export interface BatchResultDetail {
-  path: string;
-  status: "success" | "failed" | "skipped";
-  error?: { code: string; message: string };
-}
-
-export interface BatchResult {
-  batch_result: {
-    total: number;
-    succeeded: number;
-    failed: number;
-    skipped?: number;
-    details: BatchResultDetail[];
-  };
-  broken_links?: Array<{ target: string; referrer: string }>;
-  error?: { code: string; message: string };
-}
-
-export interface CacheOpResult {
-  success: boolean;
-  error?: { code: string; message: string };
-}
-
-export interface TypeMigrationEntry {
-  type: string;
-  source_path?: string;
-  migration: V03Migration;
-}
-
-interface BacklinkTokenIndex {
-  tokenToSources: Map<string, Set<string>>;
-  sourceToTokens: Map<string, Set<string>>;
-}
-
-interface LinkResolutionIndex {
-  fileSet: Set<string>;
-  basenameToFiles: Map<string, string[]>;
-  idToFiles: Map<string, string[]>;
-}
+export type {
+  BatchResult,
+  BatchResultDetail,
+  CacheOpResult,
+  CreateResult,
+  DeleteResult,
+  QueryGroupResult,
+  QueryResult,
+  ReadResult,
+  TypeMigrationEntry,
+  UpdateResult,
+  V03CreateInput,
+  V03DeleteInput,
+  V03Diagnostic,
+  V03OperationResult,
+  V03ReadInput,
+  V03RenameInput,
+  V03UpdateInput,
+  V03ValidateInput,
+  ValidateResult,
+} from "./contracts.js";
 
 const DEFAULT_SPEC_VERSION = SUPPORTED_SPEC_VERSION;
 
@@ -176,14 +134,11 @@ function normalizeInitTypesFolder(value: string): string {
 export class Collection {
   private config: MdbaseConfig;
   private typeDefs: Map<string, TypeDefinition>;
-  private excludeMatchers: ((str: string) => boolean)[];
   private cache: CacheStoreAsync | null;
-  private cachedFiles: string[] | null;
-  private cachedAllFiles: string[] | null;
-  private cachedNonMarkdownFiles: Set<string> | null;
-  private cachedFileCache: Map<string, ReadResult> | null;
-  private cachedFileCacheFiles: string[] | null;
-  private cachedBacklinkTokenIndex: BacklinkTokenIndex | null;
+  private readonly runtimeCache: CollectionRuntimeCache<ReadResult>;
+  private readonly observer: OperationObserver;
+  private readonly linkResolver: LinkResolver;
+  private readonly scanner: CollectionScanner;
 
   /**
    * Hook called after reading a file but before writing.
@@ -206,31 +161,26 @@ export class Collection {
     private root: string,
     config: MdbaseConfig,
     typeDefs: Map<string, TypeDefinition>,
+    options: CollectionOptions = {},
   ) {
     this.config = config;
     this.typeDefs = typeDefs;
-    this.excludeMatchers = config.settings.exclude.flatMap((pattern) => {
-      // If the pattern doesn't contain glob characters or /, it's a directory name
-      // Match both the directory itself and anything inside it
-      if (!pattern.includes("/") && !pattern.includes("*") && !pattern.includes("?")) {
-        return [
-          picomatch(pattern, { dot: true }),
-          picomatch(`${pattern}/**`, { dot: true }),
-        ];
-      }
-      // If it contains no /, use matchBase for basename matching
-      if (!pattern.includes("/")) {
-        return [picomatch(pattern, { dot: true, matchBase: true })];
-      }
-      return [picomatch(pattern, { dot: true })];
-    });
     this.cache = null;
-    this.cachedFiles = null;
-    this.cachedAllFiles = null;
-    this.cachedNonMarkdownFiles = null;
-    this.cachedFileCache = null;
-    this.cachedFileCacheFiles = null;
-    this.cachedBacklinkTokenIndex = null;
+    this.runtimeCache = new CollectionRuntimeCache();
+    this.observer = new OperationObserver(options.observability);
+    this.linkResolver = new LinkResolver({
+      idField: config.settings.id_field,
+      recordExtensions: config.settings.record_extensions,
+    });
+    this.scanner = new CollectionScanner({
+      root,
+      exclude: config.settings.exclude,
+      recordExtensions: config.settings.record_extensions,
+      includeSubfolders: config.settings.include_subfolders,
+      typesFolder: config.settings.types_folder,
+      cacheFolder: config.settings.cache_folder,
+      migrationsFolder: config.settings.migrations_folder,
+    });
   }
 
   /** Return the canonical v0.3 operation surface for this collection. */
@@ -254,43 +204,27 @@ export class Collection {
       normalizedPath.split("/").includes("..");
   }
 
-  private invalidateRuntimeCaches(options?: {
-    fileLists?: boolean;
-    fileCache?: boolean;
-    nonMarkdown?: boolean;
-    backlinks?: boolean;
-  }): void {
-    const fileLists = options?.fileLists ?? true;
-    const fileCache = options?.fileCache ?? true;
-    const nonMarkdown = options?.nonMarkdown ?? true;
-    const backlinks = options?.backlinks ?? true;
-
-    if (fileLists) {
-      this.cachedFiles = null;
-      this.cachedAllFiles = null;
-    }
-    if (fileCache) {
-      this.cachedFileCache = null;
-      this.cachedFileCacheFiles = null;
-    }
-    if (nonMarkdown) {
-      this.cachedNonMarkdownFiles = null;
-    }
-    if (backlinks) {
-      this.cachedBacklinkTokenIndex = null;
-    }
+  private invalidateRuntimeCaches(options?: RuntimeCacheInvalidation): void {
+    this.runtimeCache.invalidate(options);
   }
 
-  private areSamePathLists(a: string[], b: string[]): boolean {
-    if (a === b) return true;
-    if (a.length !== b.length) return false;
-    for (let i = 0; i < a.length; i++) {
-      if (a[i] !== b[i]) return false;
-    }
-    return true;
+  static async init(
+    collectionRoot: string,
+    input?: Record<string, unknown>,
+    options: CollectionOptions = {},
+  ): Promise<Record<string, unknown>> {
+    const observer = new OperationObserver(options.observability);
+    return await observer.trace(
+      "collection.init",
+      { root: path.resolve(collectionRoot) },
+      () => this.initUnobserved(collectionRoot, input),
+    );
   }
 
-  static async init(collectionRoot: string, input?: Record<string, unknown>): Promise<Record<string, unknown>> {
+  private static async initUnobserved(
+    collectionRoot: string,
+    input?: Record<string, unknown>,
+  ): Promise<Record<string, unknown>> {
     const suppliedConfig = input?.config;
     if (suppliedConfig !== undefined && !isPlainObject(suppliedConfig)) {
       throw new Error("config must be a mapping");
@@ -486,24 +420,35 @@ fields:
     };
   }
 
-  static async open(collectionRoot: string): Promise<{ collection?: Collection; error?: { code: string; message: string } }> {
-    const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
-    if (!configResult.valid || !configResult.config) {
-      return { error: configResult.error };
-    }
+  static async open(
+    collectionRoot: string,
+    options: CollectionOptions = {},
+  ): Promise<{ collection?: Collection; error?: { code: string; message: string } }> {
+    const observer = new OperationObserver(options.observability);
+    return await observer.trace(
+      "collection.open",
+      { root: path.resolve(collectionRoot) },
+      async () => {
+        const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
+        if (!configResult.valid || !configResult.config) {
+          return { error: configResult.error };
+        }
 
-    const typesResult = await loadTypesAsync(collectionRoot, configResult.config);
-    if (!typesResult.valid) {
-      return { error: typesResult.error };
-    }
+        const typesResult = await loadTypesAsync(collectionRoot, configResult.config);
+        if (!typesResult.valid) {
+          return { error: typesResult.error };
+        }
 
-    const collection = new Collection(
-      collectionRoot,
-      configResult.config,
-      typesResult.types!,
+        const collection = new Collection(
+          collectionRoot,
+          configResult.config,
+          typesResult.types!,
+          options,
+        );
+        await collection.initCache();
+        return { collection };
+      },
     );
-    await collection.initCache();
-    return { collection };
   }
 
   private async initCache(): Promise<void> {
@@ -514,34 +459,14 @@ fields:
    * Check if a path is excluded by config.
    */
   private isExcluded(relativePath: string): boolean {
-    for (const matcher of this.excludeMatchers) {
-      if (matcher(relativePath)) return true;
-    }
-    // Types folder is always excluded from regular file scan
-    if (relativePath.startsWith(this.config.settings.types_folder + "/") ||
-        relativePath === this.config.settings.types_folder) {
-      return true;
-    }
-    // Cache folder excluded
-    if (relativePath.startsWith(this.config.settings.cache_folder + "/") ||
-        relativePath === this.config.settings.cache_folder) {
-      return true;
-    }
-    // Migrations folder excluded
-    if (relativePath.startsWith(this.config.settings.migrations_folder + "/") ||
-        relativePath === this.config.settings.migrations_folder) {
-      return true;
-    }
-    // Nested collection boundary check: if a subdirectory has mdbase.yaml, don't scan into it
-    return false;
+    return this.scanner.isExcluded(relativePath);
   }
 
   /**
    * Check if a file has a valid markdown extension.
    */
   private isMarkdownFile(filePath: string): boolean {
-    const ext = path.extname(filePath).slice(1); // remove dot
-    return this.config.settings.record_extensions.includes(ext);
+    return this.scanner.isRecordFile(filePath);
   }
 
   private async fileExists(fullPath: string): Promise<boolean> {
@@ -601,7 +526,7 @@ fields:
     const matchedTypes: string[] = [];
     for (const [typeName, typeDef] of this.typeDefs) {
       if (!typeDef.match) continue;
-      if (this.matchesType(relativePath, frontmatter, typeDef.match)) {
+      if (this.matchesType(relativePath, frontmatter, typeDef)) {
         matchedTypes.push(typeName);
       }
     }
@@ -615,8 +540,9 @@ fields:
   private matchesType(
     relativePath: string,
     frontmatter: Record<string, unknown>,
-    match: MatchRules,
+    typeDef: TypeDefinition,
   ): boolean {
+    const match = typeDef.match!;
     // path_glob
     if (match.path_glob !== undefined) {
       const patterns = Array.isArray(match.path_glob) ? match.path_glob : [match.path_glob];
@@ -637,13 +563,15 @@ fields:
 
     // where - all conditions must match
     if (match.where !== undefined) {
-      if (!this.matchesWhereConditions(frontmatter, match.where)) return false;
+      if (!matchesFieldConditions(frontmatter, match.where, this.config.spec_profile)) return false;
     }
 
     if (match.expr !== undefined) {
       const result = evaluateMdbaseCel(match.expr.$expr, {
         record: frontmatter,
         raw: frontmatter,
+        knownFields: this.getTypeFieldNames(typeDef),
+        file: this.buildMatchFileBinding(relativePath),
       });
       if (result.diagnostics.length > 0) return false;
       return result.value === true;
@@ -652,113 +580,41 @@ fields:
     return true;
   }
 
-  /**
-   * Evaluate where conditions from a match block against frontmatter.
-   * where is an object where each key is a field name and the value is either:
-   *   - a literal value (exact equality)
-   *   - an object with operator keys (eq, neq, gt, gte, lt, lte, exists, contains, containsAll, containsAny, startsWith, endsWith, matches)
-   */
-  private matchesWhereConditions(
-    frontmatter: Record<string, unknown>,
-    where: Record<string, unknown>,
-  ): boolean {
-    for (const [field, condition] of Object.entries(where)) {
-      const selected = getFieldPathValue(frontmatter, field);
-      const fieldValue = selected.value;
-
-      if (condition === null || condition === undefined || typeof condition !== "object" || Array.isArray(condition)) {
-        // Literal value: exact equality
-        if (!selected.present || !deepJsonEqual(fieldValue, condition)) return false;
-        continue;
-      }
-
-      // Object with operators
-      const ops = condition as Record<string, unknown>;
-      for (const [op, expected] of Object.entries(ops)) {
-        if (!this.evalWhereOp(fieldValue, selected.present, op, expected)) return false;
-      }
-    }
-    return true;
+  private getTypeFieldNames(typeDef: TypeDefinition): string[] {
+    const schemaProperties = typeDef.schema?.value?.properties;
+    return [
+      ...Object.keys(typeDef.fields ?? {}),
+      ...(schemaProperties !== null && typeof schemaProperties === "object" && !Array.isArray(schemaProperties)
+        ? Object.keys(schemaProperties)
+        : []),
+    ];
   }
 
-  private evalWhereOp(fieldValue: unknown, present: boolean, op: string, expected: unknown): boolean {
-    switch (op) {
-      case "eq":
-      case "const":
-        if (!present || fieldValue === null || fieldValue === undefined) return false;
-        return deepJsonEqual(fieldValue, expected);
-      case "neq":
-        if (!present || fieldValue === null || fieldValue === undefined) return false;
-        return !deepJsonEqual(fieldValue, expected);
-      case "gt":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left > right);
-      case "gte":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left >= right);
-      case "lt":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left < right);
-      case "lte":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        return compareWhereValues(fieldValue, expected, (left, right) => left <= right);
-      case "exists":
-        if (this.config.spec_profile === "v0.3") {
-          return expected === true ? present : !present;
-        }
-        return expected === true
-          ? present && fieldValue !== null && fieldValue !== undefined
-          : !present || fieldValue === null || fieldValue === undefined;
-      case "contains":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (Array.isArray(fieldValue)) {
-          return fieldValue.some((item) => deepJsonEqual(item, expected));
-        }
-        if (typeof fieldValue === "string") {
-          return fieldValue.includes(String(expected));
-        }
-        return false;
-      case "containsAll":
-        if (!Array.isArray(fieldValue) || !Array.isArray(expected)) return false;
-        return expected.every((e) =>
-          fieldValue.some((item) => deepJsonEqual(item, e)),
-        );
-      case "containsAny":
-        if (!Array.isArray(fieldValue) || !Array.isArray(expected)) return false;
-        return expected.some((e) =>
-          fieldValue.some((item) => deepJsonEqual(item, e)),
-        );
-      case "in":
-        if (fieldValue === null || fieldValue === undefined || !Array.isArray(expected)) return false;
-        return expected.some((item) => deepJsonEqual(item, fieldValue));
-      case "startsWith":
-      case "starts_with":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (typeof fieldValue === "string") return fieldValue.startsWith(String(expected));
-        return false;
-      case "endsWith":
-      case "ends_with":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        if (typeof fieldValue === "string") return fieldValue.endsWith(String(expected));
-        return false;
-      case "matches":
-        if (fieldValue === null || fieldValue === undefined) return false;
-        try {
-          let pattern = String(expected);
-          pattern = pattern.replace(/\\\\/g, "\\");
-          return new RegExp(pattern).test(String(fieldValue));
-        } catch {
-          return false;
-        }
-      default:
-        return false;
-    }
+  private buildMatchFileBinding(relativePath: string): Record<string, unknown> {
+    const name = path.posix.basename(relativePath);
+    const extension = path.posix.extname(name).replace(/^\./, "");
+    const folder = path.posix.dirname(relativePath);
+    return {
+      path: relativePath,
+      name,
+      basename: extension ? name.slice(0, -(extension.length + 1)) : name,
+      extension,
+      folder: folder === "." ? "" : folder,
+    };
   }
 
   /**
    * Read a file from the collection.
    */
   async read(relativePath: string): Promise<ReadResult> {
+    return await this.observer.trace(
+      "collection.read",
+      { path: relativePath },
+      () => this.readUnobserved(relativePath),
+    );
+  }
+
+  private async readUnobserved(relativePath: string): Promise<ReadResult> {
     if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
@@ -863,7 +719,7 @@ fields:
           types: [],
           file,
           revision,
-        } as unknown as ReadResult;
+        };
       }
       if (this.config.settings.default_validation === "warn") {
         // At "warn" level: treat as empty with warning
@@ -882,7 +738,7 @@ fields:
           warnings: [{ code: "invalid_frontmatter", message: parsed.error.message }],
           file,
           revision,
-        } as unknown as ReadResult;
+        };
       }
       // At "error" level: return error
       return {
@@ -1033,7 +889,11 @@ fields:
     context: { oldFrontmatter?: Record<string, unknown>; relativePath?: string } = {},
   ): MdbaseError[] {
     const issues: MdbaseError[] = [];
-    const assignments = new Map<string, unknown>();
+    const assignments = new Map<string, {
+      value: unknown;
+      typeName: string;
+      lifecyclePath: string;
+    }>();
 
     for (const typeName of types) {
       const typeDef = this.typeDefs.get(typeName);
@@ -1053,7 +913,7 @@ fields:
           });
           if (guard.diagnostics.length > 0) {
             issues.push({
-              code: "expression_evaluation_error",
+              code: "lifecycle_expression_error",
               message: `Lifecycle guard on ${typeName}.${event}[${index}] failed: ${guard.diagnostics[0].message}`,
               severity: "error",
             });
@@ -1065,19 +925,21 @@ fields:
         }
         for (const [fieldPath, lifecycleValue] of Object.entries(action.set)) {
           const value = this.evaluateLifecycleValue(lifecycleValue, frontmatter, context);
+          const lifecyclePath = `${typeName}.lifecycle.${event}[${index}].set.${fieldPath}`;
           if (assignments.has(fieldPath)) {
-            const previous = assignments.get(fieldPath);
-            if (JSON.stringify(previous) !== JSON.stringify(value)) {
+            const previous = assignments.get(fieldPath)!;
+            if (JSON.stringify(previous.value) !== JSON.stringify(value)) {
               issues.push({
-                code: "lifecycle_conflict",
-                message: `Conflicting lifecycle assignment for "${fieldPath}" on ${event}`,
+                code: "type_conflict",
+                message: `Conflicting lifecycle assignments for "${fieldPath}": ${previous.lifecyclePath} and ${lifecyclePath}`,
                 field: fieldPath,
+                type: `${previous.typeName},${typeName}`,
                 severity: "error",
               });
               continue;
             }
           }
-          assignments.set(fieldPath, value);
+          assignments.set(fieldPath, { value, typeName, lifecyclePath });
         }
       }
     }
@@ -1086,9 +948,9 @@ fields:
       return issues;
     }
 
-    for (const [fieldPath, value] of assignments) {
+    for (const [fieldPath, assignment] of assignments) {
       try {
-        setFieldPathValue(frontmatter, fieldPath, value);
+        setFieldPathValue(frontmatter, fieldPath, assignment.value);
       } catch (error) {
         issues.push({
           code: "invalid_lifecycle_path",
@@ -1129,6 +991,14 @@ fields:
    * Validate a single file or the entire collection.
    */
   async validate(relativePath?: string): Promise<ValidateResult> {
+    return await this.observer.trace(
+      "collection.validate",
+      { path: relativePath },
+      () => this.validateUnobserved(relativePath),
+    );
+  }
+
+  private async validateUnobserved(relativePath?: string): Promise<ValidateResult> {
     if (relativePath) {
       return await this.validateFile(relativePath);
     }
@@ -1358,6 +1228,14 @@ fields:
   }
 
   async loadRuntimeContracts(options: LoadRuntimeContractsOptions = {}): Promise<RuntimePackage> {
+    return await this.observer.trace(
+      "collection.load_runtime_contracts",
+      { include_type_files: options.includeTypeFiles },
+      () => this.loadRuntimeContractsUnobserved(options),
+    );
+  }
+
+  private async loadRuntimeContractsUnobserved(options: LoadRuntimeContractsOptions): Promise<RuntimePackage> {
     const records: RuntimeMarkdownRecord[] = [];
 
     if (options.includeTypeFiles !== false) {
@@ -1402,6 +1280,14 @@ fields:
   }
 
   async getRuntimeRegistry(options: LoadRuntimeContractsOptions = {}): Promise<RuntimeRegistry> {
+    return await this.observer.trace(
+      "collection.get_runtime_registry",
+      {},
+      () => this.getRuntimeRegistryUnobserved(options),
+    );
+  }
+
+  private async getRuntimeRegistryUnobserved(options: LoadRuntimeContractsOptions): Promise<RuntimeRegistry> {
     const runtimePackage = await this.loadRuntimeContracts(options);
     const selectedPath = typeof this.config.runtime?.policy === "string"
       ? this.config.runtime.policy.replace(/\\/g, "/").replace(/^\.\//, "")
@@ -1421,6 +1307,16 @@ fields:
 
   async preflightRuntimeWorkflows(
     options: LoadRuntimeContractsOptions = {},
+  ): Promise<RuntimeValidationResult> {
+    return await this.observer.trace(
+      "collection.preflight_runtime_workflows",
+      {},
+      () => this.preflightRuntimeWorkflowsUnobserved(options),
+    );
+  }
+
+  private async preflightRuntimeWorkflowsUnobserved(
+    options: LoadRuntimeContractsOptions,
   ): Promise<RuntimeValidationResult> {
     const registry = await this.getRuntimeRegistry(options);
     return preflightRuntimeWorkflows(registry);
@@ -1530,13 +1426,15 @@ fields:
   /**
    * Create a new file in the collection.
    */
-  async create(input: {
-    type?: string;
-    types?: string[];
-    path?: string;
-    frontmatter?: Record<string, unknown>;
-    body?: string;
-  }): Promise<CreateResult> {
+  async create(input: CreateInput): Promise<CreateResult> {
+    return await this.observer.trace(
+      "collection.create",
+      { path: input.path, type: input.type, type_count: input.types?.length },
+      () => this.createUnobserved(input),
+    );
+  }
+
+  private async createUnobserved(input: CreateInput): Promise<CreateResult> {
     // Determine types from input parameters or frontmatter
     const typeNames: string[] = [];
     if (input.type) typeNames.push(input.type.toLowerCase());
@@ -1583,7 +1481,7 @@ fields:
         valid: false,
         error: { code: "validation_failed", message: "Lifecycle validation failed on create" },
         issues: createLifecycleIssues,
-      } as unknown as CreateResult;
+      };
     }
     const postLifecycleTypes = this.getTypesForFile(input.path ?? "", frontmatter);
     if (this.config.spec_profile === "v0.3" && !sameStringSet(typeNames, postLifecycleTypes)) {
@@ -1741,7 +1639,7 @@ fields:
     for (const typeName of typeNames) {
       const typeDef = this.typeDefs.get(typeName);
       if (typeDef?.match) {
-        if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef.match)) {
+        if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef)) {
           return {
             error: { code: "match_failed", message: `Created file would not satisfy match rules for type "${typeName}"` },
           };
@@ -1761,7 +1659,7 @@ fields:
             valid: false,
             error: { code: "validation_failed", message: "Validation failed on create" },
             issues: valResult.issues,
-          } as unknown as CreateResult;
+          };
         }
       }
       const policyIssues = await this.validateCollectionPoliciesForWrite(relativePath, frontmatter, effectiveFrontmatter, typeNames);
@@ -1770,7 +1668,7 @@ fields:
           valid: false,
           error: { code: "validation_failed", message: "Collection policy validation failed on create" },
           issues: policyIssues,
-        } as unknown as CreateResult;
+        };
       }
     }
     this.applyV03ReadDefaults(effectiveFrontmatter, typeNames);
@@ -1805,7 +1703,7 @@ fields:
     if (await this.fileExists(fullPath)) {
       return {
         error: { code: "path_conflict", message: `File appeared concurrently: ${relativePath}` },
-      } as unknown as CreateResult;
+      };
     }
 
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
@@ -1813,7 +1711,7 @@ fields:
     await this.updateCacheForPath(relativePath);
     this.invalidateRuntimeCaches();
 
-    const result: Record<string, unknown> = {
+    const result: CreateResult = {
       valid: true,
       frontmatter: effectiveFrontmatter,
       body,
@@ -1824,18 +1722,21 @@ fields:
     if (warnings.length > 0) {
       result.warnings = warnings;
     }
-    return result as unknown as CreateResult;
+    return result;
   }
 
   /**
    * Update an existing file in the collection.
    */
-  async update(input: {
-    path: string;
-    fields?: Record<string, unknown>;
-    body?: string;
-    if_revision?: string;
-  }): Promise<UpdateResult> {
+  async update(input: UpdateInput): Promise<UpdateResult> {
+    return await this.observer.trace(
+      "collection.update",
+      { path: input.path, field_count: Object.keys(input.fields ?? input.frontmatter ?? {}).length },
+      () => this.updateUnobserved(input),
+    );
+  }
+
+  private async updateUnobserved(input: UpdateInput): Promise<UpdateResult> {
     const relativePath = input.path;
     if (this.isInvalidRelativePath(relativePath)) {
       return {
@@ -1866,8 +1767,9 @@ fields:
     const frontmatter: Record<string, unknown> = { ...existing.frontmatter };
 
     // Apply field updates
-    if (input.fields) {
-      Object.assign(frontmatter, input.fields);
+    const updates = input.fields ?? input.frontmatter;
+    if (updates) {
+      Object.assign(frontmatter, updates);
     }
 
     // Determine types
@@ -1893,7 +1795,7 @@ fields:
       return {
         error: { code: "validation_failed", message: "Lifecycle validation failed on update" },
         issues: updateLifecycleIssues,
-      } as unknown as UpdateResult;
+      };
     }
     const postLifecycleTypes = this.getTypesForFile(relativePath, frontmatter);
     if (this.config.spec_profile === "v0.3" && !sameStringSet(types, postLifecycleTypes)) {
@@ -1923,7 +1825,7 @@ fields:
           return {
             error: { code: "validation_failed", message: "Validation failed on update" },
             issues: valResult.issues,
-          } as unknown as UpdateResult;
+          };
         }
       }
 
@@ -1936,7 +1838,7 @@ fields:
         return {
           error: { code: "validation_failed", message: "Collection policy validation failed on update" },
           issues: effectivePolicyIssues,
-        } as unknown as UpdateResult;
+        };
       }
     }
 
@@ -2011,17 +1913,16 @@ fields:
     if (writeMtime !== readMtime) {
       return {
         error: { code: "concurrent_modification", message: `File "${relativePath}" was modified externally during update` },
-      } as unknown as UpdateResult;
+      };
     }
 
     await fs.promises.writeFile(fullPath, content);
     await this.updateCacheForPath(relativePath);
-    this.invalidateRuntimeCaches({ fileLists: false });
 
     // Evaluate computed fields on the effective frontmatter for the return value
     this.evaluateComputedFields(effectiveFrontmatter, types, relativePath, body);
 
-    const result: Record<string, unknown> = {
+    const result: UpdateResult = {
       valid: true,
       frontmatter: effectiveFrontmatter,
       body,
@@ -2032,13 +1933,34 @@ fields:
     if (warnings.length > 0) {
       result.warnings = warnings;
     }
-    return result as unknown as UpdateResult;
+    this.runtimeCache.updateFile(relativePath, {
+      valid: true,
+      frontmatter: effectiveFrontmatter,
+      rawFrontmatter: diskFrontmatter,
+      body,
+      types,
+      revision: result.revision,
+    });
+    this.invalidateRuntimeCaches({
+      fileLists: false,
+      fileCache: false,
+      nonMarkdown: false,
+    });
+    return result;
   }
 
   /**
    * Delete a file from the collection.
    */
-  async delete(relativePath: string, input?: { check_backlinks?: boolean; if_revision?: string }): Promise<DeleteResult> {
+  async delete(relativePath: string, input?: DeleteOptions): Promise<DeleteResult> {
+    return await this.observer.trace(
+      "collection.delete",
+      { path: relativePath, check_backlinks: input?.check_backlinks },
+      () => this.deleteUnobserved(relativePath, input),
+    );
+  }
+
+  private async deleteUnobserved(relativePath: string, input?: DeleteOptions): Promise<DeleteResult> {
     if (this.isInvalidRelativePath(relativePath)) {
       return {
         error: { code: "invalid_path", message: `Invalid path: ${relativePath}` },
@@ -2092,15 +2014,15 @@ fields:
   /**
    * Create a new type definition file.
    */
-  async createType(input: {
-    name: string;
-    description?: string;
-    extends?: string;
-    parent?: string;
-    strict?: boolean | "warn";
-    fields?: Record<string, unknown>;
-    path_pattern?: string;
-  }): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
+  async createType(input: CreateTypeInput): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
+    return await this.observer.trace(
+      "collection.create_type",
+      { type: input.name },
+      () => this.createTypeUnobserved(input),
+    );
+  }
+
+  private async createTypeUnobserved(input: CreateTypeInput): Promise<{ valid?: boolean; error?: { code: string; message: string }; type?: Record<string, unknown> }> {
     const name = input.name.toLowerCase();
 
     // Validate type name
@@ -2174,7 +2096,8 @@ fields:
     if (parentType) typeFrontmatter.extends = parentType;
     if (input.strict !== undefined) typeFrontmatter.strict = input.strict;
     if (input.fields) typeFrontmatter.fields = input.fields;
-    if (input.path_pattern) typeFrontmatter.path_pattern = input.path_pattern;
+    const pathPattern = input.path_pattern ?? input.filename_pattern;
+    if (pathPattern) typeFrontmatter.path_pattern = pathPattern;
 
     // Write the type file
     const typesFolder = path.join(this.root, this.config.settings.types_folder);
@@ -2209,12 +2132,15 @@ fields:
   /**
    * Rename/move a file in the collection, optionally updating references.
    */
-  async rename(input: {
-    from: string;
-    to: string;
-    update_refs?: boolean;
-    if_revision?: string;
-  }): Promise<Record<string, unknown>> {
+  async rename(input: RenameInput): Promise<Record<string, unknown>> {
+    return await this.observer.trace(
+      "collection.rename",
+      { from: input.from, to: input.to, update_refs: input.update_refs },
+      () => this.renameUnobserved(input),
+    );
+  }
+
+  private async renameUnobserved(input: RenameInput): Promise<Record<string, unknown>> {
     const fromPath = path.join(this.root, input.from);
     const toPath = path.join(this.root, input.to);
 
@@ -2813,6 +2739,14 @@ fields:
    * Query the collection.
    */
   async query(input: QueryInput): Promise<QueryResult & { error?: { code: string; message: string } }> {
+    return await this.observer.trace(
+      "collection.query",
+      { limit: input.limit, offset: input.offset, type_count: input.types?.length },
+      () => this.queryUnobserved(input),
+    );
+  }
+
+  private async queryUnobserved(input: QueryInput): Promise<QueryResult & { error?: { code: string; message: string } }> {
     const resolutionIndexByCache = new WeakMap<Map<string, IndexedReadResult>, LinkResolutionIndex>();
     const result = await runQuery(input, {
       typeDefs: this.typeDefs,
@@ -2833,18 +2767,19 @@ fields:
       ) => {
         let resolutionIndex = resolutionIndexByCache.get(fileCache);
         if (!resolutionIndex) {
-          resolutionIndex = this.buildLinkResolutionIndex(files, fileCache as Map<string, ReadResult>);
+          resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
           resolutionIndexByCache.set(fileCache, resolutionIndex);
         }
-        return this.resolveLinkFullWithFiles(
+        return this.linkResolver.resolve(
           linkValue,
           fromPath,
           files,
-          undefined,
-          fileCache as Map<string, ReadResult>,
-          nonMarkdownFiles,
-          resolutionIndex.fileSet,
-          resolutionIndex,
+          {
+            fileCache,
+            nonMarkdownFiles,
+            knownFileSet: resolutionIndex.fileSet,
+            resolutionIndex,
+          },
         );
       },
       evaluateStructuredWhere: (
@@ -2854,147 +2789,68 @@ fields:
         fileTypes: string[],
         body?: string | null,
       ) => this.evaluateStructuredWhere(condition, frontmatter, relativePath, fileTypes, body),
-      detectCircularFormulas: (formulas: Record<string, string>) => this.detectCircularFormulas(formulas),
-      computeQuerySummaries: (
-        rows: Array<{ frontmatter: Record<string, unknown> }>,
-        propertySummaries: Record<string, string>,
-        customSummaries: Record<string, string>,
-      ) => this.computeQuerySummaries(rows, propertySummaries, customSummaries),
       useCel: this.config.spec_profile === "v0.3",
       omitBodyWhenExcluded: this.config.spec_profile === "v0.3",
     });
     return result as QueryResult & { error?: { code: string; message: string } };
   }
 
-  private computeQuerySummaries(
-    rows: Array<{ frontmatter: Record<string, unknown> }>,
-    propertySummaries: Record<string, string>,
-    customSummaries: Record<string, string>,
-  ): Record<string, unknown> {
-    const summary: Record<string, unknown> = {};
-    for (const [field, summaryType] of Object.entries(propertySummaries)) {
-      const values = rows.map((r) => r.frontmatter[field]).filter((v) => v !== undefined);
-
-      if (customSummaries[summaryType]) {
-        summary[field] = this.evaluateCustomSummary(customSummaries[summaryType], values);
-        continue;
-      }
-
-      switch (summaryType) {
-        case "Average": {
-          const nums = values.filter((v): v is number => typeof v === "number");
-          summary[field] = nums.length ? nums.reduce((a, b) => a + b, 0) / nums.length : null;
-          break;
-        }
-        case "Sum": {
-          const nums = values.filter((v): v is number => typeof v === "number");
-          summary[field] = nums.reduce((a, b) => a + b, 0);
-          break;
-        }
-        case "Min": {
-          const nums = values.filter((v): v is number => typeof v === "number");
-          summary[field] = nums.length ? Math.min(...nums) : null;
-          break;
-        }
-        case "Max": {
-          const nums = values.filter((v): v is number => typeof v === "number");
-          summary[field] = nums.length ? Math.max(...nums) : null;
-          break;
-        }
-        case "Earliest": {
-          const strings = values.filter((v): v is string => typeof v === "string");
-          summary[field] = strings.length ? [...strings].sort()[0] : null;
-          break;
-        }
-        case "Latest": {
-          const strings = values.filter((v): v is string => typeof v === "string");
-          summary[field] = strings.length ? [...strings].sort().at(-1) ?? null : null;
-          break;
-        }
-        case "Checked":
-          summary[field] = values.filter((v) => v === true).length;
-          break;
-        case "Unchecked":
-          summary[field] = values.filter((v) => v === false).length;
-          break;
-        case "Empty":
-          summary[field] = rows.filter((r) => {
-            const value = r.frontmatter[field];
-            return value === undefined || value === null || value === "";
-          }).length;
-          break;
-        case "Filled":
-          summary[field] = rows.filter((r) => {
-            const value = r.frontmatter[field];
-            return value !== undefined && value !== null && value !== "";
-          }).length;
-          break;
-        case "Unique":
-          summary[field] = new Set(values.map((v) => JSON.stringify(v))).size;
-          break;
-        default:
-          summary[field] = null;
-      }
-    }
-    return summary;
+  /** Execute the strict portable v0.3 query-object contract. */
+  async queryCanonical(input: CanonicalQueryInput): Promise<CanonicalQueryResult> {
+    return await this.observer.trace(
+      "collection.query_canonical",
+      { limit: input.limit, offset: input.offset, type_count: input.types?.length },
+      () => this.queryCanonicalUnobserved(input),
+    );
   }
 
-  private evaluateCustomSummary(formula: string, values: unknown[]): unknown {
-    try {
-      return evaluateExpression(formula, {
-        frontmatter: { values },
-      });
-    } catch {
-      return null;
-    }
+  private async queryCanonicalUnobserved(input: CanonicalQueryInput): Promise<CanonicalQueryResult> {
+    return await executeCanonicalQuery(input, {
+      typeDefs: this.typeDefs,
+      scanFiles: () => this.scanFiles(),
+      read: (relativePath: string) => this.read(relativePath),
+      buildFileCache: async (files: string[]) => {
+        const built = await this.buildFileCache(files);
+        return built as Map<string, IndexedReadResult>;
+      },
+    });
   }
 
-  /**
-   * Detect circular references in query formulas.
-   */
-  private detectCircularFormulas(formulas: Record<string, string>): { code: string; message: string } | null {
-    const formulaNames = new Set(Object.keys(formulas));
-    const deps = new Map<string, Set<string>>();
+  /** Discover valid canonical saved-view records. */
+  async listViews(): Promise<SavedViewListResult> {
+    return await this.observer.trace(
+      "collection.list_views",
+      {},
+      async () => await listCanonicalViews({
+        scanFiles: () => this.scanFiles(),
+        read: (relativePath) => this.read(relativePath),
+        buildFileCache: async (files) => {
+          const built = await this.buildFileCache(files);
+          return built as Map<string, IndexedReadResult>;
+        },
+      }),
+    );
+  }
 
-    for (const [name, expr] of Object.entries(formulas)) {
-      const fieldDeps = new Set<string>();
-      // Find references to formula.X in the expression
-      const pattern = /formula\.(\w+)/g;
-      let match;
-      while ((match = pattern.exec(expr)) !== null) {
-        const ref = match[1];
-        if (ref === name) {
-          return { code: "circular_formula", message: `Self-referencing formula: "${name}"` };
-        }
-        if (formulaNames.has(ref)) {
-          fieldDeps.add(ref);
-        }
-      }
-      deps.set(name, fieldDeps);
-    }
+  /** Resolve and execute an ordinary `type: view` Markdown record. */
+  async executeView(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
+    return await this.observer.trace(
+      "collection.execute_view",
+      { path: input.path, view: input.view, render: input.render },
+      () => this.executeViewUnobserved(input),
+    );
+  }
 
-    // DFS cycle detection
-    const visited = new Set<string>();
-    const inStack = new Set<string>();
-
-    function dfs(node: string): boolean {
-      if (inStack.has(node)) return true;
-      if (visited.has(node)) return false;
-      visited.add(node);
-      inStack.add(node);
-      for (const dep of deps.get(node) ?? []) {
-        if (dfs(dep)) return true;
-      }
-      inStack.delete(node);
-      return false;
-    }
-
-    for (const name of formulaNames) {
-      if (dfs(name)) {
-        return { code: "circular_formula", message: `Circular reference in formulas involving "${name}"` };
-      }
-    }
-    return null;
+  private async executeViewUnobserved(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
+    return await executeCanonicalView(input, {
+      scanFiles: () => this.scanFiles(),
+      read: (relativePath) => this.read(relativePath),
+      buildFileCache: async (files) => {
+        const built = await this.buildFileCache(files);
+        return built as Map<string, IndexedReadResult>;
+      },
+      executeQuery: (query) => this.queryCanonical(query),
+    });
   }
 
   /**
@@ -3007,51 +2863,13 @@ fields:
     types: string[],
     body?: string | null,
   ): boolean {
-    // String expression
-    if (typeof where === "string") {
-      if (this.config.spec_profile === "v0.3") {
-        const folder = path.dirname(filePath) === "." ? "" : path.dirname(filePath);
-        const result = evaluateMdbaseCel(where, {
-          record: frontmatter,
-          raw: frontmatter,
-          file: {
-            path: filePath,
-            name: path.basename(filePath),
-            folder,
-            body: body ?? "",
-          },
-        });
-        return result.diagnostics.length === 0 && result.value === true;
-      }
-      return evaluateWhere(where, { frontmatter, path: filePath, types, body });
-    }
-
-    // Handle logical operators
-    if ("and" in where) {
-      const conditions = where.and as Array<string | Record<string, unknown>>;
-      return conditions.every((c) =>
-        this.evaluateStructuredWhere(c, frontmatter, filePath, types, body),
-      );
-    }
-    if ("or" in where) {
-      const conditions = where.or as Array<string | Record<string, unknown>>;
-      return conditions.some((c) =>
-        this.evaluateStructuredWhere(c, frontmatter, filePath, types, body),
-      );
-    }
-    if ("not" in where) {
-      const condition = where.not as string | Record<string, unknown>;
-      return !this.evaluateStructuredWhere(condition, frontmatter, filePath, types, body);
-    }
-
-    // Handle explicit expression key
-    if ("expression" in where) {
-      const expr = where.expression as string;
-      return evaluateWhere(expr, { frontmatter, path: filePath, types, body });
-    }
-
-    // Handle field conditions (same as type match where)
-    return this.matchesWhereConditions(frontmatter, where);
+    return evaluateWhereClause(where, {
+      frontmatter,
+      filePath,
+      types,
+      body,
+      specProfile: this.config.spec_profile,
+    });
   }
 
   /**
@@ -3161,6 +2979,9 @@ fields:
     types: string[],
   ): Promise<MdbaseError[]> {
     const issues: MdbaseError[] = [];
+    if (!this.hasUniquenessValues(updatingPath, frontmatter, types)) {
+      return issues;
+    }
     const files = await this.scanFiles();
     const fileCache = await this.buildFileCache(files);
 
@@ -3244,14 +3065,42 @@ fields:
     return issues;
   }
 
+  /** Avoid a collection scan when the candidate supplies no constrained value. */
+  private hasUniquenessValues(
+    relativePath: string,
+    frontmatter: Record<string, unknown>,
+    types: string[],
+  ): boolean {
+    const idValue = frontmatter[this.config.settings.id_field];
+    if (idValue !== null && idValue !== undefined) return true;
+
+    for (const typeName of types) {
+      const typeDef = this.typeDefs.get(typeName);
+      for (const [fieldName, fieldDef] of Object.entries(typeDef?.fields ?? {})) {
+        const value = frontmatter[fieldName];
+        if (fieldDef.unique && value !== null && value !== undefined) return true;
+      }
+      for (const rule of typeDef?.collection?.unique ?? []) {
+        if (!this.v03UniqueRuleApplies(rule, typeName, relativePath, types)) continue;
+        const value = getFieldPathValue(frontmatter, rule.field);
+        if (value.present && value.value !== null && value.value !== undefined) return true;
+      }
+    }
+    return false;
+  }
+
   /**
    * Batch delete: delete all files matching a where expression.
    */
-  async batchDelete(input: {
-    where: string;
-    dry_run?: boolean;
-    check_backlinks?: boolean;
-  }): Promise<BatchResult> {
+  async batchDelete(input: BatchDeleteInput): Promise<BatchResult> {
+    return await this.observer.trace(
+      "collection.batch_delete",
+      { dry_run: input.dry_run, check_backlinks: input.check_backlinks },
+      () => this.batchDeleteUnobserved(input),
+    );
+  }
+
+  private async batchDeleteUnobserved(input: BatchDeleteInput): Promise<BatchResult> {
     // Find matching files
     const files = await this.scanFiles();
     const fileCache = await this.buildFileCache(files);
@@ -3347,12 +3196,15 @@ fields:
    *   1. where + fields: update all matching files with the same fields
    *   2. updates[]: array of {path, fields} for per-file updates
    */
-  async batchUpdate(input: {
-    where?: string;
-    fields?: Record<string, unknown>;
-    updates?: Array<{ path: string; fields: Record<string, unknown> }>;
-    dry_run?: boolean;
-  }): Promise<BatchResult> {
+  async batchUpdate(input: BatchUpdateInput): Promise<BatchResult> {
+    return await this.observer.trace(
+      "collection.batch_update",
+      { dry_run: input.dry_run, update_count: input.updates?.length },
+      () => this.batchUpdateUnobserved(input),
+    );
+  }
+
+  private async batchUpdateUnobserved(input: BatchUpdateInput): Promise<BatchResult> {
     // Mode 1: updates array (pre-validation all-or-nothing)
     if (input.updates) {
       return await this.batchUpdateByList(input.updates, input.dry_run);
@@ -3451,7 +3303,7 @@ fields:
     const fileCache = this.skipDependents ? await this.buildFileCache(files) : undefined;
     const nonMdSet = this.skipDependents ? this.buildNonMarkdownSet(await this.scanAllFiles()) : undefined;
     const resolutionIndex = this.skipDependents && fileCache
-      ? this.buildLinkResolutionIndex(files, fileCache)
+      ? this.linkResolver.buildIndex(files, fileCache)
       : undefined;
 
     for (const relativePath of matchingPaths) {
@@ -3489,15 +3341,16 @@ fields:
               // Also try full link resolution
               if (!dependsOnFailed) {
                 try {
-                  const resolved = this.resolveLinkFullWithFiles(
+                  const resolved = this.linkResolver.resolve(
                     linkVal,
                     relativePath,
                     files,
-                    undefined,
-                    fileCache,
-                    nonMdSet,
-                    resolutionIndex?.fileSet,
-                    resolutionIndex,
+                    {
+                      fileCache,
+                      nonMarkdownFiles: nonMdSet,
+                      knownFileSet: resolutionIndex?.fileSet,
+                      resolutionIndex,
+                    },
                   );
                   if (resolved.resolved && failedPaths.has(resolved.resolved)) {
                     dependsOnFailed = true;
@@ -3656,13 +3509,15 @@ fields:
   /**
    * Backfill defaults and/or generated fields for matching files.
    */
-  async backfill(input: {
-    type?: string;
-    where?: string | Record<string, unknown>;
-    fields?: string[];
-    apply?: { defaults?: boolean; generated?: boolean };
-    dry_run?: boolean;
-  }): Promise<BatchResult> {
+  async backfill(input: BackfillInput): Promise<BatchResult> {
+    return await this.observer.trace(
+      "collection.backfill",
+      { type: input.type, dry_run: input.dry_run, field_count: input.fields?.length },
+      () => this.backfillUnobserved(input),
+    );
+  }
+
+  private async backfillUnobserved(input: BackfillInput): Promise<BatchResult> {
     const applyDefaults = input.apply?.defaults !== false;
     const applyGenerated = input.apply?.generated !== false;
     const typeName = input.type ? String(input.type).toLowerCase() : undefined;
@@ -3976,6 +3831,14 @@ fields:
    * Run a migration manifest by id.
    */
   async migrate(input: { id?: string; dry_run?: boolean }): Promise<Record<string, unknown>> {
+    return await this.observer.trace(
+      "collection.migrate",
+      { migration: input.id, dry_run: input.dry_run },
+      () => this.migrateUnobserved(input),
+    );
+  }
+
+  private async migrateUnobserved(input: { id?: string; dry_run?: boolean }): Promise<Record<string, unknown>> {
     if (!input.id) {
       return { error: { code: "invalid_request", message: "migrate requires id" } };
     }
@@ -4067,6 +3930,14 @@ fields:
    * Rebuild cache from disk.
    */
   async cacheRebuild(): Promise<CacheOpResult> {
+    return await this.observer.trace(
+      "collection.cache_rebuild",
+      {},
+      () => this.cacheRebuildUnobserved(),
+    );
+  }
+
+  private async cacheRebuildUnobserved(): Promise<CacheOpResult> {
     if (!this.cache) {
       return { success: false, error: { code: "cache_unavailable", message: "Cache store is unavailable" } };
     }
@@ -4090,6 +3961,14 @@ fields:
    * Clear cache from disk.
    */
   async cacheClear(): Promise<CacheOpResult> {
+    return await this.observer.trace(
+      "collection.cache_clear",
+      {},
+      () => this.cacheClearUnobserved(),
+    );
+  }
+
+  private async cacheClearUnobserved(): Promise<CacheOpResult> {
     if (!this.cache) {
       return { success: true };
     }
@@ -4100,6 +3979,14 @@ fields:
   }
 
   async close(): Promise<void> {
+    return await this.observer.trace(
+      "collection.close",
+      {},
+      () => this.closeUnobserved(),
+    );
+  }
+
+  private async closeUnobserved(): Promise<void> {
     if (!this.cache) return;
     try {
       await this.cache.close();
@@ -4344,19 +4231,25 @@ fields:
     const fileCache = await this.buildFileCache(files);
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
-    const resolutionIndex = this.buildLinkResolutionIndex(files, fileCache);
-    return this.resolveLinkFullWithFiles(
+    const resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
+    return this.linkResolver.resolve(
       linkValue,
       fromPath,
       files,
-      targetType,
-      fileCache,
-      nonMdSet,
-      resolutionIndex.fileSet,
-      resolutionIndex,
+      {
+        targetType,
+        fileCache,
+        nonMarkdownFiles: nonMdSet,
+        knownFileSet: resolutionIndex.fileSet,
+        resolutionIndex,
+      },
     );
   }
 
+  /**
+   * Snapshot adapter retained for internal evaluators and the conformance
+   * harness. Resolution policy lives in LinkResolver.
+   */
   private resolveLinkFullWithFiles(
     linkValue: string,
     fromPath: string,
@@ -4367,297 +4260,13 @@ fields:
     knownFileSet?: Set<string>,
     resolutionIndex?: LinkResolutionIndex,
   ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
-    // Parse the link to get the target
-    let parsed: ParsedLink | null;
-    try {
-      parsed = parseLink(linkValue);
-    } catch {
-      return { resolved: null };
-    }
-
-    const target = parsed ? parsed.target : linkValue;
-    const format = parsed ? parsed.format : "wikilink";
-    const isRelative = parsed ? parsed.is_relative : false;
-
-    const fromDir = path.dirname(fromPath);
-
-    // Strip anchor from target for resolution
-    const resolveTarget = target;
-    const fileSet = knownFileSet ?? resolutionIndex?.fileSet ?? new Set(files);
-    const index = resolutionIndex ?? this.buildLinkResolutionIndex(files, fileCache, fileSet);
-
-    // Helper to check if a file exists (markdown files in scan list, or any file on disk)
-    const fileExists = (p: string): boolean => {
-      if (fileSet.has(p)) return true;
-      return nonMarkdownFiles ? nonMarkdownFiles.has(p) : false;
-    };
-
-    // Step 1: Path-based resolution
-    if (format === "markdown" || format === "path") {
-      // Markdown/path links resolve relative to containing file directory
-      let resolved: string;
-      if (resolveTarget.startsWith("/")) {
-        // Root-relative
-        resolved = resolveTarget.slice(1);
-      } else if (isRelative || !resolveTarget.startsWith("/")) {
-        // Relative to containing file
-        resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
-      } else {
-        resolved = resolveTarget;
-      }
-      resolved = resolved.replace(/\\/g, "/");
-
-      // Check if file exists
-      if (fileExists(resolved)) {
-        return this.checkTargetType(resolved, targetType, fileCache);
-      }
-      // Try with extensions
-      for (const ext of this.getExtensions()) {
-        if (fileExists(resolved + ext)) {
-          return this.checkTargetType(resolved + ext, targetType, fileCache);
-        }
-      }
-      return { resolved: null };
-    }
-
-    // Wikilink resolution
-    if (format === "wikilink") {
-      // Relative wikilinks (./, ../)
-      if (isRelative) {
-        let resolved = path.posix.normalize(path.posix.join(fromDir, resolveTarget));
-        resolved = resolved.replace(/\\/g, "/");
-        if (fileExists(resolved)) {
-          return this.checkTargetType(resolved, targetType, fileCache);
-        }
-        for (const ext of this.getExtensions()) {
-          if (fileSet.has(resolved + ext)) {
-            return this.checkTargetType(resolved + ext, targetType, fileCache);
-          }
-        }
-        return { resolved: null };
-      }
-
-      // Root-relative (/path)
-      if (resolveTarget.startsWith("/")) {
-        const resolved = resolveTarget.slice(1);
-        if (fileExists(resolved)) {
-          return this.checkTargetType(resolved, targetType, fileCache);
-        }
-        for (const ext of this.getExtensions()) {
-          if (fileSet.has(resolved + ext)) {
-            return this.checkTargetType(resolved + ext, targetType, fileCache);
-          }
-        }
-        return { resolved: null };
-      }
-
-      // Contains slash (absolute from root)
-      if (resolveTarget.includes("/")) {
-        if (fileExists(resolveTarget)) {
-          return this.checkTargetType(resolveTarget, targetType, fileCache);
-        }
-        for (const ext of this.getExtensions()) {
-          if (fileExists(resolveTarget + ext)) {
-            return this.checkTargetType(resolveTarget + ext, targetType, fileCache);
-          }
-        }
-        return { resolved: null };
-      }
-
-      // Simple name resolution
-      return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache, index);
-    }
-
-    // Fallback: try as simple name
-    return this.resolveSimpleName(resolveTarget, fromPath, files, targetType, fileCache, index);
-  }
-
-  /**
-   * Resolve a simple name (no path separators) using ID field match, then filename match.
-   */
-  private resolveSimpleName(
-    name: string,
-    fromPath: string,
-    files: string[],
-    targetType?: string,
-    fileCache?: Map<string, ReadResult>,
-    resolutionIndex?: LinkResolutionIndex,
-  ): { resolved: string | null; ambiguous?: boolean; wrongType?: boolean } {
-    const fromDir = path.dirname(fromPath);
-
-    // Determine scope: if target constraint, limit to files of that type
-    let scopeFiles = files;
-    if (targetType) {
-      scopeFiles = files.filter((f) => {
-        const readResult = fileCache?.get(f);
-        if (!readResult?.types) return false;
-        return readResult.types.includes(targetType);
-      });
-    }
-
-    // Step 1: ID field match
-    const idField = this.config.settings.id_field;
-    const scopeSet = targetType ? new Set(scopeFiles) : undefined;
-    const idCandidates = idField
-      ? (resolutionIndex?.idToFiles.get(name) ?? this.scanIdMatchesByName(name, files, fileCache, idField))
-      : [];
-    const idMatches = scopeSet
-      ? idCandidates.filter((filePath) => scopeSet.has(filePath))
-      : idCandidates;
-
-    if (idMatches.length === 1) {
-      return this.checkTargetType(idMatches[0], targetType, fileCache);
-    }
-    if (idMatches.length > 1) {
-      return { resolved: null, ambiguous: true };
-    }
-
-    // Step 2: Filename match
-    const basenameCandidates = resolutionIndex?.basenameToFiles.get(name) ?? this.scanBasenameMatches(name, files);
-    const filenameMatches = scopeSet
-      ? basenameCandidates.filter((filePath) => scopeSet.has(filePath))
-      : basenameCandidates;
-
-    if (filenameMatches.length === 0) {
-      // If there's a target constraint and no match found, check if a match exists outside scope
-      if (targetType) {
-        if (basenameCandidates.length > 0) {
-          return { resolved: null, wrongType: true };
-        }
-        // Also check ID match outside scope
-        if (idField && idCandidates.length > 0) {
-          return { resolved: null, wrongType: true };
-        }
-      }
-      return { resolved: null };
-    }
-
-    if (filenameMatches.length === 1) {
-      return this.checkTargetType(filenameMatches[0], targetType, fileCache);
-    }
-
-    // Apply tiebreakers
-    // 1. Same directory preference
-    const sameDir = filenameMatches.filter((f) => path.dirname(f) === fromDir);
-    if (sameDir.length === 1) {
-      return this.checkTargetType(sameDir[0], targetType, fileCache);
-    }
-
-    // 2. Shortest path
-    const sorted = [...filenameMatches].sort((a, b) => {
-      const depthA = a.split("/").length;
-      const depthB = b.split("/").length;
-      if (depthA !== depthB) return depthA - depthB;
-      // 3. Alphabetical
-      return a.localeCompare(b);
+    return this.linkResolver.resolve(linkValue, fromPath, files, {
+      targetType,
+      fileCache,
+      nonMarkdownFiles,
+      knownFileSet,
+      resolutionIndex,
     });
-
-    // If multiple with same depth after sort, check if it's ambiguous
-    const shortestDepth = sorted[0].split("/").length;
-    const shortestPaths = sorted.filter((f) => f.split("/").length === shortestDepth);
-    if (shortestPaths.length > 1) {
-      // Alphabetical tiebreaker
-      return this.checkTargetType(shortestPaths.sort()[0], targetType, fileCache);
-    }
-
-    return this.checkTargetType(sorted[0], targetType, fileCache);
-  }
-
-  private scanBasenameMatches(name: string, files: string[]): string[] {
-    const matches: string[] = [];
-    for (const filePath of files) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      if (basename === name) {
-        matches.push(filePath);
-      }
-    }
-    return matches;
-  }
-
-  private scanIdMatchesByName(
-    name: string,
-    files: string[],
-    fileCache: Map<string, ReadResult> | undefined,
-    idField: string,
-  ): string[] {
-    const matches: string[] = [];
-    for (const filePath of files) {
-      const readResult = fileCache?.get(filePath);
-      if (!readResult?.frontmatter) continue;
-      const idValue = readResult.frontmatter[idField];
-      if (idValue !== null && idValue !== undefined && String(idValue) === name) {
-        matches.push(filePath);
-      }
-    }
-    return matches;
-  }
-
-  private buildLinkResolutionIndex(
-    files: string[],
-    fileCache?: Map<string, ReadResult>,
-    fileSet?: Set<string>,
-  ): LinkResolutionIndex {
-    const basenameToFiles = new Map<string, string[]>();
-    const idToFiles = new Map<string, string[]>();
-    const idField = this.config.settings.id_field;
-
-    for (const filePath of files) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      const existingByName = basenameToFiles.get(basename);
-      if (existingByName) {
-        existingByName.push(filePath);
-      } else {
-        basenameToFiles.set(basename, [filePath]);
-      }
-
-      if (!idField) continue;
-      const readResult = fileCache?.get(filePath);
-      const idValue = readResult?.frontmatter?.[idField];
-      if (idValue === null || idValue === undefined) continue;
-      const key = String(idValue);
-      const existingById = idToFiles.get(key);
-      if (existingById) {
-        existingById.push(filePath);
-      } else {
-        idToFiles.set(key, [filePath]);
-      }
-    }
-
-    return {
-      fileSet: fileSet ?? new Set(files),
-      basenameToFiles,
-      idToFiles,
-    };
-  }
-
-  /**
-   * Check if the resolved file matches the target type constraint.
-   */
-  private checkTargetType(
-    resolvedPath: string,
-    targetType?: string,
-    fileCache?: Map<string, ReadResult>,
-  ): { resolved: string; wrongType?: boolean } {
-    if (!targetType) {
-      return { resolved: resolvedPath };
-    }
-
-    const readResult = fileCache?.get(resolvedPath);
-    if (!readResult?.types || !readResult.types.includes(targetType)) {
-      return { resolved: resolvedPath, wrongType: true };
-    }
-    return { resolved: resolvedPath };
-  }
-
-  /**
-   * Get configured file extensions to try for link resolution.
-   */
-  private getExtensions(): string[] {
-    const configExts = this.config.settings?.record_extensions ?? ["md"];
-    const normalized = configExts.map((e: string) => e.startsWith(".") ? e : `.${e}`);
-    return normalized.includes(".md")
-      ? [".md", ...normalized.filter((e: string) => e !== ".md")]
-      : normalized;
   }
 
   /**
@@ -4734,9 +4343,8 @@ fields:
   }
 
   private async getBacklinkTokenIndex(): Promise<BacklinkTokenIndex> {
-    if (this.cachedBacklinkTokenIndex) {
-      return this.cachedBacklinkTokenIndex;
-    }
+    const cached = this.runtimeCache.getBacklinkTokens();
+    if (cached) return cached;
 
     const files = await this.scanFiles();
     const fileCache = await this.buildFileCache(files);
@@ -4763,6 +4371,10 @@ fields:
         }
       }
 
+      for (const bodyLink of extractBodyLinks(readResult.body ?? "")) {
+        tokens.add(this.extractLinkTarget(bodyLink.raw));
+      }
+
       sourceToTokens.set(sourcePath, tokens);
       for (const token of tokens) {
         let sources = tokenToSources.get(token);
@@ -4774,28 +4386,14 @@ fields:
       }
     }
 
-    this.cachedBacklinkTokenIndex = {
+    return this.runtimeCache.setBacklinkTokens({
       tokenToSources,
       sourceToTokens,
-    };
-    return this.cachedBacklinkTokenIndex;
+    });
   }
 
   private removeSourceFromBacklinkTokenIndex(sourcePath: string): void {
-    if (!this.cachedBacklinkTokenIndex) return;
-    const tokens = this.cachedBacklinkTokenIndex.sourceToTokens.get(sourcePath);
-    if (!tokens) return;
-
-    for (const token of tokens) {
-      const sources = this.cachedBacklinkTokenIndex.tokenToSources.get(token);
-      if (!sources) continue;
-      sources.delete(sourcePath);
-      if (sources.size === 0) {
-        this.cachedBacklinkTokenIndex.tokenToSources.delete(token);
-      }
-    }
-
-    this.cachedBacklinkTokenIndex.sourceToTokens.delete(sourcePath);
+    this.runtimeCache.removeBacklinkSource(sourcePath);
   }
 
   private async findBacklinks(targetPaths: string[]): Promise<Array<{ target: string; referrer: string }>> {
@@ -4828,25 +4426,34 @@ fields:
    * Returns one entry per source file (deduplicated).
    */
   async computeBacklinksForFile(targetPath: string): Promise<BacklinkEntry[]> {
+    return await this.observer.trace(
+      "collection.compute_backlinks",
+      { path: targetPath },
+      () => this.computeBacklinksForFileUnobserved(targetPath),
+    );
+  }
+
+  private async computeBacklinksForFileUnobserved(targetPath: string): Promise<BacklinkEntry[]> {
     const files = await this.scanFiles();
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
     const fileCache = await this.buildFileCache(files);
-    const resolutionIndex = this.buildLinkResolutionIndex(files, fileCache);
+    const resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
     const linkIndex = buildLinkIndex({
       files,
       fileCache,
       typeDefs: this.typeDefs,
       resolveLink: (linkValue: string, fromPath: string) =>
-        this.resolveLinkFullWithFiles(
+        this.linkResolver.resolve(
           linkValue,
           fromPath,
           files,
-          undefined,
-          fileCache,
-          nonMdSet,
-          resolutionIndex.fileSet,
-          resolutionIndex,
+          {
+            fileCache,
+            nonMarkdownFiles: nonMdSet,
+            knownFileSet: resolutionIndex.fileSet,
+            resolutionIndex,
+          },
         ),
     });
     return linkIndex.backlinksFor(targetPath);
@@ -4881,13 +4488,8 @@ fields:
   }
 
   private async buildFileCache(files: string[]): Promise<Map<string, ReadResult>> {
-    if (
-      this.cachedFileCache &&
-      this.cachedFileCacheFiles &&
-      this.areSamePathLists(files, this.cachedFileCacheFiles)
-    ) {
-      return this.cachedFileCache;
-    }
+    const cached = this.runtimeCache.getFileCache(files);
+    if (cached) return cached;
 
     const fileCache = new Map<string, ReadResult>();
     const workerCount = Math.max(1, Math.min(16, files.length));
@@ -4905,12 +4507,7 @@ fields:
     });
     await Promise.all(workers);
 
-    if (this.cachedFiles && this.areSamePathLists(files, this.cachedFiles)) {
-      this.cachedFileCache = fileCache;
-      this.cachedFileCacheFiles = this.cachedFiles;
-    }
-
-    return fileCache;
+    return this.runtimeCache.setFileCache(files, fileCache);
   }
 
   private async updateCacheForPath(relativePath: string): Promise<void> {
@@ -4948,107 +4545,11 @@ fields:
     await this.cache.upsertFile(relativePath, stat, frontmatter, body);
   }
 
-  private async scanFilesRecursive(scanDir: string): Promise<string[]> {
-    const files: string[] = [];
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
-    } catch {
-      return files;
-    }
-
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-
-    for (const entry of entries) {
-      const fullPath = path.join(scanDir, entry.name);
-      const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
-
-      if (this.isExcluded(relativePath)) continue;
-
-      if (entry.isDirectory()) {
-        const nestedConfig = path.join(fullPath, "mdbase.yaml");
-        if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
-          continue;
-        }
-        if (this.config.settings.include_subfolders) {
-          files.push(...await this.scanFilesRecursive(fullPath));
-        }
-      } else if (this.isMarkdownFile(entry.name)) {
-        if (entry.name === "mdbase.yaml") continue;
-        files.push(relativePath);
-      }
-    }
-
-    return files;
-  }
-
-  private async scanAllFilesRecursive(scanDir: string): Promise<string[]> {
-    const files: string[] = [];
-
-    let entries: fs.Dirent[];
-    try {
-      entries = await fs.promises.readdir(scanDir, { withFileTypes: true });
-    } catch {
-      return files;
-    }
-
-    entries.sort((a, b) => a.name.localeCompare(b.name));
-
-    for (const entry of entries) {
-      const fullPath = path.join(scanDir, entry.name);
-      const relativePath = path.relative(this.root, fullPath).replace(/\\/g, "/");
-
-      if (this.isExcluded(relativePath)) continue;
-
-      if (entry.isDirectory()) {
-        const nestedConfig = path.join(fullPath, "mdbase.yaml");
-        if (await this.fileExists(nestedConfig) && fullPath !== this.root) {
-          continue;
-        }
-        if (this.config.settings.include_subfolders) {
-          files.push(...await this.scanAllFilesRecursive(fullPath));
-        }
-      } else {
-        if (entry.name === "mdbase.yaml") continue;
-        files.push(relativePath);
-      }
-    }
-
-    return files;
-  }
-
   private async scanTypeFilesForRuntime(): Promise<string[]> {
-    const root = this.root;
-    const typesRoot = path.join(this.root, this.config.settings.types_folder);
-    const migrationsRoot = path.resolve(this.root, this.config.settings.migrations_folder);
-    const files: string[] = [];
-
-    async function walk(directory: string): Promise<void> {
-      let entries: fs.Dirent[];
-      try {
-        entries = await fs.promises.readdir(directory, { withFileTypes: true });
-      } catch {
-        return;
-      }
-
-      entries.sort((a, b) => a.name.localeCompare(b.name));
-      for (const entry of entries) {
-        const fullPath = path.join(directory, entry.name);
-        const resolved = path.resolve(fullPath);
-        if (resolved === migrationsRoot || resolved.startsWith(migrationsRoot + path.sep)) {
-          continue;
-        }
-        if (entry.isDirectory()) {
-          await walk(fullPath);
-        } else if (entry.isFile() && path.extname(entry.name) === ".md") {
-          files.push(path.relative(root, fullPath).replace(/\\/g, "/"));
-        }
-      }
-    }
-
-    await walk(typesRoot);
-    return files;
+    return await this.scanner.scanTypeFiles(
+      this.config.settings.types_folder,
+      this.config.settings.migrations_folder,
+    );
   }
 
   /**
@@ -5056,101 +4557,29 @@ fields:
    */
   private async scanFiles(dir?: string): Promise<string[]> {
     if (dir && path.resolve(dir) !== path.resolve(this.root)) {
-      return await this.scanFilesRecursive(dir);
+      return await this.scanner.scanRecordFiles(dir);
     }
-    if (this.cachedFiles) {
-      return this.cachedFiles;
-    }
-    this.cachedFiles = await this.scanFilesRecursive(this.root);
-    return this.cachedFiles;
+    const cached = this.runtimeCache.getFiles();
+    if (cached) return cached;
+    return this.runtimeCache.setFiles(await this.scanner.scanRecordFiles());
   }
 
   private async scanAllFiles(dir?: string): Promise<string[]> {
     if (dir && path.resolve(dir) !== path.resolve(this.root)) {
-      return await this.scanAllFilesRecursive(dir);
+      return await this.scanner.scanAllFiles(dir);
     }
-    if (this.cachedAllFiles) {
-      return this.cachedAllFiles;
-    }
-    this.cachedAllFiles = await this.scanAllFilesRecursive(this.root);
-    return this.cachedAllFiles;
+    const cached = this.runtimeCache.getAllFiles();
+    if (cached) return cached;
+    return this.runtimeCache.setAllFiles(await this.scanner.scanAllFiles());
   }
 
   private buildNonMarkdownSet(allFiles: string[]): Set<string> {
-    if (
-      this.cachedNonMarkdownFiles &&
-      this.cachedAllFiles &&
-      this.areSamePathLists(allFiles, this.cachedAllFiles)
-    ) {
-      return this.cachedNonMarkdownFiles;
-    }
+    const cached = this.runtimeCache.getNonMarkdownFiles(allFiles);
+    if (cached) return cached;
 
-    const nonMd = new Set<string>();
-    for (const filePath of allFiles) {
-      if (!this.isMarkdownFile(filePath)) {
-        nonMd.add(filePath);
-      }
-    }
-
-    if (this.cachedAllFiles && this.areSamePathLists(allFiles, this.cachedAllFiles)) {
-      this.cachedNonMarkdownFiles = nonMd;
-    }
-
-    return nonMd;
+    const nonMd = this.scanner.nonRecordFiles(allFiles);
+    return this.runtimeCache.setNonMarkdownFiles(allFiles, nonMd);
   }
-}
-
-export interface V03Diagnostic {
-  severity: "info" | "warning" | "error";
-  code: string;
-  message: string;
-  path?: string;
-  field?: string;
-  type?: string;
-  schema_location?: string;
-  details?: unknown;
-}
-
-export interface V03OperationResult<T = Record<string, unknown>> {
-  valid: boolean;
-  result: T;
-  diagnostics: V03Diagnostic[];
-}
-
-export interface V03ReadInput {
-  path: string;
-}
-
-export interface V03ValidateInput {
-  path?: string;
-}
-
-export interface V03CreateInput {
-  type?: string;
-  types?: string[];
-  path?: string;
-  frontmatter?: Record<string, unknown>;
-  body?: string;
-}
-
-export interface V03UpdateInput {
-  path: string;
-  fields?: Record<string, unknown>;
-  body?: string;
-  if_revision?: string;
-}
-
-export interface V03DeleteInput {
-  path: string;
-  check_backlinks?: boolean;
-  if_revision?: string;
-}
-
-export interface V03RenameInput {
-  from: string;
-  to: string;
-  update_refs?: boolean;
-  if_revision?: string;
 }
 
 export class V03ProfileError extends Error {
@@ -5170,6 +4599,23 @@ export class V03Operations {
 
   async validate(input: V03ValidateInput = {}): Promise<V03OperationResult> {
     return await this.normalize("validate", input, await this.collection.validate(input.path));
+  }
+
+  async query(input: CanonicalQueryInput): Promise<V03OperationResult> {
+    return canonicalQueryOperationResult(await this.collection.queryCanonical(input));
+  }
+
+  async listViews(): Promise<V03OperationResult> {
+    const listed = await this.collection.listViews();
+    return {
+      valid: !listed.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+      result: { views: listed.views, meta: listed.meta },
+      diagnostics: listed.diagnostics,
+    };
+  }
+
+  async executeView(input: ExecuteViewInput): Promise<V03OperationResult> {
+    return canonicalQueryOperationResult(await this.collection.executeView(input));
   }
 
   async create(input: V03CreateInput): Promise<V03OperationResult> {
@@ -5259,6 +4705,15 @@ export class V03Operations {
       diagnostics: deduplicateV03Diagnostics(diagnostics),
     };
   }
+}
+
+function canonicalQueryOperationResult(query: CanonicalQueryResult): V03OperationResult {
+  const { error, ...result } = query;
+  return {
+    valid: error === undefined && !query.diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+    result,
+    diagnostics: query.diagnostics,
+  };
 }
 
 function collectV03Diagnostics(raw: Record<string, unknown>, fallbackPath?: string): V03Diagnostic[] {
@@ -5448,10 +4903,6 @@ function cloneJsonLike<T>(value: T): T {
   return JSON.parse(JSON.stringify(value)) as T;
 }
 
-function deepJsonEqual(left: unknown, right: unknown): boolean {
-  return canonicalJson(left) === canonicalJson(right);
-}
-
 function canonicalJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`;
   if (value && typeof value === "object") {
@@ -5465,20 +4916,6 @@ function sameStringSet(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false;
   const rightSet = new Set(right);
   return left.every((value) => rightSet.has(value));
-}
-
-function compareWhereValues(
-  left: unknown,
-  right: unknown,
-  compare: (leftValue: number | string, rightValue: number | string) => boolean,
-): boolean {
-  if (typeof left === "number" && typeof right === "number" && Number.isFinite(left) && Number.isFinite(right)) {
-    return compare(left, right);
-  }
-  if (typeof left === "string" && typeof right === "string") {
-    return compare(left, right);
-  }
-  return false;
 }
 
 async function computeRevision(filePath: string): Promise<string> {

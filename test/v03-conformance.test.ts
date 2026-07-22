@@ -22,6 +22,7 @@ import {
   type RuntimeContractRecord,
 } from "../src/runtime/contracts.js";
 import { migrateV02TypeFileToV03 } from "../src/migrations/type-migration.js";
+import type { CanonicalQueryInput, ExecuteViewInput } from "../src/operations/canonical-query.js";
 
 type Dict = Record<string, unknown>;
 
@@ -237,12 +238,30 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
       return await withOperationRoot(context, input, async (root) => {
         const collection = await open(root);
         try {
-          const result = await collection.query({
-            where: input.where as string | Dict | undefined,
-            order_by: input.order_by as Array<{ field: string; direction?: string }> | undefined,
-            include_body: input.include_body as boolean | undefined,
-          }) as Dict;
-          return { valid: true, ...result };
+          const result = await collection.queryCanonical(input as CanonicalQueryInput);
+          return adaptCanonicalQueryResult(result);
+        } finally {
+          await collection.close();
+        }
+      });
+
+    case "execute_view":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const result = await collection.executeView(input as unknown as ExecuteViewInput);
+          return adaptCanonicalQueryResult(result);
+        } finally {
+          await collection.close();
+        }
+      });
+
+    case "list_views":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const result = await collection.v03Operations().listViews();
+          return adapterResult(result, result.result as Dict);
         } finally {
           await collection.close();
         }
@@ -477,6 +496,15 @@ function adapterResult(
     issues: envelope.diagnostics,
     ...(warnings.length > 0 ? { warnings } : {}),
     ...(firstError ? { error: { code: firstError.code, message: firstError.message } } : {}),
+  };
+}
+
+function adaptCanonicalQueryResult(result: Awaited<ReturnType<Collection["queryCanonical"]>>): Dict {
+  return {
+    valid: result.error === undefined && !result.diagnostics.some((item) => item.severity === "error"),
+    ...result,
+    paths: result.results.map((row) => row.file.path),
+    context: result.meta.context ?? null,
   };
 }
 
@@ -925,6 +953,18 @@ async function assertExpectation(actual: Dict, expected: Dict, testName: string,
     (expected.results as Dict[]).forEach((expectedResult, index) => {
       assertSubset(actualResults?.[index], expectedResult, `${testName}: results[${index}]`);
     });
+  }
+  if (expected.views) {
+    assertSubset(actual.views, expected.views, `${testName}: views`);
+  }
+  if (expected.paths) {
+    expect(actual.paths, `${testName}: paths`).toEqual(expected.paths);
+  }
+  if ("context" in expected) {
+    expect(actual.context, `${testName}: context`).toEqual(expected.context);
+  }
+  if (expected.meta) {
+    assertSubset(actual.meta, expected.meta, `${testName}: meta`);
   }
   if (expected.body_returned === false) {
     for (const result of actual.results as Dict[] | undefined ?? []) {

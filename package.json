@@ -45,6 +45,8 @@
     "test:watch": "vitest",
     "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts",
     "test:package": "npm run build && node scripts/smoke-package.mjs",
+    "test:e2e": "npm run build && node scripts/e2e-package.mjs",
+    "test:all": "npm test && npm run test:package && npm run test:e2e",
     "profile": "npm run build && node dist/bin/mdb-profile.js"
   },
   "dependencies": {
