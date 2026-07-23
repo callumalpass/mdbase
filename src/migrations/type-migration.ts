@@ -221,7 +221,7 @@ function buildV03Type(oldType: Dict, options: { isTaskNotes: boolean }): Dict {
       statusMetadata.completed_values = cloneJsonLike(fieldDef.tn_completed_values);
     }
     if (fieldDef.generated !== undefined) {
-      addGeneratedLifecycle(lifecycle, fieldName, fieldDef.generated);
+      addGeneratedLifecycle(lifecycle, fieldName, fieldDef.generated, fieldDef.type);
     }
   }
 
@@ -422,13 +422,16 @@ function convertField(
   return { schema, links };
 }
 
-function addGeneratedLifecycle(lifecycle: Dict, fieldName: string, strategy: unknown): void {
+function addGeneratedLifecycle(lifecycle: Dict, fieldName: string, strategy: unknown, fieldType?: unknown): void {
+  // Date-typed fields take the date-only {today} provider so generated values
+  // stay valid against the field's own schema.
+  const nowProvider = fieldType === "date" ? { today: true } : { now: true };
   if (strategy === "now") {
-    lifecycleSet(lifecycle, "on_create", fieldName, { now: true });
+    lifecycleSet(lifecycle, "on_create", fieldName, nowProvider);
     return;
   }
   if (strategy === "now_on_write") {
-    lifecycleSet(lifecycle, "on_update", fieldName, { now: true });
+    lifecycleSet(lifecycle, "on_update", fieldName, nowProvider);
     return;
   }
   if (strategy === "uuid") {
