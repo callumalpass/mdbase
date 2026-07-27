@@ -4,6 +4,9 @@ import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
 const packageRoot = resolve(import.meta.dirname, "..");
+const packageVersion = JSON.parse(
+  readFileSync(join(packageRoot, "package.json"), "utf8"),
+).version;
 const tempRoot = mkdtempSync(join(tmpdir(), "mdbase-package-smoke-"));
 let tarball;
 
@@ -46,7 +49,7 @@ try {
   const installed = JSON.parse(
     readFileSync(join(tempRoot, "node_modules", "@callumalpass", "mdbase", "package.json"), "utf8"),
   );
-  if (installed.version !== "0.3.0-rc.1") {
+  if (installed.version !== packageVersion) {
     throw new Error(`Unexpected installed package version: ${installed.version}`);
   }
 
