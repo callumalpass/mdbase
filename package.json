@@ -1,6 +1,6 @@
 {
   "name": "@callumalpass/mdbase",
-  "version": "0.3.0-rc.1",
+  "version": "0.3.0-rc.2",
   "description": "TypeScript implementation of the mdbase specification",
   "license": "MIT",
   "type": "module",

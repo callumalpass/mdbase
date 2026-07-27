@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.3.0-rc.2 - 2026-07-28
+
 - Implement the canonical v0.3 query-object schema, invocation-context `this`
   binding, named projections, selection, grouping, and summaries.
 - Add headless execution of ordinary Markdown view records and advertise the
