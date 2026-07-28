@@ -37,7 +37,7 @@ export interface CanonicalQueryInput {
   limit?: number;
   offset?: number;
   include_body?: boolean;
-  frontmatter?: "effective" | "raw" | "both";
+  frontmatter_mode?: "effective" | "persisted" | "both";
   [extension: `x-${string}`]: unknown;
 }
 
@@ -98,7 +98,7 @@ export interface CanonicalQueryRow {
   path?: string;
   file: Record<string, unknown>;
   frontmatter?: Record<string, unknown>;
-  raw_frontmatter?: Record<string, unknown>;
+  effective_frontmatter?: Record<string, unknown>;
   values?: Record<string, unknown>;
   body?: string;
 }
@@ -453,8 +453,8 @@ function buildViewQuery(
     ...(typeof namedView.limit === "number" ? { limit: namedView.limit } : {}),
     ...(typeof namedView.offset === "number" ? { offset: namedView.offset } : {}),
     ...(typeof namedView.include_body === "boolean" ? { include_body: namedView.include_body } : {}),
-    ...(typeof namedView.frontmatter === "string"
-      ? { frontmatter: namedView.frontmatter as CanonicalQueryInput["frontmatter"] }
+    ...(typeof namedView.frontmatter_mode === "string"
+      ? { frontmatter_mode: namedView.frontmatter_mode as CanonicalQueryInput["frontmatter_mode"] }
       : {}),
     ...(typeof input.limit === "number" ? { limit: input.limit } : {}),
     ...(typeof input.offset === "number" ? { offset: input.offset } : {}),
@@ -1040,12 +1040,16 @@ function isEmptyValue(value: unknown): boolean {
 }
 
 function serializeRow(row: CandidateRow, input: CanonicalQueryInput): CanonicalQueryRow {
-  const frontmatterMode = input.frontmatter ?? "effective";
+  const frontmatterMode = input.frontmatter_mode ?? "effective";
   return {
     path: row.path,
     file: row.file,
-    frontmatter: frontmatterMode === "raw" ? row.raw : row.effective,
-    ...(frontmatterMode === "both" ? { raw_frontmatter: row.raw } : {}),
+    ...(frontmatterMode === "persisted" || frontmatterMode === "both"
+      ? { frontmatter: row.raw }
+      : {}),
+    ...(frontmatterMode === "effective" || frontmatterMode === "both"
+      ? { effective_frontmatter: row.effective }
+      : {}),
     ...(row.values ? { values: row.values } : {}),
     ...(input.include_body ? { body: row.body } : {}),
   };

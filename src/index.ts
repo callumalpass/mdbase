@@ -33,6 +33,7 @@ export type {
   TypeDefinition,
   TypeLoadResult,
   V03CollectionSemantics,
+  V03DataContractImplementation,
   V03Lifecycle,
   V03LifecycleAction,
   V03LifecycleValue,
@@ -41,6 +42,14 @@ export type {
   V03SchemaWrapper,
   V03UniqueRule,
 } from "./types/loader.js";
+export { DataContractRegistry, dataContractDigest } from "./data-contracts/registry.js";
+export type {
+  ContractViewResult,
+  DataContractDefinition,
+  DataContractDiagnostic,
+  DataContractImplementationDescriptor,
+  DataContractLoadResult,
+} from "./data-contracts/registry.js";
 export { validateJsonSchemaFrontmatter } from "./validation/json-schema.js";
 export {
   buildMdbaseCelBindings,
@@ -135,6 +144,15 @@ export type {
 } from "./operations/collection.js";
 export { CollectionAsync } from "./operations/collection-async.js";
 export type { CollectionAsyncCreateInput } from "./operations/collection-async.js";
+export { installTypePack } from "./type-packs/installer.js";
+export type {
+  InstallTypePackOptions,
+  TypePackInstallResult,
+  TypePackManifest,
+  TypePackManifestResource,
+  TypePackResourceDiff,
+  TypePackSourceResource,
+} from "./type-packs/installer.js";
 export type {
   BackfillInput,
   BatchDeleteInput,

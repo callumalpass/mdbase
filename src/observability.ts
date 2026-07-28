@@ -24,6 +24,8 @@ export interface ObservabilityOptions {
 
 export interface CollectionOptions {
   observability?: ObservabilityOptions;
+  /** Internal: recovery has already been completed by a staged transaction. */
+  skipTypePackRecovery?: boolean;
 }
 
 interface LogEventBase {

@@ -33,6 +33,10 @@ export const configSchema: Record<string, unknown> = {
           "type": "string",
           "minLength": 1
         },
+        "contracts_folder": {
+          "type": "string",
+          "minLength": 1
+        },
         "record_extensions": {
           "type": "array",
           "minItems": 1,
@@ -103,6 +107,100 @@ export const configSchema: Record<string, unknown> = {
         }
       },
       "additionalProperties": true
+    }
+  }
+};
+
+export const dataContractSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/v0.3/data-contract.schema.json",
+  "title": "mdbase v0.3 data contract frontmatter",
+  "type": "object",
+  "required": [
+    "kind",
+    "id",
+    "version",
+    "schema"
+  ],
+  "properties": {
+    "kind": {
+      "const": "mdbase.contract"
+    },
+    "id": {
+      "$ref": "#/$defs/contractId"
+    },
+    "version": {
+      "$ref": "#/$defs/semanticVersion"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "schema": {
+      "$ref": "#/$defs/schemaWrapper"
+    },
+    "binding_schema": {
+      "$ref": "#/$defs/schemaWrapper"
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "contractId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$"
+    },
+    "semanticVersion": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "schemaWrapper": {
+      "type": "object",
+      "required": [
+        "dialect"
+      ],
+      "properties": {
+        "dialect": {
+          "const": "json-schema-2020-12"
+        },
+        "value": {
+          "type": "object"
+        },
+        "ref": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "oneOf": [
+        {
+          "required": [
+            "value"
+          ],
+          "not": {
+            "required": [
+              "ref"
+            ]
+          }
+        },
+        {
+          "required": [
+            "ref"
+          ],
+          "not": {
+            "required": [
+              "value"
+            ]
+          }
+        }
+      ],
+      "additionalProperties": false
     }
   }
 };
@@ -225,10 +323,10 @@ export const querySchema: Record<string, unknown> = {
       "type": "boolean",
       "default": false
     },
-    "frontmatter": {
+    "frontmatter_mode": {
       "enum": [
         "effective",
-        "raw",
+        "persisted",
         "both"
       ],
       "default": "effective"
@@ -507,7 +605,7 @@ export const queryResultSchema: Record<string, unknown> = {
           "frontmatter": {
             "type": "object"
           },
-          "raw_frontmatter": {
+          "effective_frontmatter": {
             "type": "object"
           },
           "values": {
@@ -648,6 +746,9 @@ export const typeFileSchema: Record<string, unknown> = {
     },
     "migrations": {
       "$ref": "#/$defs/migrations"
+    },
+    "implements": {
+      "$ref": "#/$defs/implementations"
     }
   },
   "patternProperties": {
@@ -1212,6 +1313,57 @@ export const typeFileSchema: Record<string, unknown> = {
         "additionalProperties": false
       }
     },
+    "implementations": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/implementation"
+      }
+    },
+    "implementation": {
+      "type": "object",
+      "required": [
+        "contract",
+        "version",
+        "fields"
+      ],
+      "properties": {
+        "contract": {
+          "$ref": "#/$defs/contractId"
+        },
+        "version": {
+          "$ref": "#/$defs/semanticVersion"
+        },
+        "fields": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/fieldPath"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/fieldPath"
+          }
+        },
+        "binding": {
+          "type": "object"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": {
+          "$ref": "#/$defs/domainExtension"
+        }
+      },
+      "additionalProperties": false
+    },
+    "contractId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$"
+    },
+    "semanticVersion": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
     "expression": {
       "type": "object",
       "required": [
@@ -1237,6 +1389,97 @@ export const typeFileSchema: Record<string, unknown> = {
         "boolean",
         "null"
       ]
+    }
+  }
+};
+
+export const typePackSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/v0.3/type-pack.schema.json",
+  "title": "mdbase v0.3 type pack manifest",
+  "type": "object",
+  "required": [
+    "kind",
+    "id",
+    "version",
+    "resources"
+  ],
+  "properties": {
+    "kind": {
+      "const": "mdbase.type-pack"
+    },
+    "id": {
+      "$ref": "#/$defs/packId"
+    },
+    "version": {
+      "$ref": "#/$defs/semanticVersion"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "resources": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/resource"
+      }
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z][A-Za-z0-9._:-]{0,127}$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "packId": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$"
+    },
+    "semanticVersion": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    },
+    "safeRelativePath": {
+      "type": "string",
+      "minLength": 1,
+      "pattern": "^(?!/)(?!.*(?:^|/)\\.\\.(?:/|$))(?!.*\\\\).+$"
+    },
+    "digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    },
+    "resource": {
+      "type": "object",
+      "required": [
+        "kind",
+        "source",
+        "target",
+        "digest"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "contract",
+            "type",
+            "schema"
+          ]
+        },
+        "source": {
+          "$ref": "#/$defs/safeRelativePath"
+        },
+        "target": {
+          "$ref": "#/$defs/safeRelativePath"
+        },
+        "digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "additionalProperties": false
     }
   }
 };
@@ -1529,10 +1772,10 @@ export const viewSchema: Record<string, unknown> = {
           "type": "boolean",
           "default": false
         },
-        "frontmatter": {
+        "frontmatter_mode": {
           "enum": [
             "effective",
-            "raw",
+            "persisted",
             "both"
           ],
           "default": "effective"
@@ -1701,6 +1944,1234 @@ export const viewSchema: Record<string, unknown> = {
         }
       },
       "additionalProperties": false
+    }
+  }
+};
+
+export const runtimeActionSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/action.schema.json",
+  "title": "mdbase runtime action contract",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "provider",
+    "name",
+    "schemas"
+  ],
+  "properties": {
+    "type": {
+      "const": "action"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider": {
+      "$ref": "#/$defs/identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "requires": {
+      "$ref": "#/$defs/requires"
+    },
+    "schemas": {
+      "type": "object",
+      "required": [
+        "dialect",
+        "input"
+      ],
+      "properties": {
+        "dialect": {
+          "const": "json-schema-2020-12"
+        },
+        "input": {
+          "$ref": "#/$defs/jsonSchema"
+        },
+        "output": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "$ref": "#/$defs/jsonSchema"
+            }
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "effects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/identifier"
+      }
+    },
+    "emits": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/identifier"
+      }
+    },
+    "dispatch": {
+      "$ref": "#/$defs/dispatch"
+    },
+    "risk": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "destructive"
+      ]
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "jsonSchema": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "dispatch": {
+      "type": "object",
+      "properties": {
+        "idempotency": {
+          "enum": [
+            "invocation_id",
+            "none"
+          ]
+        },
+        "cancellation": {
+          "enum": [
+            "cooperative",
+            "none"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "requires": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "providers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/providerRequirement"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerRequirement": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "version"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+};
+
+export const runtimeCapabilitySchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/capability.schema.json",
+  "title": "mdbase runtime capability contract",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "name"
+  ],
+  "properties": {
+    "type": {
+      "const": "capability"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider": {
+      "$ref": "#/$defs/identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "risk": {
+      "enum": [
+        "low",
+        "medium",
+        "high",
+        "destructive"
+      ]
+    },
+    "effects": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/identifier"
+      }
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    }
+  }
+};
+
+export const runtimeCheckpointSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/checkpoint.schema.json",
+  "title": "mdbase runtime checkpoint record",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "workflow",
+    "status",
+    "updated_at",
+    "state"
+  ],
+  "properties": {
+    "type": {
+      "const": "runtime_checkpoint"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "workflow": {
+      "$ref": "#/$defs/identifier"
+    },
+    "run": {
+      "$ref": "#/$defs/identifier"
+    },
+    "status": {
+      "enum": [
+        "open",
+        "waiting",
+        "ready",
+        "completed",
+        "failed",
+        "cancelled"
+      ]
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "state": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "next_step": {
+      "$ref": "#/$defs/identifier"
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "resume_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "lease": {
+      "type": "object",
+      "required": [
+        "owner",
+        "token",
+        "expires_at"
+      ],
+      "properties": {
+        "owner": {
+          "$ref": "#/$defs/identifier"
+        },
+        "token": {
+          "type": "string",
+          "minLength": 16
+        },
+        "expires_at": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    }
+  }
+};
+
+export const runtimeDiagnosticSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/diagnostic.schema.json",
+  "title": "mdbase runtime diagnostic record",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "severity",
+    "code",
+    "message",
+    "created_at"
+  ],
+  "properties": {
+    "type": {
+      "const": "runtime_diagnostic"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "severity": {
+      "enum": [
+        "info",
+        "warning",
+        "error"
+      ]
+    },
+    "code": {
+      "$ref": "#/$defs/identifier"
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "path": {
+      "type": "string"
+    },
+    "field": {
+      "type": "string"
+    },
+    "workflow": {
+      "$ref": "#/$defs/identifier"
+    },
+    "action": {
+      "$ref": "#/$defs/identifier"
+    },
+    "event": {
+      "$ref": "#/$defs/identifier"
+    },
+    "details": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    }
+  }
+};
+
+export const runtimeEventEnvelopeSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/event-envelope.schema.json",
+  "title": "mdbase runtime event envelope",
+  "type": "object",
+  "required": [
+    "type",
+    "contract_version",
+    "id",
+    "occurred_at",
+    "source",
+    "payload"
+  ],
+  "properties": {
+    "type": {
+      "$ref": "#/$defs/identifier"
+    },
+    "contract_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "occurred_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "source": {
+      "type": "object",
+      "required": [
+        "runtime"
+      ],
+      "properties": {
+        "runtime": {
+          "$ref": "#/$defs/identifier"
+        },
+        "provider": {
+          "$ref": "#/$defs/identifier"
+        },
+        "collection": {
+          "type": "string"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z0-9._:-]+$": true
+      },
+      "additionalProperties": false
+    },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "trace": {
+      "type": "object",
+      "properties": {
+        "correlation_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "causation_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z0-9._:-]+$": true
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    }
+  }
+};
+
+export const runtimeEventSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/event.schema.json",
+  "title": "mdbase runtime event contract",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "provider",
+    "name",
+    "schemas"
+  ],
+  "properties": {
+    "type": {
+      "const": "event"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider": {
+      "$ref": "#/$defs/identifier"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "schemas": {
+      "type": "object",
+      "required": [
+        "dialect",
+        "payload"
+      ],
+      "properties": {
+        "dialect": {
+          "const": "json-schema-2020-12"
+        },
+        "payload": {
+          "$ref": "#/$defs/jsonSchema"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "jsonSchema": {
+      "type": "object",
+      "additionalProperties": true
+    }
+  }
+};
+
+export const runtimeProviderSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/provider.schema.json",
+  "title": "mdbase runtime provider contract",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "provider_version",
+    "name"
+  ],
+  "properties": {
+    "type": {
+      "const": "provider"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "provider_version": {
+      "$ref": "#/$defs/semver"
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "contracts": {
+      "type": "object",
+      "properties": {
+        "events": {
+          "$ref": "#/$defs/identifierList"
+        },
+        "actions": {
+          "$ref": "#/$defs/identifierList"
+        },
+        "capabilities": {
+          "$ref": "#/$defs/identifierList"
+        },
+        "workflows": {
+          "$ref": "#/$defs/identifierList"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "identifierList": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "$ref": "#/$defs/identifier"
+      }
+    },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?$"
+    }
+  }
+};
+
+export const runtimeRunSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/run.schema.json",
+  "title": "mdbase runtime run record",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "workflow",
+    "workflow_version",
+    "workflow_revision",
+    "registry_revision",
+    "trigger",
+    "event_id",
+    "status",
+    "created_at",
+    "updated_at"
+  ],
+  "properties": {
+    "type": {
+      "const": "runtime_run"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "workflow": {
+      "$ref": "#/$defs/identifier"
+    },
+    "workflow_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "workflow_revision": {
+      "$ref": "#/$defs/revision"
+    },
+    "registry_revision": {
+      "$ref": "#/$defs/revision"
+    },
+    "policy_revision": {
+      "$ref": "#/$defs/revision"
+    },
+    "trigger": {
+      "$ref": "#/$defs/identifier"
+    },
+    "event_id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "event_type": {
+      "$ref": "#/$defs/identifier"
+    },
+    "event_cursor": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "executor": {
+      "$ref": "#/$defs/identifier"
+    },
+    "idempotency_key": {
+      "type": "string"
+    },
+    "concurrency_group": {
+      "type": "string"
+    },
+    "status": {
+      "enum": [
+        "queued",
+        "running",
+        "waiting",
+        "succeeded",
+        "failed",
+        "cancelled",
+        "indeterminate"
+      ]
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "started_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "timeout_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "finished_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "cancel_requested_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "steps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "id",
+          "action",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "$ref": "#/$defs/identifier"
+          },
+          "action": {
+            "$ref": "#/$defs/identifier"
+          },
+          "action_version": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "invocation_id": {
+            "$ref": "#/$defs/identifier"
+          },
+          "attempt": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "running",
+              "succeeded",
+              "failed",
+              "skipped",
+              "cancelled",
+              "timed_out",
+              "indeterminate"
+            ]
+          },
+          "input": {},
+          "output": {},
+          "receipt": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "error": {
+            "type": "object",
+            "additionalProperties": true
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "finished_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        },
+        "patternProperties": {
+          "^x-[A-Za-z0-9._:-]+$": true
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "revision": {
+      "type": "string",
+      "minLength": 8
+    }
+  }
+};
+
+export const runtimePolicySchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/runtime-policy.schema.json",
+  "title": "mdbase runtime policy record",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "name"
+  ],
+  "properties": {
+    "type": {
+      "const": "runtime_policy"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "limits": {
+      "type": "object",
+      "properties": {
+        "workflow_timeout": {
+          "$ref": "#/$defs/duration"
+        },
+        "max_concurrent_runs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_steps_per_run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_items_per_step": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/identifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/capabilityPolicy"
+      }
+    },
+    "executors": {
+      "type": "object",
+      "properties": {
+        "default": {
+          "$ref": "#/$defs/identifier"
+        },
+        "workflows": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/identifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/identifier"
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(ms|s|m|h|d)$"
+    },
+    "capabilityMode": {
+      "enum": [
+        "allow",
+        "deny"
+      ]
+    },
+    "capabilityPolicy": {
+      "type": "object",
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/capabilityMode"
+        },
+        "max_files_per_run": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "max_calls_per_run": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z0-9._:-]+$": true
+      },
+      "additionalProperties": false
+    }
+  }
+};
+
+export const runtimeWorkflowSchema: Record<string, unknown> = {
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mdbase.dev/schemas/runtime/v0.1/workflow.schema.json",
+  "title": "mdbase runtime workflow record",
+  "type": "object",
+  "required": [
+    "type",
+    "id",
+    "version",
+    "name",
+    "enabled",
+    "triggers",
+    "steps"
+  ],
+  "properties": {
+    "type": {
+      "const": "workflow"
+    },
+    "id": {
+      "$ref": "#/$defs/identifier"
+    },
+    "version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "name": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "enabled": {
+      "type": "boolean"
+    },
+    "requires": {
+      "$ref": "#/$defs/requires"
+    },
+    "vars": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/expressionValue"
+      }
+    },
+    "triggers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/trigger"
+      }
+    },
+    "if": {
+      "$ref": "#/$defs/expression"
+    },
+    "steps": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/step"
+      }
+    },
+    "run": {
+      "$ref": "#/$defs/runPolicy"
+    }
+  },
+  "patternProperties": {
+    "^x-[A-Za-z0-9._:-]+$": true
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z][A-Za-z0-9._:-]*$"
+    },
+    "expression": {
+      "type": "object",
+      "required": [
+        "$expr"
+      ],
+      "properties": {
+        "$expr": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": false
+    },
+    "expressionValue": {
+      "oneOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "boolean"
+        },
+        {
+          "type": "number"
+        },
+        {
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/expression"
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/expressionValue"
+          }
+        },
+        {
+          "type": "object",
+          "not": {
+            "required": [
+              "$expr"
+            ]
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/expressionValue"
+          }
+        }
+      ]
+    },
+    "requires": {
+      "type": "object",
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/identifier"
+          }
+        },
+        "providers": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "$ref": "#/$defs/providerRequirement"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "providerRequirement": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "type": "object",
+          "required": [
+            "id",
+            "version"
+          ],
+          "properties": {
+            "id": {
+              "$ref": "#/$defs/identifier"
+            },
+            "version": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "trigger": {
+      "type": "object",
+      "required": [
+        "id",
+        "event"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "event": {
+          "$ref": "#/$defs/identifier"
+        },
+        "if": {
+          "$ref": "#/$defs/expression"
+        },
+        "debounce": {
+          "$ref": "#/$defs/duration"
+        },
+        "minimum_interval": {
+          "$ref": "#/$defs/duration"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z0-9._:-]+$": true
+      },
+      "additionalProperties": false
+    },
+    "step": {
+      "type": "object",
+      "required": [
+        "id",
+        "action"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "action": {
+          "$ref": "#/$defs/identifier"
+        },
+        "name": {
+          "type": "string"
+        },
+        "if": {
+          "$ref": "#/$defs/expression"
+        },
+        "input": {
+          "type": "object",
+          "additionalProperties": {
+            "$ref": "#/$defs/expressionValue"
+          }
+        },
+        "for_each": {
+          "type": "object",
+          "required": [
+            "items"
+          ],
+          "properties": {
+            "items": {
+              "$ref": "#/$defs/expressionValue"
+            },
+            "as": {
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+            }
+          },
+          "additionalProperties": false
+        },
+        "requires": {
+          "$ref": "#/$defs/requires"
+        }
+      },
+      "patternProperties": {
+        "^x-[A-Za-z0-9._:-]+$": true
+      },
+      "additionalProperties": false
+    },
+    "runPolicy": {
+      "type": "object",
+      "properties": {
+        "execution": {
+          "type": "object",
+          "properties": {
+            "mode": {
+              "enum": [
+                "single_executor",
+                "broadcast",
+                "best_effort"
+              ]
+            }
+          },
+          "additionalProperties": false
+        },
+        "idempotency": {
+          "type": "object",
+          "required": [
+            "key"
+          ],
+          "properties": {
+            "key": {
+              "$ref": "#/$defs/expressionValue"
+            }
+          },
+          "additionalProperties": false
+        },
+        "concurrency": {
+          "type": "object",
+          "properties": {
+            "group": {
+              "$ref": "#/$defs/expressionValue"
+            },
+            "policy": {
+              "enum": [
+                "skip",
+                "queue",
+                "replace",
+                "allow"
+              ]
+            }
+          },
+          "required": [
+            "policy"
+          ],
+          "additionalProperties": false
+        },
+        "limits": {
+          "type": "object",
+          "properties": {
+            "timeout": {
+              "$ref": "#/$defs/duration"
+            },
+            "max_items": {
+              "type": "integer",
+              "minimum": 1
+            }
+          },
+          "additionalProperties": false
+        },
+        "on_error": {
+          "enum": [
+            "stop",
+            "continue"
+          ]
+        }
+      },
+      "additionalProperties": false
+    },
+    "duration": {
+      "type": "string",
+      "pattern": "^[0-9]+(ms|s|m|h|d)$"
     }
   }
 };

@@ -8,6 +8,7 @@ export interface CollectionScannerOptions {
   recordExtensions: string[];
   includeSubfolders: boolean;
   typesFolder: string;
+  contractsFolder: string;
   cacheFolder: string;
   migrationsFolder: string;
 }
@@ -24,7 +25,12 @@ export class CollectionScanner {
     this.root = options.root;
     this.includeSubfolders = options.includeSubfolders;
     this.recordExtensions = new Set(options.recordExtensions);
-    this.reservedFolders = [options.typesFolder, options.cacheFolder, options.migrationsFolder];
+    this.reservedFolders = [
+      options.typesFolder,
+      options.contractsFolder,
+      options.cacheFolder,
+      options.migrationsFolder,
+    ];
     this.excludeMatchers = options.exclude.flatMap((pattern) => {
       if (!pattern.includes("/") && !pattern.includes("*") && !pattern.includes("?")) {
         return [
