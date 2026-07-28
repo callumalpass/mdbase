@@ -38,9 +38,10 @@ function definitions(): Array<{
       target: "_contracts/example.task.md",
       document: `---
 kind: mdbase.contract
+contract_type: record
 id: example.task
 version: 1.0.0
-schema:
+record_schema:
   dialect: json-schema-2020-12
   ref: ../schemas/task-contract.schema.json
 ---

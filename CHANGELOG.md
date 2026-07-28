@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+## 0.3.0-rc.3 - 2026-07-28
+
+- Make `mdbase.contract` a discriminated `record`, `event`, or `action`
+  artifact with subject-specific JSON Schemas.
+- Restrict type-file `implements` entries to record contracts while allowing
+  several types to implement and expose the same normalized record interface.
+- Remove the legacy Runtime Contracts conformance claim pending its rebuild on
+  the portable event/action interoperability profile.
+
 ## 0.3.0-rc.2 - 2026-07-28
 
 - Implement the canonical v0.3 query-object schema, invocation-context `this`

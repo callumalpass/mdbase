@@ -21,12 +21,20 @@ import type {
 
 export interface DataContractDefinition {
   kind: "mdbase.contract";
+  contract_type: "record" | "event" | "action";
   id: string;
   version: string;
   name?: string;
   description?: string;
-  schema: V03SchemaWrapper;
+  record_schema?: V03SchemaWrapper;
   binding_schema?: V03SchemaWrapper;
+  data_schema?: V03SchemaWrapper;
+  source_schema?: V03SchemaWrapper;
+  input_schema?: V03SchemaWrapper;
+  output_schema?: V03SchemaWrapper;
+  error_schema?: V03SchemaWrapper;
+  provider_schema?: V03SchemaWrapper;
+  behavior?: Record<string, unknown>;
   source_paths: string[];
   digest: string;
 }
@@ -70,7 +78,7 @@ export interface DataContractLoadResult {
 
 interface RegisteredContract {
   definition: DataContractDefinition;
-  schemaValidator: ValidateFunction;
+  recordValidator?: ValidateFunction;
   bindingValidator?: ValidateFunction;
 }
 
@@ -119,39 +127,32 @@ export class DataContractRegistry {
         );
       }
 
-      const resolvedSchema = await resolveSchemaWrapper(
-        frontmatter.schema as V03SchemaWrapper,
-        filePath,
-        collectionRoot,
-        `${String(frontmatter.id)} ${String(frontmatter.version)} schema`,
-      );
-      if (!resolvedSchema.valid) return resolvedSchema;
-      const resolvedBinding = frontmatter.binding_schema
-        ? await resolveSchemaWrapper(
-            frontmatter.binding_schema as V03SchemaWrapper,
-            filePath,
-            collectionRoot,
-            `${String(frontmatter.id)} ${String(frontmatter.version)} binding_schema`,
-          )
-        : undefined;
-      if (resolvedBinding && !resolvedBinding.valid) return resolvedBinding;
+      const contractType = frontmatter.contract_type as DataContractDefinition["contract_type"];
+      const resolvedWrappers: Record<string, V03SchemaWrapper> = {};
+      for (const field of schemaFieldsForContractType(contractType)) {
+        const wrapper = frontmatter[field];
+        if (wrapper === undefined) continue;
+        const resolved = await resolveSchemaWrapper(
+          wrapper as V03SchemaWrapper,
+          filePath,
+          collectionRoot,
+          `${String(frontmatter.id)} ${String(frontmatter.version)} ${field}`,
+        );
+        if (!resolved.valid) return resolved;
+        resolvedWrappers[field] = resolved.wrapper!;
+      }
 
-      const portable = {
+      const portable: Omit<DataContractDefinition, "source_paths" | "digest" | "name" | "description"> = {
         kind: "mdbase.contract" as const,
+        contract_type: contractType,
         id: String(frontmatter.id),
         version: String(frontmatter.version),
-        schema: resolvedSchema.wrapper!,
-        ...(resolvedBinding?.wrapper ? { binding_schema: resolvedBinding.wrapper } : {}),
-      };
-      const digest = digestCanonical({
-        kind: portable.kind,
-        id: portable.id,
-        version: portable.version,
-        schema: resolvedSchema.wrapper!.value,
-        ...(resolvedBinding?.wrapper?.value
-          ? { binding_schema: resolvedBinding.wrapper.value }
+        ...resolvedWrappers,
+        ...(isPlainObject(frontmatter.behavior)
+          ? { behavior: cloneJson(frontmatter.behavior) }
           : {}),
-      });
+      };
+      const digest = dataContractDigest(portable);
       const identity = contractKey(portable.id, portable.version);
       const existing = contracts.get(identity);
       if (existing) {
@@ -167,12 +168,13 @@ export class DataContractRegistry {
       }
 
       const ajv = createAjv();
-      let schemaValidator: ValidateFunction;
+      let recordValidator: ValidateFunction | undefined;
       let bindingValidator: ValidateFunction | undefined;
       try {
-        schemaValidator = ajv.compile(resolvedSchema.wrapper!.value!);
-        if (resolvedBinding?.wrapper) {
-          bindingValidator = ajv.compile(resolvedBinding.wrapper.value!);
+        for (const [field, wrapper] of Object.entries(resolvedWrappers)) {
+          const compiled = ajv.compile(wrapper.value!);
+          if (field === "record_schema") recordValidator = compiled;
+          if (field === "binding_schema") bindingValidator = compiled;
         }
       } catch (error) {
         return invalid(
@@ -188,7 +190,7 @@ export class DataContractRegistry {
           source_paths: [relativePath],
           digest,
         },
-        schemaValidator,
+        ...(recordValidator ? { recordValidator } : {}),
         bindingValidator,
       });
     }
@@ -202,6 +204,12 @@ export class DataContractRegistry {
           return invalid(
             "data_contract_not_found",
             `Type "${typeDef.name}" implements missing exact data contract "${implementation.contract}" ${implementation.version}`,
+          );
+        }
+        if (registered.definition.contract_type !== "record") {
+          return invalid(
+            "data_contract_field_invalid",
+            `Type "${typeDef.name}" cannot implement ${registered.definition.contract_type} contract "${implementation.contract}" ${implementation.version}`,
           );
         }
         const implementationError = validateImplementation(typeDef, implementation, registered);
@@ -277,7 +285,7 @@ export class DataContractRegistry {
       if (value.present) {
         try {
           setFieldReferenceValue(view, contractField, cloneJson(value.value), {
-            schema: registered.definition.schema.value,
+            schema: registered.definition.record_schema!.value,
             allowArrayAppend: true,
           });
         } catch (error) {
@@ -290,9 +298,10 @@ export class DataContractRegistry {
         }
       }
     }
-    const valid = diagnostics.length === 0 && registered.schemaValidator(view);
+    const validator = registered.recordValidator!;
+    const valid = diagnostics.length === 0 && validator(view);
     if (!valid && diagnostics.length === 0) {
-      diagnostics.push(...(registered.schemaValidator.errors ?? []).map((error) => ({
+      diagnostics.push(...(validator.errors ?? []).map((error) => ({
           code: "data_contract_record_invalid",
           message: `record projected through "${typeName}" does not satisfy "${contract}" ${version}: ${error.instancePath || "/"} ${error.message ?? error.keyword}`,
           severity: "error" as const,
@@ -317,7 +326,7 @@ function validateImplementation(
   implementation: V03DataContractImplementation,
   contract: RegisteredContract,
 ): { code: string; message: string } | null {
-  const contractSchema = contract.definition.schema.value!;
+  const contractSchema = contract.definition.record_schema!.value!;
   const typeSchema = typeDef.schema?.value;
   for (const requiredField of getUnconditionalRequiredFields(contractSchema)) {
     if (!Object.keys(implementation.fields).some((fieldReference) =>
@@ -387,20 +396,39 @@ function digestImplementation(
 }
 
 export function dataContractDigest(frontmatter: Record<string, unknown>): string {
-  const schema = isPlainObject(frontmatter.schema) && frontmatter.schema.value !== undefined
-    ? frontmatter.schema.value
-    : frontmatter.schema;
-  const bindingSchema = isPlainObject(frontmatter.binding_schema) &&
-    frontmatter.binding_schema.value !== undefined
-    ? frontmatter.binding_schema.value
-    : frontmatter.binding_schema;
-  return digestCanonical({
+  const contractType = frontmatter.contract_type;
+  const portable: Record<string, unknown> = {
     kind: frontmatter.kind,
+    contract_type: contractType,
     id: frontmatter.id,
     version: frontmatter.version,
-    schema,
-    ...(bindingSchema !== undefined ? { binding_schema: bindingSchema } : {}),
-  });
+  };
+  if (contractType === "record" || contractType === "event" || contractType === "action") {
+    for (const field of schemaFieldsForContractType(contractType)) {
+      const wrapper = frontmatter[field];
+      if (wrapper === undefined) continue;
+      portable[field] = isPlainObject(wrapper) && wrapper.value !== undefined
+        ? wrapper.value
+        : wrapper;
+    }
+  }
+  if (contractType === "action" && isPlainObject(frontmatter.behavior)) {
+    portable.behavior = frontmatter.behavior;
+  }
+  return digestCanonical(portable);
+}
+
+function schemaFieldsForContractType(
+  contractType: DataContractDefinition["contract_type"],
+): string[] {
+  switch (contractType) {
+    case "record":
+      return ["record_schema", "binding_schema"];
+    case "event":
+      return ["data_schema", "source_schema"];
+    case "action":
+      return ["input_schema", "output_schema", "error_schema", "provider_schema"];
+  }
 }
 
 function digestCanonical(value: unknown): string {
