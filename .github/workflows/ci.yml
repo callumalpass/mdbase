@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: mdbase-dev/mdbase-spec
-          ref: e0c591b9a12cf8c36a61574b00c8d1f56f8e7d41
+          ref: 8180449530b5db54cde88383c3b96798596cc4b4
           path: mdbase-spec
       - run: npm run build
       - run: npm test
