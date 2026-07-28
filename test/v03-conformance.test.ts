@@ -62,6 +62,11 @@ interface V03Suite {
   groups?: V03Group[];
 }
 
+interface V03FixtureSet {
+  files?: string[];
+  coverage_targets?: string[];
+}
+
 interface TestContext {
   root: string;
   cleanup?: () => Promise<void>;
@@ -71,6 +76,7 @@ interface TestContext {
 const SPEC_REPO = resolveSpecRepo();
 const V03_TESTS_DIR = path.join(SPEC_REPO, "tests", "v0.3");
 const REQUIRE_V03_CONFORMANCE = process.env.MDBASE_REQUIRE_V03_CONFORMANCE === "1";
+const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.2.yml");
 
 function resolveSpecRepo(): string {
   const candidates = [
@@ -87,16 +93,31 @@ function resolveSpecRepo(): string {
   return candidates[0] ?? path.resolve(process.cwd(), "../mdbase-spec");
 }
 
-function discoverV03Suites(): Array<{ file: string; suite: V03Suite }> {
+function loadClaimedProfiles(): Set<string> {
+  const claim = yaml.load(fs.readFileSync(CLAIM_PATH, "utf8")) as { profiles?: string[] };
+  return new Set(claim.profiles ?? []);
+}
+
+function discoverV03Suites(): Array<{
+  file: string;
+  suite: V03Suite;
+  missingProfiles: string[];
+}> {
   const manifestPath = path.join(V03_TESTS_DIR, "manifest.yaml");
   if (!fs.existsSync(manifestPath)) return [];
-  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as { fixture_sets?: Array<{ files?: string[] }> };
-  const suites: Array<{ file: string; suite: V03Suite }> = [];
+  const claimedProfiles = loadClaimedProfiles();
+  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as {
+    fixture_sets?: V03FixtureSet[];
+  };
+  const suites: Array<{ file: string; suite: V03Suite; missingProfiles: string[] }> = [];
   for (const fixtureSet of manifest.fixture_sets ?? []) {
+    const missingProfiles = (fixtureSet.coverage_targets ?? []).filter(
+      (profile) => !claimedProfiles.has(profile),
+    );
     for (const relativeFile of fixtureSet.files ?? []) {
       const fullPath = path.join(V03_TESTS_DIR, relativeFile);
       const suite = yaml.load(fs.readFileSync(fullPath, "utf8")) as V03Suite;
-      suites.push({ file: relativeFile, suite });
+      suites.push({ file: relativeFile, suite, missingProfiles });
     }
   }
   return suites;
@@ -1372,8 +1393,11 @@ if (suites.length === 0) {
   });
 } else {
   describe("v0.3 conformance", () => {
-    for (const { file, suite } of suites) {
-      describe(`${suite.fixture_set}: ${suite.name} (${file})`, () => {
+    for (const { file, suite, missingProfiles } of suites) {
+      const describeSuite = missingProfiles.length === 0 ? describe : describe.skip;
+      const unsupported =
+        missingProfiles.length === 0 ? "" : ` [unclaimed: ${missingProfiles.join(", ")}]`;
+      describeSuite(`${suite.fixture_set}: ${suite.name} (${file})${unsupported}`, () => {
         for (const group of suite.groups ?? []) {
           describe(group.name, () => {
             let sharedContext: TestContext | undefined;
