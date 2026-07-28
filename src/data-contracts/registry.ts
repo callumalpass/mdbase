@@ -6,6 +6,12 @@ import type { ErrorObject, ValidateFunction } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormatsImport from "ajv-formats";
 import type { MdbaseConfig } from "../config/loader.js";
+import {
+  fieldReferenceTargetsTopLevel,
+  getFieldReferenceValue,
+  schemaDeclaresFieldReference,
+  setFieldReferenceValue,
+} from "../field-references.js";
 import { dataContractSchema } from "../generated/v03-schemas.js";
 import type {
   TypeDefinition,
@@ -265,19 +271,34 @@ export class DataContractRegistry {
     }
 
     const view: Record<string, unknown> = {};
+    const diagnostics: DataContractDiagnostic[] = [];
     for (const [contractField, recordField] of Object.entries(implementation.fields)) {
-      const value = getFieldPath(effectiveFrontmatter, recordField);
-      if (value.found) setFieldPath(view, contractField, cloneJson(value.value));
+      const value = getFieldReferenceValue(effectiveFrontmatter, recordField);
+      if (value.present) {
+        try {
+          setFieldReferenceValue(view, contractField, cloneJson(value.value), {
+            schema: registered.definition.schema.value,
+            allowArrayAppend: true,
+          });
+        } catch (error) {
+          diagnostics.push({
+            code: "data_contract_record_invalid",
+            message: (error as Error).message,
+            severity: "error",
+            field: contractField,
+          });
+        }
+      }
     }
-    const valid = registered.schemaValidator(view);
-    const diagnostics = valid
-      ? []
-      : (registered.schemaValidator.errors ?? []).map((error) => ({
+    const valid = diagnostics.length === 0 && registered.schemaValidator(view);
+    if (!valid && diagnostics.length === 0) {
+      diagnostics.push(...(registered.schemaValidator.errors ?? []).map((error) => ({
           code: "data_contract_record_invalid",
           message: `record projected through "${typeName}" does not satisfy "${contract}" ${version}: ${error.instancePath || "/"} ${error.message ?? error.keyword}`,
           severity: "error" as const,
           ...(error.instancePath ? { field: jsonPointerToFieldPath(error.instancePath) } : {}),
-        }));
+        })));
+    }
     return {
       valid: diagnostics.length === 0,
       contract,
@@ -299,7 +320,9 @@ function validateImplementation(
   const contractSchema = contract.definition.schema.value!;
   const typeSchema = typeDef.schema?.value;
   for (const requiredField of getUnconditionalRequiredFields(contractSchema)) {
-    if (!(requiredField in implementation.fields)) {
+    if (!Object.keys(implementation.fields).some((fieldReference) =>
+      fieldReferenceTargetsTopLevel(fieldReference, requiredField)
+    )) {
       return {
         code: "data_contract_field_invalid",
         message: `Type "${typeDef.name}" does not map required contract field "${requiredField}"`,
@@ -307,13 +330,13 @@ function validateImplementation(
     }
   }
   for (const [contractField, recordField] of Object.entries(implementation.fields)) {
-    if (!schemaDeclaresField(contractSchema, contractField)) {
+    if (!schemaDeclaresFieldReference(contractSchema, contractField)) {
       return {
         code: "data_contract_field_invalid",
         message: `Type "${typeDef.name}" maps contract field "${contractField}", but that contract field is not declared`,
       };
     }
-    if (!typeSchema || !schemaDeclaresField(typeSchema, recordField)) {
+    if (!typeSchema || !schemaDeclaresFieldReference(typeSchema, recordField)) {
       return {
         code: "data_contract_field_invalid",
         message: `Type "${typeDef.name}" maps "${contractField}" to "${recordField}", but the record field is not declared`,
@@ -341,23 +364,6 @@ function getUnconditionalRequiredFields(schema: Record<string, unknown>): string
   return Array.isArray(schema.required)
     ? schema.required.filter((field): field is string => typeof field === "string")
     : [];
-}
-
-function schemaDeclaresField(schema: Record<string, unknown>, fieldPath: string): boolean {
-  let current: unknown = schema;
-  for (const rawSegment of fieldPath.split(".")) {
-    const array = rawSegment.endsWith("[]");
-    const segment = array ? rawSegment.slice(0, -2) : rawSegment;
-    if (!isPlainObject(current) || !isPlainObject(current.properties) || !(segment in current.properties)) {
-      return false;
-    }
-    current = current.properties[segment];
-    if (array) {
-      if (!isPlainObject(current) || !isPlainObject(current.items)) return false;
-      current = current.items;
-    }
-  }
-  return true;
 }
 
 function digestImplementation(
@@ -548,30 +554,6 @@ async function findMarkdownFiles(root: string): Promise<string[]> {
 
 function contractKey(contract: string, version: string): string {
   return `${contract}\0${version}`;
-}
-
-function getFieldPath(
-  source: Record<string, unknown>,
-  fieldPath: string,
-): { found: boolean; value?: unknown } {
-  let value: unknown = source;
-  for (const rawSegment of fieldPath.split(".")) {
-    const segment = rawSegment.endsWith("[]") ? rawSegment.slice(0, -2) : rawSegment;
-    if (!isPlainObject(value) || !Object.prototype.hasOwnProperty.call(value, segment)) return { found: false };
-    value = value[segment];
-    if (rawSegment.endsWith("[]") && !Array.isArray(value)) return { found: false };
-  }
-  return { found: true, value };
-}
-
-function setFieldPath(target: Record<string, unknown>, fieldPath: string, value: unknown): void {
-  const segments = fieldPath.split(".").map((segment) => segment.endsWith("[]") ? segment.slice(0, -2) : segment);
-  let current = target;
-  for (const segment of segments.slice(0, -1)) {
-    if (!isPlainObject(current[segment])) current[segment] = {};
-    current = current[segment] as Record<string, unknown>;
-  }
-  current[segments.at(-1)!] = value;
 }
 
 function resolveJsonPointer(document: unknown, pointer: string): unknown {
