@@ -1461,9 +1461,10 @@ settings:
 `);
     await write(root, "contracts/example.note.md", `---
 kind: mdbase.contract
+contract_type: record
 id: example.note
 version: 1.0.0
-schema:
+record_schema:
   dialect: json-schema-2020-12
   value:
     type: object
@@ -1563,6 +1564,103 @@ implements:
 `);
     expect(await Collection.open(root)).toMatchObject({
       error: { code: "data_contract_not_found" },
+    });
+  });
+
+  it("registers event and action contracts without treating them as record implementations", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "_contracts/example.changed.md", `---
+kind: mdbase.contract
+contract_type: event
+id: example.changed
+version: 1.0.0
+data_schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [value]
+    properties: { value: { type: string } }
+---
+`);
+    await write(root, "_contracts/example.update.md", `---
+kind: mdbase.contract
+contract_type: action
+id: example.update
+version: 1.0.0
+input_schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [value]
+    properties: { value: { type: string } }
+output_schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [updated]
+    properties: { updated: { type: boolean } }
+behavior:
+  idempotency: optional
+  cancellation: cooperative
+---
+`);
+
+    const collection = await open(root);
+    expect(collection.listDataContracts()).toEqual([
+      expect.objectContaining({
+        contract_type: "event",
+        id: "example.changed",
+        data_schema: expect.any(Object),
+      }),
+      expect.objectContaining({
+        contract_type: "action",
+        id: "example.update",
+        input_schema: expect.any(Object),
+        output_schema: expect.any(Object),
+        behavior: {
+          idempotency: "optional",
+          cancellation: "cooperative",
+        },
+      }),
+    ]);
+    expect(collection.getDataContractImplementations("example.changed", "1.0.0")).toEqual([]);
+    await collection.close();
+  });
+
+  it("rejects a type-file implements entry for an event contract", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "_contracts/example.changed.md", `---
+kind: mdbase.contract
+contract_type: event
+id: example.changed
+version: 1.0.0
+data_schema:
+  dialect: json-schema-2020-12
+  value: { type: object }
+---
+`);
+    await write(root, "_types/note.md", `---
+kind: mdbase.type
+name: note
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    properties: { title: { type: string } }
+implements:
+  - contract: example.changed
+    version: 1.0.0
+    fields: {}
+---
+`);
+    expect(await Collection.open(root)).toMatchObject({
+      error: {
+        code: "data_contract_field_invalid",
+        message: expect.stringContaining("cannot implement event contract"),
+      },
     });
   });
 });
