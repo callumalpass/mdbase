@@ -1,6 +1,9 @@
 # @callumalpass/mdbase
 
-TypeScript implementation of the [mdbase specification](https://mdbase.dev): structured Markdown collections with JSON Schema types, collection semantics, validation, queries, links, lifecycle hooks, and runtime contracts.
+TypeScript implementation of the [mdbase specification](https://mdbase.dev):
+structured Markdown collections with JSON Schema types, first-class record,
+event, and action contracts, collection semantics, validation, queries, links,
+and lifecycle hooks.
 
 The v0.3 implementation is pre-1.0 and intentionally breaking. It also includes a v0.2 compatibility adapter and reviewed migration tooling.
 
@@ -16,7 +19,8 @@ The v0.3 implementation is pre-1.0 and intentionally breaking. It also includes 
 - Backlinks, tags, and embeds extraction from content
 - Batch operations and rename with optional reference updates
 - Async SQLite-backed cache with coherent in-memory query indexes
-- Portable runtime contracts, provider registries, policy, and validation
+- One core contract registry for record, event, and action artifacts, with
+  ordinary type implementations for record contracts
 - Safe, report-first v0.2-to-v0.3 collection migration
 
 ## Install
@@ -224,3 +228,9 @@ The package ships its machine-readable v0.3 conformance claim under `conformance
 - `src/types/` type loading and validation helpers
 - `src/cache/` async cache store + worker
 - `test/` conformance test runner
+
+Durable workflow execution is an optional companion profile. Core mdbase does
+not maintain a second runtime contract registry or activate providers. Install
+the passive `mdbase.runtime.standard` pack for portable runtime records, use
+the interoperability profile for live event/action bindings, and use a durable
+runtime host for admission and recovery.

@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+- Remove the parallel runtime contract registry, implicit contracts,
+  proprietary event-envelope validation, materialization helpers, and
+  collection-level workflow preflight.
+- Keep canonical core-schema validation in the core package instead of taking
+  a dependency on the runtime companion.
+- Remove the superseded `runtime.contract_mode` and type-file runtime section;
+  old collection config receives direct runtime 0.2 migration guidance.
+- Leave durable admission and execution to the separately claimable runtime
+  0.2 companion built on core contracts and event/action interoperability.
+
 ## 0.3.0-rc.3 - 2026-07-28
 
 - Make `mdbase.contract` a discriminated `record`, `event`, or `action`

@@ -7,7 +7,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { dump } from "js-yaml";
-import { validateCanonicalSchema } from "@callumalpass/mdbase-runtime";
+import { validateCanonicalSchema } from "../validation/canonical.js";
 import picomatch from "picomatch";
 import { ulid } from "ulid";
 import {
@@ -89,16 +89,6 @@ import {
   evaluateStructuredWhere as evaluateWhereClause,
   matchesFieldConditions,
 } from "./structured-where.js";
-import {
-  buildRuntimePackage,
-  composeRuntimeRegistry,
-  LoadRuntimeContractsOptions,
-  preflightRuntimeWorkflows,
-  RuntimeMarkdownRecord,
-  RuntimePackage,
-  RuntimeRegistry,
-  RuntimeValidationResult,
-} from "../runtime/contracts.js";
 import { recoverInterruptedTypePackTransactions } from "../type-packs/recovery.js";
 
 export type {
@@ -1375,101 +1365,6 @@ fields:
       valid: !hasErrors,
       issues: allIssues,
     };
-  }
-
-  async loadRuntimeContracts(options: LoadRuntimeContractsOptions = {}): Promise<RuntimePackage> {
-    return await this.observer.trace(
-      "collection.load_runtime_contracts",
-      { include_type_files: options.includeTypeFiles },
-      () => this.loadRuntimeContractsUnobserved(options),
-    );
-  }
-
-  private async loadRuntimeContractsUnobserved(options: LoadRuntimeContractsOptions): Promise<RuntimePackage> {
-    const records: RuntimeMarkdownRecord[] = [];
-
-    if (options.includeTypeFiles !== false) {
-      for (const relativePath of await this.scanTypeFilesForRuntime()) {
-        const parsed = await parseFileAsync(path.join(this.root, relativePath));
-        if (parsed.error) {
-          records.push({
-            path: relativePath,
-            frontmatter: {},
-            body: parsed.body,
-          });
-          continue;
-        }
-        records.push({
-          path: relativePath,
-          frontmatter: parsed.frontmatter,
-          body: parsed.body,
-        });
-      }
-    }
-
-    for (const relativePath of await this.scanFiles()) {
-      const parsed = await parseFileAsync(path.join(this.root, relativePath));
-      if (parsed.error) continue;
-      records.push({
-        path: relativePath,
-        frontmatter: parsed.frontmatter,
-        body: parsed.body,
-      });
-    }
-
-    const runtimePackage = buildRuntimePackage(this.root, records, options);
-    const profileVersion = this.config.runtime?.profile_version;
-    if (profileVersion !== undefined && profileVersion !== "0.1.0") {
-      runtimePackage.diagnostics.push({
-        severity: "error",
-        code: "unsupported_profile",
-        message: `Unsupported runtime profile ${String(profileVersion)}; supported: 0.1.0.`,
-      });
-    }
-    return runtimePackage;
-  }
-
-  async getRuntimeRegistry(options: LoadRuntimeContractsOptions = {}): Promise<RuntimeRegistry> {
-    return await this.observer.trace(
-      "collection.get_runtime_registry",
-      {},
-      () => this.getRuntimeRegistryUnobserved(options),
-    );
-  }
-
-  private async getRuntimeRegistryUnobserved(options: LoadRuntimeContractsOptions): Promise<RuntimeRegistry> {
-    const runtimePackage = await this.loadRuntimeContracts(options);
-    const selectedPath = typeof this.config.runtime?.policy === "string"
-      ? this.config.runtime.policy.replace(/\\/g, "/").replace(/^\.\//, "")
-      : undefined;
-    const selectedPolicyId = options.selectedPolicyId
-      ?? runtimePackage.policies.find((policy) => policy.path === selectedPath)?.frontmatter.id;
-    if (selectedPath && !selectedPolicyId) {
-      runtimePackage.diagnostics.push({
-        severity: "error",
-        code: "policy_not_selected",
-        message: `Selected runtime policy ${selectedPath} was not found.`,
-        path: selectedPath,
-      });
-    }
-    return composeRuntimeRegistry(runtimePackage, options.implicitContracts, selectedPolicyId);
-  }
-
-  async preflightRuntimeWorkflows(
-    options: LoadRuntimeContractsOptions = {},
-  ): Promise<RuntimeValidationResult> {
-    return await this.observer.trace(
-      "collection.preflight_runtime_workflows",
-      {},
-      () => this.preflightRuntimeWorkflowsUnobserved(options),
-    );
-  }
-
-  private async preflightRuntimeWorkflowsUnobserved(
-    options: LoadRuntimeContractsOptions,
-  ): Promise<RuntimeValidationResult> {
-    const registry = await this.getRuntimeRegistry(options);
-    return preflightRuntimeWorkflows(registry);
   }
 
   listTypeMigrations(options: { type?: string; from?: number; to?: number } = {}): TypeMigrationEntry[] {
@@ -4698,13 +4593,6 @@ fields:
       return;
     }
     await this.cache.upsertFile(relativePath, stat, frontmatter, body);
-  }
-
-  private async scanTypeFilesForRuntime(): Promise<string[]> {
-    return await this.scanner.scanTypeFiles(
-      this.config.settings.types_folder,
-      this.config.settings.migrations_folder,
-    );
   }
 
   /**

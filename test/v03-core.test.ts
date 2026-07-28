@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as fsSync from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { validateCanonicalSchema } from "@callumalpass/mdbase-runtime";
+import { validateCanonicalSchema } from "../src/validation/canonical.js";
 import { Collection } from "../src/operations/collection.js";
 import { loadConfigAsync } from "../src/config/loader.js";
 import { loadTypesAsync } from "../src/types/loader.js";
