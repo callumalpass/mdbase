@@ -3,7 +3,7 @@ status: verified
 implementation:
   id: mdbase-ts
   name: mdbase TypeScript implementation
-  version: 0.3.0-rc.1
+  version: 0.3.0-rc.2
   language: TypeScript
   target: npm
   url: https://github.com/callumalpass/mdbase
@@ -12,10 +12,12 @@ profiles:
   - core_read
   - collection_semantics
   - cel
+  - cel_match
   - cel_query
   - links
   - core_write
   - lifecycle
+  - runtime_contracts/0.1
 optional_features:
   - view_records
 json_schema:
@@ -69,17 +71,17 @@ evidence:
   - kind: conformance_suite
     command: npm run test -- test/v03-conformance.test.ts
     result: pass
-    verified_at: "2026-07-22T00:48:00+10:00"
+    verified_at: "2026-07-28T15:14:00+10:00"
     artifact: test/v03-conformance.test.ts
     environment: Linux x86_64, Node.js 22
   - kind: test_suite
     command: npm test
     result: pass
-    verified_at: "2026-07-22T00:48:00+10:00"
+    verified_at: "2026-07-28T15:14:00+10:00"
     environment: Linux x86_64, Node.js 22
   - kind: package_smoke
     command: npm pack --dry-run
     result: pass
-    verified_at: "2026-07-22T00:48:00+10:00"
-    artifact: callumalpass-mdbase-0.3.0-rc.1.tgz
+    verified_at: "2026-07-28T15:14:00+10:00"
+    artifact: callumalpass-mdbase-0.3.0-rc.2.tgz
     environment: Linux x86_64, Node.js 22

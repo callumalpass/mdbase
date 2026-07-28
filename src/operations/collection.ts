@@ -18,6 +18,12 @@ import {
   SUPPORTED_SPEC_VERSION,
 } from "../config/loader.js";
 import { loadTypesAsync, TypeDefinition, FieldDefinition, MatchRules } from "../types/loader.js";
+import {
+  DataContractRegistry,
+  type ContractViewResult,
+  type DataContractDefinition,
+  type DataContractImplementationDescriptor,
+} from "../data-contracts/registry.js";
 import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
@@ -88,6 +94,7 @@ import {
   RuntimeRegistry,
   RuntimeValidationResult,
 } from "../runtime/contracts.js";
+import { recoverInterruptedTypePackTransactions } from "../type-packs/recovery.js";
 
 export type {
   BatchResult,
@@ -139,6 +146,7 @@ export class Collection {
   private readonly observer: OperationObserver;
   private readonly linkResolver: LinkResolver;
   private readonly scanner: CollectionScanner;
+  private readonly dataContracts: DataContractRegistry;
 
   /**
    * Hook called after reading a file but before writing.
@@ -162,9 +170,11 @@ export class Collection {
     config: MdbaseConfig,
     typeDefs: Map<string, TypeDefinition>,
     options: CollectionOptions = {},
+    dataContracts: DataContractRegistry = DataContractRegistry.empty(),
   ) {
     this.config = config;
     this.typeDefs = typeDefs;
+    this.dataContracts = dataContracts;
     this.cache = null;
     this.runtimeCache = new CollectionRuntimeCache();
     this.observer = new OperationObserver(options.observability);
@@ -178,6 +188,7 @@ export class Collection {
       recordExtensions: config.settings.record_extensions,
       includeSubfolders: config.settings.include_subfolders,
       typesFolder: config.settings.types_folder,
+      contractsFolder: config.settings.contracts_folder,
       cacheFolder: config.settings.cache_folder,
       migrationsFolder: config.settings.migrations_folder,
     });
@@ -260,6 +271,21 @@ export class Collection {
     if (input?.types_folder !== undefined || settings.types_folder !== undefined || typesFolder !== "_types") {
       settings.types_folder = typesFolder;
     }
+    const requestedContractsFolder = input?.contracts_folder ?? settings.contracts_folder ?? "_contracts";
+    if (typeof requestedContractsFolder !== "string") {
+      throw new Error("settings.contracts_folder must be a string");
+    }
+    const contractsFolder = normalizeInitTypesFolder(requestedContractsFolder);
+    if (contractsFolder === typesFolder) {
+      throw new Error("settings.contracts_folder must differ from settings.types_folder");
+    }
+    if (
+      input?.contracts_folder !== undefined ||
+      settings.contracts_folder !== undefined ||
+      contractsFolder !== "_contracts"
+    ) {
+      settings.contracts_folder = contractsFolder;
+    }
     if (Object.keys(settings).length > 0) {
       config.settings = settings;
     }
@@ -279,6 +305,7 @@ export class Collection {
 
     const configPath = path.join(collectionRoot, "mdbase.yaml");
     const typesFolderPath = path.join(collectionRoot, ...typesFolder.split("/"));
+    const contractsFolderPath = path.join(collectionRoot, ...contractsFolder.split("/"));
     const metaTypePath = path.join(typesFolderPath, "meta.md");
     const configContent = `${dump(config, {
       noRefs: true,
@@ -298,10 +325,12 @@ export class Collection {
     }
 
     await fs.promises.mkdir(typesFolderPath, { recursive: true });
+    await fs.promises.mkdir(contractsFolderPath, { recursive: true });
     if (!isLegacyV02) {
       return {
         config_path: "mdbase.yaml",
         types_folder: typesFolder,
+        contracts_folder: contractsFolder,
       };
     }
 
@@ -429,6 +458,9 @@ fields:
       "collection.open",
       { root: path.resolve(collectionRoot) },
       async () => {
+        if (!options.skipTypePackRecovery) {
+          await recoverInterruptedTypePackTransactions(collectionRoot);
+        }
         const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
         if (!configResult.valid || !configResult.config) {
           return { error: configResult.error };
@@ -439,11 +471,21 @@ fields:
           return { error: typesResult.error };
         }
 
+        const dataContractsResult = await DataContractRegistry.load(
+          collectionRoot,
+          configResult.config,
+          typesResult.types!,
+        );
+        if (!dataContractsResult.valid || !dataContractsResult.registry) {
+          return { error: dataContractsResult.error };
+        }
+
         const collection = new Collection(
           collectionRoot,
           configResult.config,
           typesResult.types!,
           options,
+          dataContractsResult.registry,
         );
         await collection.initCache();
         return { collection };
@@ -453,6 +495,98 @@ fields:
 
   private async initCache(): Promise<void> {
     this.cache = await CacheStoreAsync.open(this.root, this.config.settings.cache_folder);
+  }
+
+  /** List every local data contract in canonical ID/version order. */
+  listDataContracts(): DataContractDefinition[] {
+    return this.dataContracts.listContracts();
+  }
+
+  /** Return the explicit, canonically ordered implementation set for one exact contract. */
+  getDataContractImplementations(
+    contract: string,
+    version: string,
+  ): DataContractImplementationDescriptor[] {
+    return this.dataContracts.getImplementations(contract, version);
+  }
+
+  /** Project one record through one exact implementing type and validate the normalized view. */
+  async getContractView(
+    relativePath: string,
+    contract: string,
+    version: string,
+    typeName?: string,
+  ): Promise<ContractViewResult> {
+    const readResult = await this.read(relativePath);
+    if (readResult.error) {
+      return {
+        valid: false,
+        contract,
+        version,
+        contract_digest: "",
+        type: typeName ?? "",
+        implementation_digest: "",
+        view: {},
+        diagnostics: [{
+          code: readResult.error.code,
+          message: readResult.error.message,
+          severity: "error",
+          path: relativePath,
+        }],
+      };
+    }
+    const candidates = (readResult.types ?? []).filter((candidate) =>
+      this.dataContracts
+        .getImplementations(contract, version)
+        .some((implementation) => implementation.type === candidate),
+    );
+    const selectedType = typeName ?? (candidates.length === 1 ? candidates[0] : undefined);
+    if (!selectedType) {
+      return {
+        valid: false,
+        contract,
+        version,
+        contract_digest: "",
+        type: "",
+        implementation_digest: "",
+        view: {},
+        diagnostics: [{
+          code: candidates.length === 0
+            ? "data_contract_implementation_not_found"
+            : "data_contract_implementation_ambiguous",
+          message: candidates.length === 0
+            ? `Record "${relativePath}" has no type implementing "${contract}" ${version}`
+            : `Record "${relativePath}" matches multiple implementations of "${contract}" ${version}; select one type explicitly: ${candidates.join(", ")}`,
+          severity: "error",
+          path: relativePath,
+        }],
+      };
+    }
+    if (!candidates.includes(selectedType)) {
+      return {
+        valid: false,
+        contract,
+        version,
+        contract_digest: "",
+        type: selectedType,
+        implementation_digest: "",
+        view: {},
+        diagnostics: [{
+          code: "data_contract_implementation_not_found",
+          message: `Record "${relativePath}" does not match implementing type "${selectedType}"`,
+          severity: "error",
+          path: relativePath,
+        }],
+      };
+    }
+    const result = this.dataContracts.project(
+      selectedType,
+      contract,
+      version,
+      readResult.frontmatter ?? {},
+    );
+    for (const diagnostic of result.diagnostics) diagnostic.path = relativePath;
+    return result;
   }
 
   /**
@@ -930,7 +1064,7 @@ fields:
             const previous = assignments.get(fieldPath)!;
             if (JSON.stringify(previous.value) !== JSON.stringify(value)) {
               issues.push({
-                code: "lifecycle_conflict",
+                code: "type_conflict",
                 message: `Conflicting lifecycle assignments for "${fieldPath}": ${previous.lifecyclePath} and ${lifecyclePath}`,
                 field: fieldPath,
                 type: `${previous.typeName},${typeName}`,
@@ -1054,6 +1188,17 @@ fields:
     if (legacyTypeDefs.length > 0) {
       const legacyResult = validateFrontmatter(frontmatter, legacyTypeDefs, this.config);
       result.issues.push(...legacyResult.issues);
+    }
+    for (const typeDef of v03TypeDefs) {
+      for (const implementation of typeDef.implements ?? []) {
+        const contractResult = this.dataContracts.project(
+          typeDef.name,
+          implementation.contract,
+          implementation.version,
+          frontmatter,
+        );
+        result.issues.push(...contractResult.diagnostics);
+      }
     }
     // Add path to all issues
     for (const issue of result.issues) {
@@ -4614,6 +4759,49 @@ export class V03Operations {
     };
   }
 
+  async getDataContracts(input: { contract?: string; version?: string } = {}): Promise<V03OperationResult> {
+    const contracts = this.collection.listDataContracts().filter((contract) =>
+      (input.contract === undefined || contract.id === input.contract) &&
+      (input.version === undefined || contract.version === input.version),
+    );
+    const implementations = input.contract !== undefined && input.version !== undefined
+      ? this.collection.getDataContractImplementations(input.contract, input.version)
+      : contracts.flatMap((contract) =>
+          this.collection.getDataContractImplementations(contract.id, contract.version),
+        );
+    return {
+      valid: true,
+      result: { contracts, implementations },
+      diagnostics: [],
+    };
+  }
+
+  async getContractView(input: {
+    path: string;
+    contract: string;
+    version: string;
+    type?: string;
+  }): Promise<V03OperationResult> {
+    const projected = await this.collection.getContractView(
+      input.path,
+      input.contract,
+      input.version,
+      input.type,
+    );
+    return {
+      valid: projected.valid,
+      result: {
+        contract: projected.contract,
+        version: projected.version,
+        contract_digest: projected.contract_digest,
+        type: projected.type,
+        implementation_digest: projected.implementation_digest,
+        view: projected.view,
+      },
+      diagnostics: projected.diagnostics,
+    };
+  }
+
   async executeView(input: ExecuteViewInput): Promise<V03OperationResult> {
     return canonicalQueryOperationResult(await this.collection.executeView(input));
   }
@@ -4658,10 +4846,7 @@ export class V03Operations {
       delete result[key];
     }
 
-    if (result.rawFrontmatter !== undefined) {
-      result.raw_frontmatter = result.rawFrontmatter;
-      delete result.rawFrontmatter;
-    }
+    delete result.rawFrontmatter;
     if (operation === "read" && fallbackPath && !result.path) {
       result.path = fallbackPath;
     }
@@ -4684,13 +4869,10 @@ export class V03Operations {
           valid = false;
         } else {
           result.path = persistedPath;
-          result.frontmatter = persisted.rawFrontmatter ?? persisted.frontmatter ?? {};
+          result.frontmatter = persisted.rawFrontmatter ?? {};
+          result.effective_frontmatter = persisted.frontmatter ?? persisted.rawFrontmatter ?? {};
           result.types = persisted.types ?? [];
           if (persisted.revision) result.revision = persisted.revision;
-          if (operation === "read") {
-            result.raw_frontmatter = persisted.rawFrontmatter ?? {};
-            result.frontmatter = persisted.frontmatter ?? {};
-          }
         }
       }
     }

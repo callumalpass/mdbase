@@ -23,8 +23,8 @@ jobs:
       - name: Checkout mdbase spec tests
         uses: actions/checkout@v5
         with:
-          repository: callumalpass/mdbase-spec
-          ref: v0.3.0-rc.1
+          repository: mdbase-dev/mdbase-spec
+          ref: 8180449530b5db54cde88383c3b96798596cc4b4
           path: mdbase-spec
       - run: npm run build
       - run: npm test

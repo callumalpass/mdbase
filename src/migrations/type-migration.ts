@@ -298,17 +298,16 @@ function buildV03Type(oldType: Dict, options: { isTaskNotes: boolean }): Dict {
   };
 
   if (options.isTaskNotes) {
-    migrated["x-tasknotes"] = {
+    migrated.implements = [{
       contract: "tasknotes.task",
-      version: 1,
-      field_roles: fieldRoles,
-      status: statusMetadata,
-      priority: priorityMetadata,
-      archive: {
-        tags_field: fieldRoles.tags ?? "tags",
-        archived_tag: "archived",
+      version: "0.2.0",
+      fields: fieldRoles,
+      binding: {
+        status: statusMetadata,
+        priority: priorityMetadata,
+        archive: { archived_tag: "archived" },
       },
-    };
+    }];
   }
 
   const legacy = collectLegacyMetadata(oldType, { isTaskNotes: options.isTaskNotes });
@@ -524,13 +523,13 @@ function buildMappings(isTaskNotes: boolean, displayMigrated: boolean): TypeMigr
   ];
   if (!isTaskNotes) return mappings;
   return [
-    { from: "fields.title", to: ["schema.value.properties.title", "x-tasknotes.field_roles.title"] },
+    { from: "fields.title", to: ["schema.value.properties.title", "implements.0.fields.title"] },
     { from: "fields.status.values", to: "schema.value.properties.status.enum" },
     {
       from: "fields.status.default",
-      to: ["schema.value.properties.status.default", "collection.read_defaults.status", "x-tasknotes.status.default"],
+      to: ["schema.value.properties.status.default", "collection.read_defaults.status", "implements.0.binding.status.default"],
     },
-    { from: "fields.status.tn_completed_values", to: "x-tasknotes.status.completed_values" },
+    { from: "fields.status.tn_completed_values", to: "implements.0.binding.status.completed_values" },
     { from: "fields.dateCreated.generated", to: "lifecycle.on_create.set.dateCreated" },
     { from: "fields.dateModified.generated", to: "lifecycle.on_update.set.dateModified" },
     { from: "fields.projects.items.type", to: ["schema.value.properties.projects.items.type", "collection.links.projects[]"] },

@@ -112,6 +112,14 @@ export interface V03Migration {
   description?: string;
 }
 
+export interface V03DataContractImplementation {
+  contract: string;
+  version: string;
+  fields: Record<string, string>;
+  binding?: Record<string, unknown>;
+  [extension: `x-${string}`]: unknown;
+}
+
 export interface TypeDefinition {
   name: string;
   kind?: "mdbase.type";
@@ -129,6 +137,7 @@ export interface TypeDefinition {
   lifecycle?: V03Lifecycle;
   runtime?: Record<string, unknown>;
   migrations?: V03Migration[];
+  implements?: V03DataContractImplementation[];
   source_path?: string;
   domain?: Record<string, unknown>;
 }
@@ -399,6 +408,13 @@ export async function loadTypesAsync(
           };
         }
         typeDef.migrations = migrations.migrations;
+      }
+      if (data.implements !== undefined) {
+        typeDef.implements = (data.implements as V03DataContractImplementation[]).map((implementation) => ({
+          ...implementation,
+          fields: { ...implementation.fields },
+          ...(implementation.binding ? { binding: { ...implementation.binding } } : {}),
+        }));
       }
       const domain: Record<string, unknown> = {};
       for (const [key, value] of Object.entries(data)) {
@@ -874,6 +890,7 @@ function validateV03TypeFileShape(data: Record<string, unknown>, typeName: strin
     "lifecycle",
     "runtime",
     "migrations",
+    "implements",
   ]);
 
   for (const [key, value] of Object.entries(data)) {
@@ -899,6 +916,59 @@ function validateV03TypeFileShape(data: Record<string, unknown>, typeName: strin
   }
   if (data.runtime !== undefined && !isPlainObject(data.runtime)) {
     return invalidV03TypeShape(typeName, "runtime section must be a mapping");
+  }
+  if (data.implements !== undefined) {
+    const error = validateV03ImplementationsShape(data.implements, typeName);
+    if (error) return error;
+  }
+  return null;
+}
+
+function validateV03ImplementationsShape(
+  value: unknown,
+  typeName: string,
+): { code: string; message: string } | null {
+  if (!Array.isArray(value) || value.length === 0) {
+    return invalidV03TypeShape(typeName, "implements must be a non-empty list");
+  }
+  const identities = new Set<string>();
+  const contractPattern = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/;
+  const semverPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+  const fieldPathPattern = /^[A-Za-z_][A-Za-z0-9_-]*(?:\[\])?(?:\.[A-Za-z_][A-Za-z0-9_-]*(?:\[\])?)*$/;
+  for (const [index, candidate] of value.entries()) {
+    if (!isPlainObject(candidate)) {
+      return invalidV03TypeShape(typeName, `implements[${index}] must be a mapping`);
+    }
+    for (const [key, child] of Object.entries(candidate)) {
+      if (["contract", "version", "fields", "binding"].includes(key)) continue;
+      if (isV03ExtensionKey(key) && isPlainObject(child)) continue;
+      return invalidV03TypeShape(typeName, `implements[${index}] has invalid key "${key}"`);
+    }
+    if (typeof candidate.contract !== "string" || !contractPattern.test(candidate.contract)) {
+      return invalidV03TypeShape(typeName, `implements[${index}].contract is not a valid contract ID`);
+    }
+    if (typeof candidate.version !== "string" || !semverPattern.test(candidate.version)) {
+      return invalidV03TypeShape(typeName, `implements[${index}].version must be an exact semantic version`);
+    }
+    if (!isPlainObject(candidate.fields)) {
+      return invalidV03TypeShape(typeName, `implements[${index}].fields must be a mapping`);
+    }
+    for (const [contractField, recordField] of Object.entries(candidate.fields)) {
+      if (!fieldPathPattern.test(contractField) || typeof recordField !== "string" || !fieldPathPattern.test(recordField)) {
+        return invalidV03TypeShape(typeName, `implements[${index}].fields contains an invalid field path`);
+      }
+    }
+    if (candidate.binding !== undefined && !isPlainObject(candidate.binding)) {
+      return invalidV03TypeShape(typeName, `implements[${index}].binding must be a mapping`);
+    }
+    const identity = `${candidate.contract}\0${candidate.version}`;
+    if (identities.has(identity)) {
+      return invalidV03TypeShape(
+        typeName,
+        `implements contains duplicate contract identity "${candidate.contract}" ${candidate.version}`,
+      );
+    }
+    identities.add(identity);
   }
   return null;
 }

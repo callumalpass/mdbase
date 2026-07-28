@@ -55,7 +55,7 @@ describe("in-memory cache mutation regressions", () => {
     expect(updated.error).toBeUndefined();
 
     const tasks = await collection.queryCanonical({ types: ["task"] });
-    const notes = await collection.queryCanonical({ types: ["note"], frontmatter: "raw" });
+    const notes = await collection.queryCanonical({ types: ["note"], frontmatter_mode: "persisted" });
     expect(tasks.results.map((row) => row.path)).not.toContain("a.md");
     expect(notes.results).toMatchObject([{
       path: "a.md",

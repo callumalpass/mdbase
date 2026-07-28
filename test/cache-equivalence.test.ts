@@ -22,7 +22,7 @@ function comparableRow(row: CanonicalQueryRow): Record<string, unknown> {
   return {
     path: row.path,
     frontmatter: row.frontmatter,
-    raw_frontmatter: row.raw_frontmatter,
+    effective_frontmatter: row.effective_frontmatter,
     body: row.body,
   };
 }
@@ -32,7 +32,7 @@ async function expectEquivalent(warm: Collection, root: string): Promise<void> {
   try {
     const query = {
       include_body: true,
-      frontmatter: "both" as const,
+      frontmatter_mode: "both" as const,
       order_by: [{ field: "file.path", direction: "asc" as const }],
     };
     const [warmResult, coldResult] = await Promise.all([
@@ -97,7 +97,7 @@ Links to [[${previous}]].
     const warm = await open(root);
     try {
       // Populate every derived runtime cache before the first mutation.
-      await warm.queryCanonical({ include_body: true, frontmatter: "both" });
+      await warm.queryCanonical({ include_body: true, frontmatter_mode: "both" });
       await warm.computeBacklinksForFile("records/item-0.md");
 
       let created = 0;

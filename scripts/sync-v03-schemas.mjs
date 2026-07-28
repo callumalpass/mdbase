@@ -9,12 +9,24 @@ const schemaRoot = resolve(
 const target = resolve(root, "src/generated/v03-schemas.ts");
 const schemas = {
   configSchema: "config.schema.json",
+  dataContractSchema: "data-contract.schema.json",
   diagnosticSchema: "diagnostic.schema.json",
   operationResultSchema: "operation-result.schema.json",
   querySchema: "query.schema.json",
   queryResultSchema: "query-result.schema.json",
   typeFileSchema: "type-file.schema.json",
+  typePackSchema: "type-pack.schema.json",
   viewSchema: "view.schema.json",
+  runtimeActionSchema: "runtime/action.schema.json",
+  runtimeCapabilitySchema: "runtime/capability.schema.json",
+  runtimeCheckpointSchema: "runtime/checkpoint.schema.json",
+  runtimeDiagnosticSchema: "runtime/diagnostic.schema.json",
+  runtimeEventEnvelopeSchema: "runtime/event-envelope.schema.json",
+  runtimeEventSchema: "runtime/event.schema.json",
+  runtimeProviderSchema: "runtime/provider.schema.json",
+  runtimeRunSchema: "runtime/run.schema.json",
+  runtimePolicySchema: "runtime/runtime-policy.schema.json",
+  runtimeWorkflowSchema: "runtime/workflow.schema.json",
 };
 
 const chunks = [

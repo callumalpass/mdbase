@@ -46,8 +46,10 @@ describe("v0.3 core", () => {
     expect(result).toEqual({
       config_path: "mdbase.yaml",
       types_folder: "schemas/types",
+      contracts_folder: "_contracts",
     });
     expect(fsSync.existsSync(path.join(root, "schemas/types"))).toBe(true);
+    expect(fsSync.existsSync(path.join(root, "_contracts"))).toBe(true);
     expect(fsSync.existsSync(path.join(root, "schemas/types/meta.md"))).toBe(false);
     const loaded = await loadConfigAsync(root);
     expect(loaded.config).toMatchObject({
@@ -170,8 +172,8 @@ lifecycle:
       expect(read.valid).toBe(true);
       expect(read.result).toMatchObject({
         path: "notes/one.md",
-        raw_frontmatter: { type: "note", title: "One" },
-        frontmatter: { type: "note", title: "One", status: "open" },
+        frontmatter: { type: "note", title: "One" },
+        effective_frontmatter: { type: "note", title: "One", status: "open" },
       });
       expect(validateCanonicalSchema("operationResult", read).valid).toBe(true);
 
@@ -1182,7 +1184,11 @@ settings:
     const types = await loadTypesAsync(root, config.config!);
     expect(types.valid).toBe(true);
     expect(types.types?.get("task")?.collection?.links?.["blockedBy[].uid"]?.target_type).toBe("task");
-    expect(types.types?.get("task")?.domain?.["x-tasknotes"]).toEqual(expect.any(Object));
+    expect(types.types?.get("task")?.implements?.[0]).toMatchObject({
+      contract: "tasknotes.task",
+      version: "0.2.0",
+      fields: { title: "title", status: "status" },
+    });
   });
 
   it("does not classify Pickle response types mentioning TaskNotes as TaskNotes exports", () => {
@@ -1445,5 +1451,118 @@ views:
     expect((await collection.queryCanonical({ types: ["task"] })).results.map((row) => row.path)).toEqual([
       "tasks/a.md",
     ]);
+  });
+
+  it("loads explicit data-contract unions and validates normalized record views", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", `spec_version: "0.3.0"
+settings:
+  contracts_folder: contracts
+`);
+    await write(root, "contracts/example.note.md", `---
+kind: mdbase.contract
+id: example.note
+version: 1.0.0
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [title]
+    additionalProperties: false
+    properties:
+      title: { type: string, minLength: 1 }
+---
+`);
+    await write(root, "_types/personal_note.md", `---
+kind: mdbase.type
+name: personal_note
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, title]
+    properties:
+      type: { const: personal_note }
+      title: { type: string }
+implements:
+  - contract: example.note
+    version: 1.0.0
+    fields: { title: title }
+---
+`);
+    await write(root, "_types/work_note.md", `---
+kind: mdbase.type
+name: work_note
+version: 2
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    required: [type, summary]
+    properties:
+      type: { const: work_note }
+      summary: { type: string }
+implements:
+  - contract: example.note
+    version: 1.0.0
+    fields: { title: summary }
+---
+`);
+    await write(root, "work.md", "---\ntype: work_note\nsummary: Work note\n---\n");
+    await write(root, "invalid.md", "---\ntype: work_note\nsummary: ''\n---\n");
+
+    const collection = await open(root);
+    expect(collection.listDataContracts()).toEqual([
+      expect.objectContaining({
+        id: "example.note",
+        version: "1.0.0",
+        digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+      }),
+    ]);
+    expect(collection.getDataContractImplementations("example.note", "1.0.0")).toEqual([
+      expect.objectContaining({ type: "personal_note", type_version: 1 }),
+      expect.objectContaining({ type: "work_note", type_version: 2 }),
+    ]);
+    expect(await collection.getContractView("work.md", "example.note", "1.0.0")).toMatchObject({
+      valid: true,
+      type: "work_note",
+      view: { title: "Work note" },
+      implementation_digest: expect.stringMatching(/^sha256:[0-9a-f]{64}$/),
+    });
+    expect(await collection.validate("invalid.md")).toMatchObject({
+      valid: false,
+      issues: expect.arrayContaining([
+        expect.objectContaining({ code: "data_contract_record_invalid", field: "title" }),
+      ]),
+    });
+    expect((await collection.queryCanonical({})).results.map((row) => row.path)).toEqual([
+      "invalid.md",
+      "work.md",
+    ]);
+    await collection.close();
+  });
+
+  it("fails closed when a type names a missing exact data contract", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "_types/note.md", `---
+kind: mdbase.type
+name: note
+version: 1
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+    properties: { title: { type: string } }
+implements:
+  - contract: example.note
+    version: 2.0.0
+    fields: { title: title }
+---
+`);
+    expect(await Collection.open(root)).toMatchObject({
+      error: { code: "data_contract_not_found" },
+    });
   });
 });

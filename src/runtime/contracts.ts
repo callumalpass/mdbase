@@ -4,7 +4,6 @@ import addFormatsImport from "ajv-formats";
 import { satisfies } from "semver";
 import { stringify } from "yaml";
 import {
-  getCanonicalSchemas,
   type ActionContract,
   type CapabilityContract,
   type EventContract,
@@ -20,6 +19,18 @@ import {
   type WorkflowStep,
   type WorkflowTrigger,
 } from "@callumalpass/mdbase-runtime";
+import {
+  runtimeActionSchema,
+  runtimeCapabilitySchema,
+  runtimeCheckpointSchema,
+  runtimeDiagnosticSchema,
+  runtimeEventEnvelopeSchema,
+  runtimeEventSchema,
+  runtimePolicySchema,
+  runtimeProviderSchema,
+  runtimeRunSchema,
+  runtimeWorkflowSchema,
+} from "../generated/v03-schemas.js";
 
 export type RuntimeRecordType = PortableRuntimeRecordType;
 export type RuntimeSeverity = PortableRuntimeDiagnostic["severity"];
@@ -291,7 +302,7 @@ export function validateRuntimeEventEnvelope(
   if (declaredVersion !== contract.version) {
     diagnostics.push({
       severity: "error",
-      code: "contract_version_mismatch",
+      code: "runtime_contract_version_mismatch",
       message: `Event ${eventType} declares contract version ${String(declaredVersion)}, but the registry provides ${String(contract.version)}.`,
       id: eventType,
       details: { expected: contract.version, actual: declaredVersion },
@@ -432,7 +443,7 @@ function addRuntimeRecordToRegistry(
     if (canonicalJson(existing) === canonicalJson(contract)) return;
     registry.diagnostics.push({
       severity: "error",
-      code: "contract_conflict",
+      code: "runtime_contract_conflict",
       message: `Conflicting ${contract.type} contract ${contract.id}.`,
       path: record.path,
       id: contract.id,
@@ -500,18 +511,17 @@ function getAjv(): Ajv2020 {
 function getValidator(name: RuntimeRecordType | "eventEnvelope"): ValidateFunction | undefined {
   if (!validators) {
     const instance = getAjv();
-    const schemas = getCanonicalSchemas();
     validators = {
-      provider: instance.compile(schemas.provider),
-      action: instance.compile(schemas.action),
-      event: instance.compile(schemas.event),
-      capability: instance.compile(schemas.capability),
-      workflow: instance.compile(schemas.workflow),
-      runtime_policy: instance.compile(schemas.runtimePolicy),
-      runtime_run: instance.compile(schemas.run),
-      runtime_checkpoint: instance.compile(schemas.checkpoint),
-      runtime_diagnostic: instance.compile(schemas.diagnostic),
-      eventEnvelope: instance.compile(schemas.eventEnvelope),
+      provider: instance.compile(runtimeProviderSchema),
+      action: instance.compile(runtimeActionSchema),
+      event: instance.compile(runtimeEventSchema),
+      capability: instance.compile(runtimeCapabilitySchema),
+      workflow: instance.compile(runtimeWorkflowSchema),
+      runtime_policy: instance.compile(runtimePolicySchema),
+      runtime_run: instance.compile(runtimeRunSchema),
+      runtime_checkpoint: instance.compile(runtimeCheckpointSchema),
+      runtime_diagnostic: instance.compile(runtimeDiagnosticSchema),
+      eventEnvelope: instance.compile(runtimeEventEnvelopeSchema),
     };
   }
   return validators[name];

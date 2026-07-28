@@ -13,6 +13,7 @@ export interface MdbaseSettings {
   exclude: string[];
   include_subfolders: boolean;
   types_folder: string;
+  contracts_folder: string;
   migrations_folder: string;
   explicit_type_keys: string[];
   default_validation: "off" | "warn" | "error";
@@ -57,6 +58,7 @@ const DEFAULT_SETTINGS: MdbaseSettings = {
   exclude: [".git", "node_modules", ".mdbase"],
   include_subfolders: true,
   types_folder: "_types",
+  contracts_folder: "_contracts",
   migrations_folder: "_types/_migrations",
   explicit_type_keys: ["type", "types"],
   default_validation: "warn",
@@ -83,6 +85,7 @@ const KNOWN_SETTINGS_KEYS = new Set([
   "exclude",
   "include_subfolders",
   "types_folder",
+  "contracts_folder",
   "migrations_folder",
   "explicit_type_keys",
   "default_validation",
@@ -392,6 +395,44 @@ function parseSettings(
     settings.types_folder = raw.types_folder;
   }
 
+  // contracts_folder
+  if (raw.contracts_folder !== undefined) {
+    if (typeof raw.contracts_folder !== "string") {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: "settings.contracts_folder must be a string",
+        },
+      };
+    }
+    settings.contracts_folder = raw.contracts_folder;
+  }
+
+  const invalidTypesFolder = validateControlFolder(settings.types_folder);
+  if (invalidTypesFolder) {
+    return {
+      valid: false,
+      error: { code: "invalid_config", message: `settings.types_folder ${invalidTypesFolder}` },
+    };
+  }
+  const invalidContractsFolder = validateControlFolder(settings.contracts_folder);
+  if (invalidContractsFolder) {
+    return {
+      valid: false,
+      error: { code: "invalid_config", message: `settings.contracts_folder ${invalidContractsFolder}` },
+    };
+  }
+  if (normalizeControlFolder(settings.contracts_folder) === normalizeControlFolder(settings.types_folder)) {
+    return {
+      valid: false,
+      error: {
+        code: "invalid_config",
+        message: "settings.contracts_folder must differ from settings.types_folder",
+      },
+    };
+  }
+
   // migrations_folder
   if (raw.migrations_folder !== undefined) {
     if (typeof raw.migrations_folder !== "string") {
@@ -569,4 +610,23 @@ function normalizeExtensions(values: unknown[]): string[] {
     }
   }
   return extensions;
+}
+
+function validateControlFolder(value: string): string | undefined {
+  const normalized = value.replaceAll("\\", "/");
+  const segments = normalized.split("/");
+  if (
+    normalized.length === 0 ||
+    normalized.includes("\0") ||
+    path.posix.isAbsolute(normalized) ||
+    path.win32.isAbsolute(value) ||
+    segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")
+  ) {
+    return "must be a non-empty relative path without traversal segments";
+  }
+  return undefined;
+}
+
+function normalizeControlFolder(value: string): string {
+  return value.replaceAll("\\", "/");
 }

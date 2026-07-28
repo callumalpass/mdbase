@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
+import { createHash } from "node:crypto";
 import matter from "gray-matter";
 import yaml from "js-yaml";
 import picomatch from "picomatch";
@@ -10,7 +11,8 @@ import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormatsImport from "ajv-formats";
 import { Collection, type V03OperationResult } from "../src/operations/collection.js";
 import { loadConfig } from "../src/config/loader.js";
-import { getType } from "../src/types/loader.js";
+import { getType, loadTypesAsync } from "../src/types/loader.js";
+import { DataContractRegistry, dataContractDigest } from "../src/data-contracts/registry.js";
 import { evaluateMdbaseCel } from "../src/expressions/cel.js";
 import {
   authorizeRuntimeAction,
@@ -23,12 +25,14 @@ import {
 } from "../src/runtime/contracts.js";
 import { migrateV02TypeFileToV03 } from "../src/migrations/type-migration.js";
 import type { CanonicalQueryInput, ExecuteViewInput } from "../src/operations/canonical-query.js";
+import { installTypePack, type TypePackManifest } from "../src/type-packs/installer.js";
 
 type Dict = Record<string, unknown>;
 
 interface V03Setup {
   config?: string | null;
   types?: Record<string, string>;
+  contracts?: Record<string, string>;
   files?: Record<string, string | { content?: string }>;
   collection?: string;
   source_collection?: string;
@@ -58,6 +62,11 @@ interface V03Suite {
   groups?: V03Group[];
 }
 
+interface V03FixtureSet {
+  files?: string[];
+  coverage_targets?: string[];
+}
+
 interface TestContext {
   root: string;
   cleanup?: () => Promise<void>;
@@ -67,6 +76,7 @@ interface TestContext {
 const SPEC_REPO = resolveSpecRepo();
 const V03_TESTS_DIR = path.join(SPEC_REPO, "tests", "v0.3");
 const REQUIRE_V03_CONFORMANCE = process.env.MDBASE_REQUIRE_V03_CONFORMANCE === "1";
+const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.2.yml");
 
 function resolveSpecRepo(): string {
   const candidates = [
@@ -83,16 +93,31 @@ function resolveSpecRepo(): string {
   return candidates[0] ?? path.resolve(process.cwd(), "../mdbase-spec");
 }
 
-function discoverV03Suites(): Array<{ file: string; suite: V03Suite }> {
+function loadClaimedProfiles(): Set<string> {
+  const claim = yaml.load(fs.readFileSync(CLAIM_PATH, "utf8")) as { profiles?: string[] };
+  return new Set(claim.profiles ?? []);
+}
+
+function discoverV03Suites(): Array<{
+  file: string;
+  suite: V03Suite;
+  missingProfiles: string[];
+}> {
   const manifestPath = path.join(V03_TESTS_DIR, "manifest.yaml");
   if (!fs.existsSync(manifestPath)) return [];
-  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as { fixture_sets?: Array<{ files?: string[] }> };
-  const suites: Array<{ file: string; suite: V03Suite }> = [];
+  const claimedProfiles = loadClaimedProfiles();
+  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as {
+    fixture_sets?: V03FixtureSet[];
+  };
+  const suites: Array<{ file: string; suite: V03Suite; missingProfiles: string[] }> = [];
   for (const fixtureSet of manifest.fixture_sets ?? []) {
+    const missingProfiles = (fixtureSet.coverage_targets ?? []).filter(
+      (profile) => !claimedProfiles.has(profile),
+    );
     for (const relativeFile of fixtureSet.files ?? []) {
       const fullPath = path.join(V03_TESTS_DIR, relativeFile);
       const suite = yaml.load(fs.readFileSync(fullPath, "utf8")) as V03Suite;
-      suites.push({ file: relativeFile, suite });
+      suites.push({ file: relativeFile, suite, missingProfiles });
     }
   }
   return suites;
@@ -109,8 +134,12 @@ async function materializeSetup(setup: V03Setup | undefined): Promise<TestContex
   }
 
   const typesFolder = extractTypesFolder(setup?.config) ?? "_types";
+  const contractsFolder = extractContractsFolder(setup?.config) ?? "_contracts";
   for (const [file, content] of Object.entries(setup?.types ?? {})) {
     await write(root, path.join(typesFolder, file), content);
+  }
+  for (const [file, content] of Object.entries(setup?.contracts ?? {})) {
+    await write(root, path.join(contractsFolder, file), content);
   }
   for (const [file, fileSpec] of Object.entries(setup?.files ?? {})) {
     await write(root, file, typeof fileSpec === "string" ? fileSpec : String(fileSpec.content ?? ""));
@@ -142,6 +171,12 @@ async function materializeInlineCollection(files: Dict): Promise<TestContext> {
 function extractTypesFolder(config?: string | null): string | undefined {
   if (!config) return undefined;
   const match = config.match(/types_folder:\s*["']?([^"'\n]+)["']?/);
+  return match?.[1]?.trim();
+}
+
+function extractContractsFolder(config?: string | null): string | undefined {
+  if (!config) return undefined;
+  const match = config.match(/contracts_folder:\s*["']?([^"'\n]+)["']?/);
   return match?.[1]?.trim();
 }
 
@@ -189,9 +224,6 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
         try {
           const envelope = await collection.v03Operations().read({ path: String(input.path) });
           const result = envelope.result as Dict;
-          if (input.effective === false && result.raw_frontmatter) {
-            return adapterResult(envelope, { ...result, frontmatter: result.raw_frontmatter });
-          }
           return adapterResult(envelope, result);
         } finally {
           await collection.close();
@@ -233,6 +265,54 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
         if (!config.valid || !config.config) return config as Dict;
         return await getType(root, config.config, String(input.name)) as Dict;
       });
+
+    case "get_data_contracts":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const result = await collection.v03Operations().getDataContracts({
+            contract: input.contract as string | undefined,
+            version: input.version as string | undefined,
+          });
+          return adapterResult(result, result.result as Dict);
+        } finally {
+          await collection.close();
+        }
+      });
+
+    case "get_contract_view":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const result = await collection.v03Operations().getContractView({
+            path: String(input.path),
+            contract: String(input.contract),
+            version: String(input.version),
+            type: input.type as string | undefined,
+          });
+          return adapterResult(result, result.result as Dict);
+        } finally {
+          await collection.close();
+        }
+      });
+
+    case "data_contract_implementation_validate":
+      return await validateStandaloneDataContractImplementation(input);
+
+    case "data_contract_digest":
+      return inspectDataContractDigest(input);
+
+    case "data_contract_implementation_digest":
+      return await inspectDataContractImplementationDigest(input);
+
+    case "data_contract_registry_validate":
+      return await validateStandaloneDataContractRegistry(input);
+
+    case "type_pack_resources_validate":
+      return validateTypePackResources(input);
+
+    case "install_type_pack":
+      return await installTypePackFixture(context.root, input);
 
     case "query":
       return await withOperationRoot(context, input, async (root) => {
@@ -470,6 +550,57 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
     default:
       throw new Error(`Unsupported v0.3 conformance operation: ${testCase.operation}`);
   }
+}
+
+async function installTypePackFixture(root: string, input: Dict): Promise<Dict> {
+  const manifestPath = path.join(SPEC_REPO, String(input.pack));
+  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as TypePackManifest;
+  const resources = manifest.resources.map((resource) => ({
+    source: resource.source,
+    document: fs.readFileSync(
+      path.resolve(path.dirname(manifestPath), resource.source),
+      "utf8",
+    ),
+  }));
+  if (input.corrupt_digest === true) {
+    manifest.resources[0] = {
+      ...manifest.resources[0]!,
+      digest: `sha256:${"0".repeat(64)}`,
+    };
+  }
+  const runs: Dict[] = [];
+  const repeat = Number(input.repeat ?? 1);
+  for (let index = 0; index < repeat; index += 1) {
+    const result = await installTypePack(root, manifest, resources);
+    runs.push({
+      valid: result.valid,
+      actions: result.result.resources?.map(({ action }) => action) ?? [],
+      ...(result.diagnostics[0]
+        ? {
+            error: {
+              code: result.diagnostics[0].code,
+              message: result.diagnostics[0].message,
+            },
+          }
+        : {}),
+    });
+    if (!result.valid) break;
+  }
+  const last = runs.at(-1) ?? { valid: false };
+  const opened = await Collection.open(root);
+  const implementations = opened.collection
+    ? opened.collection.getDataContractImplementations("tasknotes.task", "0.2.0").length
+    : 0;
+  await opened.collection?.close();
+  return {
+    valid: last.valid,
+    runs,
+    implementations,
+    targets_exist: manifest.resources.map((resource) =>
+      fs.existsSync(path.join(root, resource.target))
+    ),
+    ...(last.error ? { error: last.error } : {}),
+  };
 }
 
 async function withRuntimeRegistryInput<T>(
@@ -748,11 +879,69 @@ function validateMarkdownFrontmatter(input: Dict): Dict {
 function validateEmbeddedJsonSchemas(input: Dict): Dict {
   const ajv = getAjv();
   const diagnostics: Dict[] = [];
+  const pointers = Array.isArray(input.pointers)
+    ? input.pointers.map(String)
+    : [String(input.pointer)];
   for (const filePath of resolveSpecPaths(input.paths)) {
     const frontmatter = matter(fs.readFileSync(filePath, "utf8")).data as Dict;
-    const schema = getPointer(frontmatter, String(input.pointer));
-    if (!ajv.validateSchema(schema)) {
-      diagnostics.push(...(ajv.errors ?? []).map((error) => ({ code: "invalid_embedded_schema", path: filePath, message: error.message })));
+    for (const pointer of pointers) {
+      const schema = getPointer(frontmatter, pointer);
+      if (!ajv.validateSchema(schema)) {
+        diagnostics.push(...(ajv.errors ?? []).map((error) => ({
+          code: "invalid_embedded_schema",
+          path: filePath,
+          field: pointer,
+          message: error.message,
+        })));
+      }
+    }
+  }
+  return { valid: diagnostics.length === 0, diagnostics };
+}
+
+function validateTypePackResources(input: Dict): Dict {
+  const manifestPath = path.join(SPEC_REPO, String(input.path));
+  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as {
+    resources?: Array<{ source?: unknown; digest?: unknown }>;
+  };
+  const diagnostics: Dict[] = [];
+  for (const [index, resource] of (manifest.resources ?? []).entries()) {
+    if (typeof resource.source !== "string" || typeof resource.digest !== "string") {
+      diagnostics.push({
+        code: "invalid_type_pack",
+        field: `resources.${index}`,
+        message: "resource source and digest must be strings",
+      });
+      continue;
+    }
+    const sourcePath = path.resolve(path.dirname(manifestPath), resource.source);
+    const manifestRoot = path.resolve(path.dirname(manifestPath));
+    if (sourcePath !== manifestRoot && !sourcePath.startsWith(manifestRoot + path.sep)) {
+      diagnostics.push({
+        code: "type_pack_path_forbidden",
+        field: `resources.${index}.source`,
+        message: `resource source escapes the pack: ${resource.source}`,
+      });
+      continue;
+    }
+    let bytes: Buffer;
+    try {
+      bytes = fs.readFileSync(sourcePath);
+    } catch (error) {
+      diagnostics.push({
+        code: "type_pack_resource_missing",
+        field: `resources.${index}.source`,
+        message: (error as Error).message,
+      });
+      continue;
+    }
+    const digest = `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
+    if (digest !== resource.digest) {
+      diagnostics.push({
+        code: "type_pack_digest_mismatch",
+        field: `resources.${index}.digest`,
+        message: `expected ${resource.digest}, computed ${digest}`,
+      });
     }
   }
   return { valid: diagnostics.length === 0, diagnostics };
@@ -807,6 +996,151 @@ function inspectYaml(input: Dict): Dict {
   const filePath = path.join(SPEC_REPO, String(input.path));
   const document = matter(fs.readFileSync(filePath, "utf8")).data as Dict;
   return { valid: true, document };
+}
+
+async function validateStandaloneDataContractImplementation(input: Dict): Promise<Dict> {
+  const context = await materializeStandaloneDataContracts(
+    [String(input.contract)],
+    input.type ? String(input.type) : undefined,
+  );
+  try {
+    const loaded = await loadStandaloneRegistry(context.root);
+    if (!loaded.valid || !loaded.registry || !loaded.typeName || !loaded.contractIdentity) {
+      return {
+        valid: false,
+        error: loaded.error ?? { code: "data_contract_implementation_not_found", message: "Expected exactly one implementation" },
+      };
+    }
+    const implementations = loaded.registry.getImplementations(
+      loaded.contractIdentity.id,
+      loaded.contractIdentity.version,
+    );
+    if (implementations.length !== 1) {
+      return {
+        valid: false,
+        error: {
+          code: "data_contract_implementation_not_found",
+          message: `Expected exactly one implementation, found ${implementations.length}`,
+        },
+      };
+    }
+    if (typeof input.record === "string") {
+      const record = yaml.load(fs.readFileSync(path.join(SPEC_REPO, input.record), "utf8")) as Dict;
+      const projected = loaded.registry.project(
+        loaded.typeName,
+        loaded.contractIdentity.id,
+        loaded.contractIdentity.version,
+        record,
+      );
+      if (!projected.valid) {
+        return {
+          valid: false,
+          diagnostics: projected.diagnostics,
+          error: { code: projected.diagnostics[0].code, message: projected.diagnostics[0].message },
+        };
+      }
+      return { valid: true, view: projected.view, diagnostics: [] };
+    }
+    return { valid: true, diagnostics: [] };
+  } finally {
+    await context.cleanup?.();
+  }
+}
+
+function inspectDataContractDigest(input: Dict): Dict {
+  const contract = matter(fs.readFileSync(path.join(SPEC_REPO, String(input.contract)), "utf8")).data as Dict;
+  return { valid: true, digest: dataContractDigest(contract) };
+}
+
+async function inspectDataContractImplementationDigest(input: Dict): Promise<Dict> {
+  const context = await materializeStandaloneDataContracts(
+    [String(input.contract)],
+    String(input.type),
+  );
+  try {
+    const loaded = await loadStandaloneRegistry(context.root);
+    if (!loaded.valid || !loaded.registry || !loaded.contractIdentity) {
+      return { valid: false, error: loaded.error };
+    }
+    const implementations = loaded.registry.getImplementations(
+      loaded.contractIdentity.id,
+      loaded.contractIdentity.version,
+    );
+    if (implementations.length !== 1) {
+      return {
+        valid: false,
+        error: {
+          code: "data_contract_implementation_not_found",
+          message: `Expected exactly one implementation, found ${implementations.length}`,
+        },
+      };
+    }
+    return { valid: true, digest: implementations[0].implementation_digest };
+  } finally {
+    await context.cleanup?.();
+  }
+}
+
+async function validateStandaloneDataContractRegistry(input: Dict): Promise<Dict> {
+  const paths = (input.paths as string[] | undefined) ?? [];
+  const context = await materializeStandaloneDataContracts(paths);
+  try {
+    const config = await loadConfig(context.root);
+    const loaded = await DataContractRegistry.load(context.root, config.config!, new Map());
+    return loaded.valid
+      ? { valid: true, diagnostics: [] }
+      : { valid: false, error: loaded.error, diagnostics: [{ ...loaded.error, severity: "error" }] };
+  } finally {
+    await context.cleanup?.();
+  }
+}
+
+async function materializeStandaloneDataContracts(
+  contractPaths: string[],
+  typePath?: string,
+): Promise<TestContext> {
+  const root = await fsp.mkdtemp(path.join(os.tmpdir(), "mdbase-v0.3-data-contract-"));
+  await write(root, "mdbase.yaml", [
+    'spec_version: "0.3.0"',
+    "settings:",
+    "  types_folder: _types",
+    "  contracts_folder: _contracts",
+    "",
+  ].join("\n"));
+  for (const [index, contractPath] of contractPaths.entries()) {
+    await write(root, `_contracts/contract-${index}.md`, fs.readFileSync(path.join(SPEC_REPO, contractPath), "utf8"));
+  }
+  if (typePath) {
+    await write(root, "_types/type.md", fs.readFileSync(path.join(SPEC_REPO, typePath), "utf8"));
+  }
+  return {
+    root,
+    cleanup: async () => {
+      await fsp.rm(root, { recursive: true, force: true });
+    },
+  };
+}
+
+async function loadStandaloneRegistry(root: string): Promise<{
+  valid: boolean;
+  registry?: DataContractRegistry;
+  typeName?: string;
+  contractIdentity?: { id: string; version: string };
+  error?: { code: string; message: string };
+}> {
+  const config = await loadConfig(root);
+  if (!config.valid || !config.config) return { valid: false, error: config.error };
+  const types = await loadTypesAsync(root, config.config);
+  if (!types.valid || !types.types) return { valid: false, error: types.error };
+  const loaded = await DataContractRegistry.load(root, config.config, types.types);
+  if (!loaded.valid || !loaded.registry) return { valid: false, error: loaded.error };
+  const contract = loaded.registry.listContracts()[0];
+  return {
+    valid: true,
+    registry: loaded.registry,
+    typeName: [...types.types.keys()][0],
+    ...(contract ? { contractIdentity: { id: contract.id, version: contract.version } } : {}),
+  };
 }
 
 async function inspectTasknotesMigration(context: TestContext, input: Dict): Promise<Dict> {
@@ -902,6 +1236,10 @@ async function assertExpectation(actual: Dict, expected: Dict, testName: string,
   if (expected.error && typeof expected.error === "object") {
     expect((actual.error as Dict | undefined)?.code, `${testName}: error.code`).toBe((expected.error as Dict).code);
   }
+  if (typeof expected.error_contains === "string") {
+    expect(String((actual.error as Dict | undefined)?.message ?? actual.error ?? ""), `${testName}: error_contains`)
+      .toContain(expected.error_contains);
+  }
   if (Array.isArray(expected.issues)) {
     assertDiagnostics(actual.issues as Dict[] | undefined, expected.issues as Dict[], `${testName}: issues`);
   }
@@ -913,6 +1251,9 @@ async function assertExpectation(actual: Dict, expected: Dict, testName: string,
   }
   if (expected.frontmatter) {
     assertSubset(actual.frontmatter, expected.frontmatter, `${testName}: frontmatter`);
+  }
+  if (expected.effective_frontmatter) {
+    assertSubset(actual.effective_frontmatter, expected.effective_frontmatter, `${testName}: effective_frontmatter`);
   }
   if (expected.frontmatter_contains) {
     assertSubset(actual.frontmatter, expected.frontmatter_contains, `${testName}: frontmatter_contains`);
@@ -956,6 +1297,15 @@ async function assertExpectation(actual: Dict, expected: Dict, testName: string,
   }
   if (expected.views) {
     assertSubset(actual.views, expected.views, `${testName}: views`);
+  }
+  if (expected.implementations) {
+    assertSubset(actual.implementations, expected.implementations, `${testName}: implementations`);
+  }
+  if (expected.view) {
+    assertSubset(actual.view, expected.view, `${testName}: view`);
+  }
+  if (expected.digest) {
+    expect(actual.digest, `${testName}: digest`).toBe(expected.digest);
   }
   if (expected.paths) {
     expect(actual.paths, `${testName}: paths`).toEqual(expected.paths);
@@ -1043,8 +1393,11 @@ if (suites.length === 0) {
   });
 } else {
   describe("v0.3 conformance", () => {
-    for (const { file, suite } of suites) {
-      describe(`${suite.fixture_set}: ${suite.name} (${file})`, () => {
+    for (const { file, suite, missingProfiles } of suites) {
+      const describeSuite = missingProfiles.length === 0 ? describe : describe.skip;
+      const unsupported =
+        missingProfiles.length === 0 ? "" : ` [unclaimed: ${missingProfiles.join(", ")}]`;
+      describeSuite(`${suite.fixture_set}: ${suite.name} (${file})${unsupported}`, () => {
         for (const group of suite.groups ?? []) {
           describe(group.name, () => {
             let sharedContext: TestContext | undefined;
