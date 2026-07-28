@@ -52,6 +52,14 @@ export type {
 } from "./data-contracts/registry.js";
 export { validateJsonSchemaFrontmatter } from "./validation/json-schema.js";
 export {
+  getCanonicalSchemas,
+  validateCanonicalSchema,
+} from "./validation/canonical.js";
+export type {
+  CanonicalSchemaName,
+  CanonicalSchemaValidationResult,
+} from "./validation/canonical.js";
+export {
   buildMdbaseCelBindings,
   collectMdbaseCelProjectionReferences,
   evaluateMdbaseCel,
@@ -95,41 +103,6 @@ export type {
   CollectionMigrationRecoveryResult,
   CollectionMigrationReport,
 } from "./migrations/collection-migration.js";
-export {
-  buildRuntimePackage,
-  authorizeRuntimeAction,
-  composeRuntimeRegistry,
-  isRuntimeRecordType,
-  materializeRuntimeContractRecord,
-  preflightRuntimeWorkflows,
-  validateRuntimeActionInput,
-  validateRuntimeActionOutput,
-  validateRuntimeContractRecord,
-  validateRuntimeEventEnvelope,
-  validateRuntimeValueAgainstSchema,
-} from "./runtime/contracts.js";
-export type {
-  LoadRuntimeContractsOptions,
-  RuntimeActionContract,
-  RuntimeCapabilityContract,
-  RuntimeContractRecord,
-  RuntimeDiagnostic,
-  RuntimeEventContract,
-  RuntimeExpressionObject,
-  RuntimeMarkdownRecord,
-  RuntimePackage,
-  RuntimePolicyContract,
-  RuntimeProviderContract,
-  RuntimeProviderRequirement,
-  RuntimeRecordType,
-  RuntimeRegistry,
-  RuntimeRequires,
-  RuntimeSeverity,
-  RuntimeValidationResult,
-  RuntimeWorkflowContract,
-  RuntimeWorkflowStep,
-  RuntimeWorkflowTrigger,
-} from "./runtime/contracts.js";
 export { Collection, V03Operations, V03ProfileError } from "./operations/collection.js";
 export type {
   TypeMigrationEntry,

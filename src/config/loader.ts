@@ -33,7 +33,6 @@ export interface MdbaseConfig {
   name?: string;
   description?: string;
   settings: MdbaseSettings;
-  runtime?: Record<string, unknown>;
 }
 
 export interface ConfigLoadResult {
@@ -76,7 +75,6 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
   "name",
   "description",
   "settings",
-  "runtime",
 ]);
 
 const KNOWN_SETTINGS_KEYS = new Set([
@@ -147,7 +145,11 @@ export async function loadConfigAsync(
   // Check for unknown top-level keys
   for (const key of Object.keys(rawConfig)) {
     if (!KNOWN_TOP_LEVEL_KEYS.has(key)) {
-      warnings.push(`Unknown top-level key: ${key}`);
+      warnings.push(
+        key === "runtime"
+          ? "The mdbase runtime 0.1 config section is superseded. Runtime 0.2 host enablement and policy selection belong in host settings; install the standard runtime pack for portable records."
+          : `Unknown top-level key: ${key}`,
+      );
     }
   }
 
@@ -261,10 +263,6 @@ export async function loadConfigAsync(
   if (rawConfig.description !== undefined) {
     config.description = String(rawConfig.description);
   }
-  if (rawConfig.runtime !== undefined && rawConfig.runtime !== null && typeof rawConfig.runtime === "object" && !Array.isArray(rawConfig.runtime)) {
-    config.runtime = rawConfig.runtime as Record<string, unknown>;
-  }
-
   return {
     valid: true,
     config,

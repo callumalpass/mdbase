@@ -14,15 +14,6 @@ import { loadConfig } from "../src/config/loader.js";
 import { getType, loadTypesAsync } from "../src/types/loader.js";
 import { DataContractRegistry, dataContractDigest } from "../src/data-contracts/registry.js";
 import { evaluateMdbaseCel } from "../src/expressions/cel.js";
-import {
-  authorizeRuntimeAction,
-  composeRuntimeRegistry,
-  materializeRuntimeContractRecord,
-  validateRuntimeActionInput,
-  validateRuntimeActionOutput,
-  validateRuntimeEventEnvelope,
-  type RuntimeContractRecord,
-} from "../src/runtime/contracts.js";
 import { migrateV02TypeFileToV03 } from "../src/migrations/type-migration.js";
 import type { CanonicalQueryInput, ExecuteViewInput } from "../src/operations/canonical-query.js";
 import { installTypePack, type TypePackManifest } from "../src/type-packs/installer.js";
@@ -40,7 +31,6 @@ interface V03Setup {
   expected_report?: string;
   event?: Dict;
   steps?: Dict;
-  implicit_contracts?: RuntimeContractRecord[];
 }
 
 interface V03TestCase {
@@ -76,7 +66,7 @@ interface TestContext {
 const SPEC_REPO = resolveSpecRepo();
 const V03_TESTS_DIR = path.join(SPEC_REPO, "tests", "v0.3");
 const REQUIRE_V03_CONFORMANCE = process.env.MDBASE_REQUIRE_V03_CONFORMANCE === "1";
-const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.3.yml");
+const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.4.yml");
 
 function resolveSpecRepo(): string {
   const candidates = [
@@ -393,136 +383,6 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
     case "evaluate_workflow_input":
       return evaluateWorkflowInput(context, input);
 
-    case "runtime_load_contracts":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const runtimePackage = await collection.loadRuntimeContracts({ implicitContracts });
-          return {
-            valid: !hasErrorDiagnostics(runtimePackage.diagnostics),
-            diagnostics: runtimePackage.diagnostics,
-            counts: {
-              type_files: runtimePackage.typeFiles.length,
-              providers: runtimePackage.providers.length,
-              actions: runtimePackage.actions.length,
-              events: runtimePackage.events.length,
-              capabilities: runtimePackage.capabilities.length,
-              workflows: runtimePackage.workflows.length,
-            },
-          };
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_compose_registry":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const runtimePackage = await collection.loadRuntimeContracts({ implicitContracts });
-          const registry = composeRuntimeRegistry(runtimePackage, implicitContracts);
-          return {
-            valid: !hasErrorDiagnostics(registry.diagnostics),
-            diagnostics: registry.diagnostics,
-            registry: {
-              providers: [...registry.providerContracts.keys()],
-              actions: [...registry.actions.keys()],
-              events: [...registry.events.keys()],
-              capabilities: [...registry.capabilityIds],
-              workflows: [...registry.workflows.keys()],
-            },
-          };
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_reference_load":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const runtimePackage = await collection.loadRuntimeContracts({ implicitContracts });
-          const registry = await collection.getRuntimeRegistry({ implicitContracts });
-          const preflight = await collection.preflightRuntimeWorkflows({ implicitContracts });
-          const diagnostics = [...registry.diagnostics, ...preflight.diagnostics.filter((item) => !registry.diagnostics.includes(item))];
-          return {
-            valid: !hasErrorDiagnostics(diagnostics),
-            diagnostics,
-            counts: {
-              providers: runtimePackage.providers.length,
-              actions: registry.actions.size,
-              events: registry.events.size,
-              capabilities: registry.capabilityIds.size,
-              workflows: registry.workflows.size,
-            },
-          };
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_preflight_workflows":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const result = await collection.preflightRuntimeWorkflows({ implicitContracts });
-          return result as unknown as Dict;
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_validate_event":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const registry = await collection.getRuntimeRegistry({ implicitContracts });
-          const envelope = input.value ?? JSON.parse(fs.readFileSync(path.join(SPEC_REPO, String(input.event)), "utf8"));
-          return validateRuntimeEventEnvelope(registry, envelope) as unknown as Dict;
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_execute_event":
-      return await executeRuntimeEvent(context, input);
-
-    case "runtime_validate_action_input":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const registry = await collection.getRuntimeRegistry({ implicitContracts });
-          return validateRuntimeActionInput(registry, String(input.action), input.value) as unknown as Dict;
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_validate_action_output":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const registry = await collection.getRuntimeRegistry({ implicitContracts });
-          return validateRuntimeActionOutput(registry, String(input.action), input.value) as unknown as Dict;
-        } finally {
-          await collection.close();
-        }
-      });
-
-    case "runtime_materialize_contract":
-      return await withRuntimeRegistryInput(context, input, async (root, implicitContracts) => {
-        const collection = await open(root);
-        try {
-          const registry = await collection.getRuntimeRegistry({ implicitContracts });
-          const id = String(input.contract);
-          const contract = registry.actions.get(id) ?? registry.events.get(id) ?? registry.capabilities.get(id) ?? registry.workflows.get(id) ?? registry.policies.get(id);
-          if (!contract) return { valid: false, diagnostics: [{ code: "unresolved_contract", id }] };
-          return { valid: true, markdown: materializeRuntimeContractRecord(contract) };
-        } finally {
-          await collection.close();
-        }
-      });
-
     case "json_schema_meta_validate":
       return validateJsonSchemas(input);
 
@@ -601,17 +461,6 @@ async function installTypePackFixture(root: string, input: Dict): Promise<Dict> 
     ),
     ...(last.error ? { error: last.error } : {}),
   };
-}
-
-async function withRuntimeRegistryInput<T>(
-  context: TestContext,
-  input: Dict,
-  fn: (root: string, implicitContracts: RuntimeContractRecord[]) => Promise<T>,
-): Promise<T> {
-  const implicitContracts = input.include_setup_implicit_contracts === true
-    ? context.setup?.implicit_contracts ?? []
-    : [];
-  return await withOperationRoot(context, input, (root) => fn(root, implicitContracts));
 }
 
 function adapterResult(
@@ -706,99 +555,6 @@ function evaluateWorkflowInput(context: TestContext, input: Dict): Dict {
   return { valid: true, value: evaluateValue(input.template) } as Dict;
 }
 
-async function executeRuntimeEvent(context: TestContext, input: Dict): Promise<Dict> {
-  const sourceRoot = typeof input.collection === "string"
-    ? path.join(SPEC_REPO, input.collection)
-    : context.root;
-  const collection = await open(sourceRoot);
-  const recordOverrides = new Map<string, Dict>();
-  try {
-    const registry = await collection.getRuntimeRegistry();
-    const preflight = await collection.preflightRuntimeWorkflows();
-    if (!preflight.valid) return preflight as unknown as Dict;
-    const event = JSON.parse(fs.readFileSync(path.join(SPEC_REPO, String(input.event)), "utf8")) as Dict;
-    const eventValidation = validateRuntimeEventEnvelope(registry, event);
-    if (!eventValidation.valid) return eventValidation as unknown as Dict;
-
-    const runs: Dict[] = [];
-    for (const workflow of registry.workflows.values()) {
-      if (workflow.enabled === false) continue;
-      for (const trigger of workflow.triggers ?? []) {
-        if (trigger.event !== event.type) continue;
-        if (trigger.if) {
-          const guard = evaluateMdbaseCel(trigger.if.$expr, { event });
-          if (guard.diagnostics.length > 0 || guard.value !== true) continue;
-        }
-
-        const stepBindings: Dict = {};
-        const runSteps: Dict[] = [];
-        let runStatus = "succeeded";
-        for (const step of workflow.steps ?? []) {
-          if (step.if) {
-            const guard = evaluateMdbaseCel(step.if.$expr, { event, steps: stepBindings });
-            if (guard.diagnostics.length > 0) {
-              return { valid: false, diagnostics: guard.diagnostics };
-            }
-            if (guard.value !== true) continue;
-          }
-          const evaluatedInput = evaluateRuntimeTemplate(step.input ?? {}, event, stepBindings) as Dict;
-          const inputValidation = validateRuntimeActionInput(registry, step.action, evaluatedInput);
-          const authorization = authorizeRuntimeAction(registry, step.action);
-          if (!inputValidation.valid || !authorization.valid) {
-            return {
-              valid: false,
-              diagnostics: [...inputValidation.diagnostics, ...authorization.diagnostics],
-            };
-          }
-
-          let output: unknown;
-          if (step.action === "mdbase.record.patch") {
-            const recordPath = String(evaluatedInput.path);
-            const read = await collection.read(recordPath);
-            if (read.error || !read.frontmatter) {
-              runStatus = "failed";
-              return { valid: false, diagnostics: [{ code: read.error?.code ?? "record_not_found", message: read.error?.message ?? recordPath }] };
-            }
-            const frontmatter = { ...read.frontmatter, ...(evaluatedInput.patch as Dict) };
-            recordOverrides.set(recordPath, frontmatter);
-            output = { path: recordPath, frontmatter };
-          } else {
-            return { valid: false, diagnostics: [{ code: "unresolved_action_handler", id: step.action }] };
-          }
-          const outputValidation = validateRuntimeActionOutput(registry, step.action, output);
-          if (!outputValidation.valid) return outputValidation as unknown as Dict;
-          stepBindings[step.id] = { output };
-          runSteps.push({ id: step.id, action: step.action, status: "succeeded", input: evaluatedInput });
-        }
-        runs.push({ workflow: workflow.id, trigger: trigger.id, status: runStatus, steps: runSteps });
-      }
-    }
-
-    const records: Dict = {};
-    for (const recordPath of input.record_store as string[] | undefined ?? []) {
-      const read = await collection.read(recordPath);
-      records[recordPath] = { frontmatter: recordOverrides.get(recordPath) ?? read.frontmatter, body: read.body };
-    }
-    return { valid: true, diagnostics: [], runs, records };
-  } finally {
-    await collection.close();
-  }
-}
-
-function evaluateRuntimeTemplate(value: unknown, event: Dict, steps: Dict): unknown {
-  if (Array.isArray(value)) return value.map((item) => evaluateRuntimeTemplate(item, event, steps));
-  if (value && typeof value === "object") {
-    const object = value as Dict;
-    if (typeof object.$expr === "string") {
-      return evaluateMdbaseCel(object.$expr, { event, steps }).value;
-    }
-    return Object.fromEntries(
-      Object.entries(object).map(([key, item]) => [key, evaluateRuntimeTemplate(item, event, steps)]),
-    );
-  }
-  return value;
-}
-
 function collectTags(record: Dict): string[] {
   const tags = record.tags;
   if (Array.isArray(tags)) return tags.filter((tag): tag is string => typeof tag === "string");
@@ -809,10 +565,6 @@ function collectTags(record: Dict): string[] {
 function diffFields(before: Dict, after: Dict): string[] {
   const fields = new Set([...Object.keys(before), ...Object.keys(after)]);
   return [...fields].filter((field) => JSON.stringify(before[field]) !== JSON.stringify(after[field]));
-}
-
-function hasErrorDiagnostics(diagnostics: Array<{ severity?: string }>): boolean {
-  return diagnostics.some((diagnostic) => diagnostic.severity === "error" || diagnostic.severity === undefined);
 }
 
 function expandSpecGlob(pattern: string): string[] {

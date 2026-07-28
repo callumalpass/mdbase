@@ -136,7 +136,6 @@ export interface TypeDefinition {
   schema?: V03SchemaWrapper;
   collection?: V03CollectionSemantics;
   lifecycle?: V03Lifecycle;
-  runtime?: Record<string, unknown>;
   migrations?: V03Migration[];
   implements?: V03DataContractImplementation[];
   source_path?: string;
@@ -396,9 +395,6 @@ export async function loadTypesAsync(
       }
       if (data.lifecycle !== undefined && data.lifecycle !== null && typeof data.lifecycle === "object" && !Array.isArray(data.lifecycle)) {
         typeDef.lifecycle = data.lifecycle as V03Lifecycle;
-      }
-      if (data.runtime !== undefined && data.runtime !== null && typeof data.runtime === "object" && !Array.isArray(data.runtime)) {
-        typeDef.runtime = data.runtime as Record<string, unknown>;
       }
       if (data.migrations !== undefined) {
         const migrations = parseV03Migrations(data.migrations, typeName);
@@ -889,7 +885,6 @@ function validateV03TypeFileShape(data: Record<string, unknown>, typeName: strin
     "schema",
     "collection",
     "lifecycle",
-    "runtime",
     "migrations",
     "implements",
   ]);
@@ -914,9 +909,6 @@ function validateV03TypeFileShape(data: Record<string, unknown>, typeName: strin
   if (data.lifecycle !== undefined) {
     const error = validateV03LifecycleShape(data.lifecycle, typeName);
     if (error) return error;
-  }
-  if (data.runtime !== undefined && !isPlainObject(data.runtime)) {
-    return invalidV03TypeShape(typeName, "runtime section must be a mapping");
   }
   if (data.implements !== undefined) {
     const error = validateV03ImplementationsShape(data.implements, typeName);
