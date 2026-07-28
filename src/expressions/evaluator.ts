@@ -11,6 +11,7 @@
  */
 
 import { parseLink, extractBodyLinks, extractBodyTags, ParsedLink } from "../links/parser.js";
+import { getFieldReferenceValue } from "../field-references.js";
 
 export class ExpressionError extends Error {
   code: string;
@@ -1321,7 +1322,8 @@ class ExprParser {
         for (const typeName of (this.ctx.types ?? [])) {
           const td = this.ctx.typeDefs?.get(typeName);
           if (td?.display_name_key) {
-            const val = this.ctx.frontmatter?.[td.display_name_key];
+            const selected = getFieldReferenceValue(this.ctx.frontmatter, td.display_name_key);
+            const val = selected.present ? selected.value : undefined;
             if (val != null && String(val) !== "") return String(val);
           }
         }

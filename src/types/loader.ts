@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import matter from "gray-matter";
 import { MdbaseConfig } from "../config/loader.js";
+import { isValidFieldReference } from "../field-references.js";
 
 export interface FieldDefinition {
   type: string;
@@ -934,7 +935,6 @@ function validateV03ImplementationsShape(
   const identities = new Set<string>();
   const contractPattern = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/;
   const semverPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
-  const fieldPathPattern = /^[A-Za-z_][A-Za-z0-9_-]*(?:\[\])?(?:\.[A-Za-z_][A-Za-z0-9_-]*(?:\[\])?)*$/;
   for (const [index, candidate] of value.entries()) {
     if (!isPlainObject(candidate)) {
       return invalidV03TypeShape(typeName, `implements[${index}] must be a mapping`);
@@ -954,8 +954,8 @@ function validateV03ImplementationsShape(
       return invalidV03TypeShape(typeName, `implements[${index}].fields must be a mapping`);
     }
     for (const [contractField, recordField] of Object.entries(candidate.fields)) {
-      if (!fieldPathPattern.test(contractField) || typeof recordField !== "string" || !fieldPathPattern.test(recordField)) {
-        return invalidV03TypeShape(typeName, `implements[${index}].fields contains an invalid field path`);
+      if (!isValidFieldReference(contractField) || !isValidFieldReference(recordField)) {
+        return invalidV03TypeShape(typeName, `implements[${index}].fields contains an invalid field reference`);
       }
     }
     if (candidate.binding !== undefined && !isPlainObject(candidate.binding)) {
@@ -985,12 +985,21 @@ function validateV03MatchShape(value: unknown, typeName: string): { code: string
     if (!validPathGlob) return invalidV03TypeShape(typeName, "match.path_glob must be a string or non-empty string list");
   }
   if (value.fields_present !== undefined) {
-    if (!Array.isArray(value.fields_present) || !value.fields_present.every((entry) => typeof entry === "string" && entry.length > 0)) {
-      return invalidV03TypeShape(typeName, "match.fields_present must be a non-empty string list");
+    if (
+      !Array.isArray(value.fields_present)
+      || value.fields_present.length === 0
+      || !value.fields_present.every(isValidFieldReference)
+    ) {
+      return invalidV03TypeShape(typeName, "match.fields_present must be a non-empty field-reference list");
     }
   }
-  if (value.where !== undefined && !isPlainObject(value.where)) {
-    return invalidV03TypeShape(typeName, "match.where must be a mapping");
+  if (value.where !== undefined) {
+    if (!isPlainObject(value.where)) {
+      return invalidV03TypeShape(typeName, "match.where must be a mapping");
+    }
+    if (Object.keys(value.where).length === 0 || !Object.keys(value.where).every(isValidFieldReference)) {
+      return invalidV03TypeShape(typeName, "match.where contains an invalid field reference");
+    }
   }
   if (value.expr !== undefined) {
     if (!isPlainObject(value.expr) || typeof value.expr.$expr !== "string" || value.expr.$expr.length === 0) {
@@ -1018,6 +1027,15 @@ function validateV03CollectionShape(value: unknown, typeName: string): { code: s
   if (value.display !== undefined) {
     const error = validateV03ObjectKeys(typeName, "collection.display", value.display, ["name_field", "description_field", "icon", "color_field"]);
     if (error) return error;
+    const display = value.display as Record<string, unknown>;
+    for (const key of ["name_field", "description_field", "color_field"]) {
+      if (display[key] !== undefined && !isValidFieldReference(display[key])) {
+        return invalidV03TypeShape(typeName, `collection.display.${key} must be a field reference`);
+      }
+    }
+    if (display.icon !== undefined && typeof display.icon !== "string") {
+      return invalidV03TypeShape(typeName, "collection.display.icon must be a string");
+    }
   }
   if (value.read_defaults !== undefined && !isPlainObject(value.read_defaults)) {
     return invalidV03TypeShape(typeName, "collection.read_defaults must be a mapping");
@@ -1049,9 +1067,12 @@ function validateV03CollectionShape(value: unknown, typeName: string): { code: s
 
 function validateV03LinksShape(value: unknown, typeName: string): { code: string; message: string } | null {
   if (!isPlainObject(value)) return invalidV03TypeShape(typeName, "collection.links must be a mapping");
+  if (Object.keys(value).length === 0) {
+    return invalidV03TypeShape(typeName, "collection.links must not be empty");
+  }
   for (const [fieldPath, rule] of Object.entries(value)) {
-    if (typeof fieldPath !== "string" || fieldPath.length === 0) {
-      return invalidV03TypeShape(typeName, "collection.links field paths must be non-empty strings");
+    if (!isValidFieldReference(fieldPath)) {
+      return invalidV03TypeShape(typeName, "collection.links contains an invalid field reference");
     }
     if (!isPlainObject(rule)) return invalidV03TypeShape(typeName, `collection.links.${fieldPath} must be a mapping`);
     const error = validateV03ObjectKeys(typeName, `collection.links.${fieldPath}`, rule, ["target_type", "validate_exists", "format"]);
@@ -1072,13 +1093,15 @@ function validateV03LinksShape(value: unknown, typeName: string): { code: string
 }
 
 function validateV03UniqueShape(value: unknown, typeName: string): { code: string; message: string } | null {
-  if (!Array.isArray(value)) return invalidV03TypeShape(typeName, "collection.unique must be a list");
+  if (!Array.isArray(value) || value.length === 0) {
+    return invalidV03TypeShape(typeName, "collection.unique must be a non-empty list");
+  }
   for (const [index, rule] of value.entries()) {
     if (!isPlainObject(rule)) return invalidV03TypeShape(typeName, `collection.unique[${index}] must be a mapping`);
     const error = validateV03ObjectKeys(typeName, `collection.unique[${index}]`, rule, ["field", "scope", "path_glob"]);
     if (error) return error;
-    if (typeof rule.field !== "string" || rule.field.length === 0) {
-      return invalidV03TypeShape(typeName, `collection.unique[${index}].field must be a non-empty string`);
+    if (!isValidFieldReference(rule.field)) {
+      return invalidV03TypeShape(typeName, `collection.unique[${index}].field must be a field reference`);
     }
     if (rule.scope !== undefined && !["collection", "type", "path_glob"].includes(String(rule.scope))) {
       return invalidV03TypeShape(typeName, `collection.unique[${index}].scope has invalid value "${rule.scope}"`);
@@ -1107,7 +1130,9 @@ function validateV03LifecycleShape(value: unknown, typeName: string): { code: st
         return invalidV03TypeShape(typeName, `lifecycle.${key}[${index}].set must be a non-empty mapping`);
       }
       for (const [fieldPath, lifecycleValue] of Object.entries(action.set)) {
-        if (fieldPath.length === 0) return invalidV03TypeShape(typeName, `lifecycle.${key}[${index}].set contains an empty field path`);
+        if (!isValidFieldReference(fieldPath)) {
+          return invalidV03TypeShape(typeName, `lifecycle.${key}[${index}].set contains an invalid field reference`);
+        }
         if (!isValidV03LifecycleValue(lifecycleValue)) {
           return invalidV03TypeShape(typeName, `lifecycle.${key}[${index}].set.${fieldPath} has invalid lifecycle value`);
         }
@@ -1137,7 +1162,7 @@ function isValidV03LifecycleValue(value: unknown): boolean {
   if (keys.length !== 1) return false;
   const key = keys[0];
   if (key === "now" || key === "today" || key === "uuid" || key === "ulid") return value[key] === true;
-  if (key === "slugify" || key === "copy") return typeof value[key] === "string" && value[key].length > 0;
+  if (key === "slugify" || key === "copy") return isValidFieldReference(value[key]);
   if (key === "literal") return true;
   return false;
 }

@@ -11,6 +11,11 @@ import { validateCanonicalSchema } from "@callumalpass/mdbase-runtime";
 import picomatch from "picomatch";
 import { ulid } from "ulid";
 import {
+  getFieldReferenceValue,
+  getFieldReferenceValues,
+  setFieldReferenceValue,
+} from "../field-references.js";
+import {
   isSupportedV03SpecVersion,
   LEGACY_SPEC_VERSION,
   loadConfigAsync,
@@ -688,7 +693,7 @@ fields:
     // fields_present - all listed fields must be present and non-null
     if (match.fields_present !== undefined) {
       for (const field of match.fields_present) {
-        const value = getFieldPathValue(frontmatter, field);
+        const value = getFieldReferenceValue(frontmatter, field);
         if (!value.present || value.value === null || value.value === undefined) {
           return false;
         }
@@ -1084,7 +1089,7 @@ fields:
 
     for (const [fieldPath, assignment] of assignments) {
       try {
-        setFieldPathValue(frontmatter, fieldPath, assignment.value);
+        setFieldReferenceValue(frontmatter, fieldPath, assignment.value);
       } catch (error) {
         issues.push({
           code: "invalid_lifecycle_path",
@@ -1111,11 +1116,11 @@ fields:
     if (value.uuid === true) return crypto.randomUUID();
     if (value.ulid === true) return ulid();
     if (typeof value.slugify === "string") {
-      const source = getFieldPathValue(frontmatter, value.slugify).value;
+      const source = getFieldReferenceValue(frontmatter, value.slugify).value;
       return source === null || source === undefined ? null : slugify(String(source));
     }
     if (typeof value.copy === "string") {
-      return cloneJsonLike(getFieldPathValue(frontmatter, value.copy).value);
+      return cloneJsonLike(getFieldReferenceValue(frontmatter, value.copy).value);
     }
     if ("literal" in value) return cloneJsonLike(value.literal);
     return undefined;
@@ -1529,7 +1534,7 @@ fields:
           const fileTypes = this.getTypesForFile(filePath, frontmatter);
           if (!fileTypes.includes(typeDef.name)) continue;
           if (!this.v03UniqueRuleApplies(rule, typeDef.name, filePath, fileTypes)) continue;
-          const fieldValue = getFieldPathValue(frontmatter, rule.field);
+          const fieldValue = getFieldReferenceValue(frontmatter, rule.field);
           if (!fieldValue.present || fieldValue.value === null || fieldValue.value === undefined) continue;
           const key = JSON.stringify(fieldValue.value);
           if (seen.has(key)) {
@@ -3042,7 +3047,7 @@ fields:
       if (!typeDef.collection?.unique) continue;
       const currentTypes = typeDefs.map((t) => t.name);
       for (const rule of typeDef.collection.unique) {
-        const fieldValue = getFieldPathValue(frontmatter, rule.field);
+        const fieldValue = getFieldReferenceValue(frontmatter, rule.field);
         if (!fieldValue.present || fieldValue.value === null || fieldValue.value === undefined) continue;
         if (!this.v03UniqueRuleApplies(rule, typeDef.name, relativePath, currentTypes)) continue;
         const key = JSON.stringify(fieldValue.value);
@@ -3054,7 +3059,7 @@ fields:
           const otherTypes = other.types ?? this.getTypesForFile(otherPath, otherFrontmatter);
           if (!otherTypes.includes(typeDef.name)) continue;
           if (!this.v03UniqueRuleApplies(rule, typeDef.name, otherPath, otherTypes)) continue;
-          const otherValue = getFieldPathValue(otherFrontmatter, rule.field);
+          const otherValue = getFieldReferenceValue(otherFrontmatter, rule.field);
           if (!otherValue.present || otherValue.value === null || otherValue.value === undefined) continue;
           if (JSON.stringify(otherValue.value) === key) {
             issues.push({
@@ -3107,8 +3112,8 @@ fields:
         }
       }
       for (const rule of typeDef?.collection?.unique ?? []) {
-        const before = getFieldPathValue(originalFrontmatter, rule.field).value;
-        const after = getFieldPathValue(updatedFrontmatter, rule.field).value;
+        const before = getFieldReferenceValue(originalFrontmatter, rule.field).value;
+        const after = getFieldReferenceValue(updatedFrontmatter, rule.field).value;
         if (!this.valuesEqualForUniqueness(before, after)) {
           return true;
         }
@@ -3185,13 +3190,13 @@ fields:
         }
       }
       for (const rule of typeDef?.collection?.unique ?? []) {
-        const myValue = getFieldPathValue(frontmatter, rule.field);
+        const myValue = getFieldReferenceValue(frontmatter, rule.field);
         if (!myValue.present || myValue.value === null || myValue.value === undefined) continue;
         for (const [otherPath, otherFm] of otherFiles) {
           const otherTypes = this.getTypesForFile(otherPath, otherFm);
           if (!otherTypes.includes(typeName)) continue;
           if (!this.v03UniqueRuleApplies(rule, typeName, otherPath, otherTypes)) continue;
-          const otherValue = getFieldPathValue(otherFm, rule.field);
+          const otherValue = getFieldReferenceValue(otherFm, rule.field);
           if (!otherValue.present || otherValue.value === null || otherValue.value === undefined) continue;
           if (JSON.stringify(myValue.value) === JSON.stringify(otherValue.value)) {
             issues.push({
@@ -3227,7 +3232,7 @@ fields:
       }
       for (const rule of typeDef?.collection?.unique ?? []) {
         if (!this.v03UniqueRuleApplies(rule, typeName, relativePath, types)) continue;
-        const value = getFieldPathValue(frontmatter, rule.field);
+        const value = getFieldReferenceValue(frontmatter, rule.field);
         if (value.present && value.value !== null && value.value !== undefined) return true;
       }
     }
@@ -4229,25 +4234,30 @@ fields:
       }
       if (typeDef.collection?.links) {
         for (const [fieldPath, rule] of Object.entries(typeDef.collection.links)) {
-          const values = getFieldPathValues(frontmatter, fieldPath);
-          for (const value of values) {
-            if (value === null || value === undefined) continue;
-            const targetType = Array.isArray(rule.target_type)
-              ? rule.target_type.find((entry) => entry !== "any")
-              : rule.target_type === "any"
-                ? undefined
-                : rule.target_type;
-            await this.validateSingleLink(
-              fieldPath,
-              {
-                type: "link",
-                validate_exists: rule.validate_exists,
-                target: targetType,
-              } as unknown as FieldDefinition,
-              value,
-              relativePath,
-              result,
-            );
+          const selected = getFieldReferenceValues(frontmatter, fieldPath);
+          for (const selectedValue of selected) {
+            const values = Array.isArray(selectedValue) && fieldPath.startsWith("/")
+              ? selectedValue
+              : [selectedValue];
+            for (const value of values) {
+              if (value === null || value === undefined) continue;
+              const targetType = Array.isArray(rule.target_type)
+                ? rule.target_type.find((entry) => entry !== "any")
+                : rule.target_type === "any"
+                  ? undefined
+                  : rule.target_type;
+              await this.validateSingleLink(
+                fieldPath,
+                {
+                  type: "link",
+                  validate_exists: rule.validate_exists,
+                  target: targetType,
+                } as unknown as FieldDefinition,
+                value,
+                relativePath,
+                result,
+              );
+            }
           }
         }
       }
@@ -5103,69 +5113,4 @@ function sameStringSet(left: string[], right: string[]): boolean {
 async function computeRevision(filePath: string): Promise<string> {
   const content = await fs.promises.readFile(filePath);
   return `sha256:${createHash("sha256").update(content).digest("hex")}`;
-}
-
-function getFieldPathValue(
-  frontmatter: Record<string, unknown>,
-  fieldPath: string,
-): { present: boolean; value: unknown } {
-  const values = getFieldPathValues(frontmatter, fieldPath);
-  if (values.length === 0) return { present: false, value: undefined };
-  return { present: true, value: values[0] };
-}
-
-function getFieldPathValues(frontmatter: Record<string, unknown>, fieldPath: string): unknown[] {
-  const segments = fieldPath.split(".").filter(Boolean);
-  let current: unknown[] = [frontmatter];
-
-  for (const segment of segments) {
-    const arraySegment = segment.endsWith("[]");
-    const key = arraySegment ? segment.slice(0, -2) : segment;
-    const next: unknown[] = [];
-
-    for (const value of current) {
-      if (!value || typeof value !== "object" || Array.isArray(value)) continue;
-      const child = (value as Record<string, unknown>)[key];
-      if (arraySegment) {
-        if (Array.isArray(child)) {
-          next.push(...child);
-        }
-      } else if (child !== undefined) {
-        next.push(child);
-      }
-    }
-
-    current = next;
-    if (current.length === 0) break;
-  }
-
-  return current;
-}
-
-function setFieldPathValue(
-  frontmatter: Record<string, unknown>,
-  fieldPath: string,
-  value: unknown,
-): void {
-  const segments = fieldPath.split(".").filter(Boolean);
-  if (segments.length === 0) return;
-  let target: Record<string, unknown> = frontmatter;
-
-  for (let i = 0; i < segments.length - 1; i++) {
-    const segment = segments[i];
-    if (segment.endsWith("[]")) {
-      throw new Error(`Cannot assign lifecycle value through array path "${fieldPath}"`);
-    }
-    const existing = target[segment];
-    if (!existing || typeof existing !== "object" || Array.isArray(existing)) {
-      target[segment] = {};
-    }
-    target = target[segment] as Record<string, unknown>;
-  }
-
-  const finalSegment = segments[segments.length - 1];
-  if (finalSegment.endsWith("[]")) {
-    throw new Error(`Cannot assign lifecycle value through array path "${fieldPath}"`);
-  }
-  target[finalSegment] = value;
 }

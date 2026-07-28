@@ -2,6 +2,7 @@ import * as path from "node:path";
 
 import { evaluateMdbaseCel } from "../expressions/cel.js";
 import { evaluateWhere } from "../expressions/evaluator.js";
+import { getFieldReferenceValue } from "../field-references.js";
 
 export type SpecProfile = "v0.2" | "v0.3";
 
@@ -40,7 +41,7 @@ export function matchesFieldConditions(
   specProfile: SpecProfile,
 ): boolean {
   for (const [field, condition] of Object.entries(where)) {
-    const selected = getFieldPathValue(frontmatter, field);
+    const selected = getFieldReferenceValue(frontmatter, field);
     if (!isOperatorSet(condition)) {
       if (!selected.present || !deepEqual(selected.value, condition)) return false;
       continue;
@@ -159,30 +160,6 @@ function compare(
     return predicate(left, right);
   }
   return typeof left === "string" && typeof right === "string" && predicate(left, right);
-}
-
-function getFieldPathValue(
-  frontmatter: Record<string, unknown>,
-  fieldPath: string,
-): { present: boolean; value: unknown } {
-  let current: unknown[] = [frontmatter];
-  for (const segment of fieldPath.split(".").filter(Boolean)) {
-    const arraySegment = segment.endsWith("[]");
-    const key = arraySegment ? segment.slice(0, -2) : segment;
-    const next: unknown[] = [];
-    for (const value of current) {
-      if (!isRecord(value) || !Object.prototype.hasOwnProperty.call(value, key)) continue;
-      const child = value[key];
-      if (arraySegment) {
-        if (Array.isArray(child)) next.push(...child);
-      } else {
-        next.push(child);
-      }
-    }
-    current = next;
-    if (current.length === 0) return { present: false, value: undefined };
-  }
-  return { present: true, value: current[0] };
 }
 
 function deepEqual(left: unknown, right: unknown): boolean {
