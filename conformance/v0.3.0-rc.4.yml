@@ -67,6 +67,16 @@ limits:
     - ancestor_pack_schemas/v0.3
   operation_surface: v03Operations
 evidence:
+  - kind: testbed_transcript
+    command: npm run test:testbed -- --evidence conformance/testbed-v0.1.json
+    result: pass
+    verified_at: "2026-07-29T09:21:42+10:00"
+    artifact: conformance/testbed-v0.1.json
+    environment: Linux x86_64, Node.js 22
+    testbed_protocol_version: "0.1"
+    scenario_ids:
+      - core.shared-contract-consumers
+    evidence_digest: sha256:7cb868eae9f5f1ddab6b5f9ae9671551636c97f5ad20606752f2e63ec8864023
   - kind: conformance_suite
     command: npm run test -- test/v03-conformance.test.ts
     result: pass
