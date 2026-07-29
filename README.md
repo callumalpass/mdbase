@@ -204,7 +204,15 @@ reads; correctness does not depend on cache presence. Use `cacheRebuild()` and
 
 ## Conformance
 
-The package ships its machine-readable v0.3 conformance claim under `conformance/`. Shared v0.3 fixtures live in `mdbase-spec/tests/v0.3`; the legacy suite remains active to protect v0.2 compatibility.
+The package ships its machine-readable v0.3 conformance claim under
+`conformance/`. Shared v0.3 fixtures live in `mdbase-spec/tests/v0.3`; the
+legacy suite remains active to protect v0.2 compatibility.
+
+`npm run test:testbed` also runs the spec-owned
+`core.shared-contract-consumers` black-box scenario. Its adapter creates a real
+collection, loads one type `implements` declaration, and obtains the same
+contract view for two independent consumer identities. The adapter is test
+plumbing only; applications use the normal public collection API.
 
 ## Example applications
 

@@ -44,6 +44,7 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:conformance": "vitest run --reporter=verbose test/conformance.test.ts",
+    "test:testbed": "npm run build && node ../mdbase-spec/packages/testbed/src/cli.mjs run --adapter scripts/testbed-adapter.mjs --scenario core.shared-contract-consumers",
     "test:package": "npm run build && node scripts/smoke-package.mjs",
     "test:e2e": "npm run build && node scripts/e2e-package.mjs",
     "test:all": "npm test && npm run test:package && npm run test:e2e",

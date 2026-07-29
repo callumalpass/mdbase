@@ -24,12 +24,18 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: mdbase-dev/mdbase-spec
-          ref: 88f4d64ff2d54df23631db9d03a95eba566b4eee
+          ref: 9155a3d7b390da0c5b7d1928b95f89ad23b8fb2c
           path: mdbase-spec
+          persist-credentials: false
+      - name: Install portable testbed runner
+        working-directory: mdbase-spec/packages/testbed
+        run: npm ci
       - run: npm run build
       - run: npm test
         env:
           MDBASE_SPEC_REPO_DIR: ${{ github.workspace }}/mdbase-spec
           MDBASE_REQUIRE_V03_CONFORMANCE: "1"
+      - name: Run shared-contract black-box scenario
+        run: node mdbase-spec/packages/testbed/src/cli.mjs run --adapter scripts/testbed-adapter.mjs --scenario core.shared-contract-consumers
       - name: Verify installable package
         run: npm run test:package
