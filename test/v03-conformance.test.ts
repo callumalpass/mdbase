@@ -16,7 +16,12 @@ import { DataContractRegistry, dataContractDigest } from "../src/data-contracts/
 import { evaluateMdbaseCel } from "../src/expressions/cel.js";
 import { migrateV02TypeFileToV03 } from "../src/migrations/type-migration.js";
 import type { CanonicalQueryInput, ExecuteViewInput } from "../src/operations/canonical-query.js";
-import { installTypePack, type TypePackManifest } from "../src/type-packs/installer.js";
+import {
+  applyTypePack,
+  assessTypePack,
+  type TypePackManifest,
+  type TypePackProvision,
+} from "../src/type-packs/installer.js";
 
 type Dict = Record<string, unknown>;
 
@@ -301,8 +306,11 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
     case "type_pack_resources_validate":
       return validateTypePackResources(input);
 
-    case "install_type_pack":
-      return await installTypePackFixture(context.root, input);
+    case "apply_type_pack":
+      return await applyTypePackFixture(context.root, input);
+
+    case "assess_type_pack":
+      return await assessTypePackFixture(context.root, input);
 
     case "query":
       return await withOperationRoot(context, input, async (root) => {
@@ -412,36 +420,44 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
   }
 }
 
-async function installTypePackFixture(root: string, input: Dict): Promise<Dict> {
-  const manifestPath = path.join(SPEC_REPO, String(input.pack));
-  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as TypePackManifest;
-  const resources = manifest.resources.map((resource) => ({
-    source: resource.source,
-    document: fs.readFileSync(
-      path.resolve(path.dirname(manifestPath), resource.source),
-      "utf8",
-    ),
-  }));
-  if (input.corrupt_digest === true) {
-    manifest.resources[0] = {
-      ...manifest.resources[0]!,
-      digest: `sha256:${"0".repeat(64)}`,
-    };
-  }
+async function applyTypePackFixture(root: string, input: Dict): Promise<Dict> {
+  const { manifest, resources } = loadTypePackFixture(input);
+  const provision = { manifest, resources };
   const runs: Dict[] = [];
   const repeat = Number(input.repeat ?? 1);
   for (let index = 0; index < repeat; index += 1) {
-    const result = await installTypePack(root, manifest, resources);
+    let adoptResources: Record<string, string> = {};
+    let assessment = await assessTypePack(root, provision, { installedBy: "dev.mdbase.conformance" });
+    if (input.adopt_conflicts === true && assessment.valid) {
+      adoptResources = Object.fromEntries(
+        assessment.result.resources
+          .filter(({ action, mode, current_digest }) =>
+            action === "conflict" && mode === "managed" && current_digest)
+          .map(({ target, current_digest }) => [target, current_digest!]),
+      );
+      assessment = await assessTypePack(root, provision, {
+        installedBy: "dev.mdbase.conformance",
+        adoptResources,
+      });
+    }
+    if (input.mutate_after_assess) {
+      const target = path.join(root, String(input.mutate_after_assess));
+      await fsp.mkdir(path.dirname(target), { recursive: true });
+      await fsp.writeFile(target, "Changed after assessment.\n");
+    }
+    const result = assessment.valid
+      ? await applyTypePack(root, provision, {
+          installedBy: "dev.mdbase.conformance",
+          adoptResources,
+          expectedAssessmentDigest: assessment.result.assessment_digest,
+        })
+      : assessment;
     runs.push({
       valid: result.valid,
-      actions: result.result.resources?.map(({ action }) => action) ?? [],
+      status: assessment.result.status,
+      actions: assessment.result.resources?.map(({ action }) => action) ?? [],
       ...(result.diagnostics[0]
-        ? {
-            error: {
-              code: result.diagnostics[0].code,
-              message: result.diagnostics[0].message,
-            },
-          }
+        ? { error: { code: result.diagnostics[0].code, message: result.diagnostics[0].message } }
         : {}),
     });
     if (!result.valid) break;
@@ -456,11 +472,53 @@ async function installTypePackFixture(root: string, input: Dict): Promise<Dict> 
     valid: last.valid,
     runs,
     implementations,
-    targets_exist: manifest.resources.map((resource) =>
-      fs.existsSync(path.join(root, resource.target))
-    ),
+    lock_exists: fs.existsSync(path.join(root, "mdbase.lock.yaml")),
+    targets_exist: manifest.resources.map((resource) => fs.existsSync(path.join(root, resource.target))),
     ...(last.error ? { error: last.error } : {}),
   };
+}
+
+async function assessTypePackFixture(root: string, input: Dict): Promise<Dict> {
+  const provision = loadTypePackFixture(input);
+  const initial = await assessTypePack(root, provision, { installedBy: "dev.mdbase.conformance" });
+  if (!initial.valid) return adapterResult(initial, {});
+  await applyTypePack(root, provision, {
+    installedBy: "dev.mdbase.conformance",
+    expectedAssessmentDigest: initial.result.assessment_digest,
+  });
+  if (input.install_then_modify) {
+    await fsp.writeFile(path.join(root, String(input.install_then_modify)), "User-authored change.\n");
+  }
+  const assessed = await assessTypePack(root, provision, { installedBy: "dev.mdbase.conformance" });
+  return {
+    valid: assessed.valid,
+    status: assessed.result.status,
+    applicable: assessed.result.applicable,
+    actions: assessed.result.resources?.map(({ action }) => action) ?? [],
+  };
+}
+
+function loadTypePackFixture(input: Dict): TypePackProvision {
+  const manifestPath = path.join(SPEC_REPO, String(input.pack));
+  const manifest = yaml.load(fs.readFileSync(manifestPath, "utf8")) as TypePackManifest;
+  manifest.resources = manifest.resources.map((resource) => ({
+    ...resource,
+    mode: resource.mode ?? "managed",
+  }));
+  const resources = manifest.resources.map((resource) => ({
+    source: resource.source,
+    document: fs.readFileSync(
+      path.resolve(path.dirname(manifestPath), resource.source),
+      "utf8",
+    ),
+  }));
+  if (input.corrupt_digest === true) {
+    manifest.resources[0] = {
+      ...manifest.resources[0]!,
+      digest: `sha256:${"0".repeat(64)}`,
+    };
+  }
+  return { manifest, resources };
 }
 
 function adapterResult(

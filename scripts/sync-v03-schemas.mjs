@@ -15,6 +15,7 @@ const schemas = {
   querySchema: "query.schema.json",
   queryResultSchema: "query-result.schema.json",
   typeFileSchema: "type-file.schema.json",
+  typePackLockSchema: "type-pack-lock.schema.json",
   typePackSchema: "type-pack.schema.json",
   viewSchema: "view.schema.json",
 };
