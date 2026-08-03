@@ -117,12 +117,19 @@ export type {
 } from "./operations/collection.js";
 export { CollectionAsync } from "./operations/collection-async.js";
 export type { CollectionAsyncCreateInput } from "./operations/collection-async.js";
-export { installTypePack } from "./type-packs/installer.js";
+export {
+  applyTypePack,
+  assessTypePack,
+  TYPE_PACK_LOCK_PATH,
+} from "./type-packs/installer.js";
 export type {
-  InstallTypePackOptions,
-  TypePackInstallResult,
+  ApplyTypePackOptions,
+  TypePackApplyResult,
+  TypePackAssessment,
   TypePackManifest,
   TypePackManifestResource,
+  TypePackProvision,
+  TypePackReceipt,
   TypePackResourceDiff,
   TypePackSourceResource,
 } from "./type-packs/installer.js";
