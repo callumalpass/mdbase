@@ -357,6 +357,11 @@ export const querySchema: Record<string, unknown> = {
     "types": {
       "$ref": "#/$defs/typeList"
     },
+    "timezone": {
+      "type": "string",
+      "minLength": 1,
+      "description": "IANA timezone used for this query execution"
+    },
     "context": {
       "$ref": "#/$defs/queryContext"
     },

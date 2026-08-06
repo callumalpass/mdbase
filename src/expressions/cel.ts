@@ -1,6 +1,7 @@
 import {
   CelScalar,
   celEnv,
+  celFunc,
   celMethod,
   isCelError,
   isCelList,
@@ -33,6 +34,12 @@ export interface MdbaseCelContext {
   projection?: Record<string, unknown>;
   values?: unknown[];
   operation?: Record<string, unknown>;
+  temporal?: MdbaseCelTemporalContext;
+}
+
+export interface MdbaseCelTemporalContext {
+  now: Date;
+  timezone: string;
 }
 
 export interface MdbaseCelResult {
@@ -41,9 +48,16 @@ export interface MdbaseCelResult {
 }
 
 const mapDyn = mapType(CelScalar.STRING, CelScalar.DYN);
+let activeTemporalContext: MdbaseCelTemporalContext | undefined;
 
 const mdbaseCelFuncs = [
   ...strings,
+  celFunc("now", [], CelScalar.STRING, () =>
+    (activeTemporalContext?.now ?? new Date()).toISOString()),
+  celFunc("today", [], CelScalar.STRING, () =>
+    calendarDate(activeTemporalContext?.now ?? new Date(), activeTemporalContext?.timezone)),
+  celFunc("date", [CelScalar.DYN], CelScalar.STRING, (value) =>
+    dateValue(String(value ?? ""), activeTemporalContext?.timezone)),
   celMethod("inFolder", mapDyn, [CelScalar.STRING], CelScalar.BOOL, function inFolder(folder) {
     const filePath = this.get("path");
     if (typeof filePath !== "string") return false;
@@ -114,6 +128,8 @@ export function getMdbaseCelProgramCacheSize(): number {
 }
 
 export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext): MdbaseCelResult {
+  const previousTemporalContext = activeTemporalContext;
+  activeTemporalContext = context.temporal;
   try {
     const value = compileMdbaseCel(expression)(
       buildMdbaseCelBindings(context) as Record<string, CelInput>,
@@ -138,7 +154,29 @@ export function evaluateMdbaseCel(expression: string, context: MdbaseCelContext)
         expression,
       }],
     };
+  } finally {
+    activeTemporalContext = previousTemporalContext;
   }
+}
+
+function dateValue(value: string, timezone?: string): string {
+  if (/^\d{4}-\d{2}-\d{2}$/.test(value)) return value;
+  const instant = new Date(value);
+  return Number.isNaN(instant.valueOf())
+    ? value.slice(0, 10)
+    : calendarDate(instant, timezone);
+}
+
+function calendarDate(instant: Date, timezone?: string): string {
+  const parts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: timezone,
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(instant);
+  const part = (type: Intl.DateTimeFormatPartTypes) =>
+    parts.find((candidate) => candidate.type === type)?.value ?? "";
+  return `${part("year")}-${part("month")}-${part("day")}`;
 }
 
 /** Parse a CEL expression without evaluating it against an arbitrary record. */

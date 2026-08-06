@@ -1411,6 +1411,55 @@ assignee: null
     expect(query.diagnostics).toEqual([]);
   });
 
+  it("uses one invocation timezone for datetime-to-date conversion", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\nsettings:\n  timezone: UTC\n');
+    await write(root, "records/temporal.md", `---
+title: Temporal
+scheduled: 2026-08-05T23:30:00Z
+---
+`);
+    await write(root, "views/temporal.md", `---
+type: view
+id: temporal.views
+version: 1
+name: Temporal
+query:
+  where: date(scheduled) == '2026-08-05'
+views:
+  - id: local-day
+    name: Local day
+---
+`);
+    const collection = await open(root);
+    const melbourne = await collection.queryCanonical({
+      timezone: "Australia/Melbourne",
+      where: "date(scheduled) == '2026-08-06'",
+    });
+    expect(melbourne.meta.total_count).toBe(1);
+    const losAngeles = await collection.queryCanonical({
+      timezone: "America/Los_Angeles",
+      where: "date(scheduled) == '2026-08-05'",
+    });
+    expect(losAngeles.meta.total_count).toBe(1);
+    expect((await collection.executeView({
+      path: "views/temporal.md",
+      view: "local-day",
+      timezone: "America/Los_Angeles",
+    })).meta.total_count).toBe(1);
+    expect((await collection.executeView({
+      path: "views/temporal.md",
+      view: "local-day",
+      timezone: "Australia/Melbourne",
+    })).meta.total_count).toBe(0);
+    const invalid = await collection.queryCanonical({
+      timezone: "+10:00",
+      where: "true",
+    });
+    expect(invalid.error?.code).toBe("invalid_timezone");
+    expect(invalid.diagnostics[0]?.code).toBe("invalid_timezone");
+  });
+
   it("keeps a view's nested query types separate from record membership", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');

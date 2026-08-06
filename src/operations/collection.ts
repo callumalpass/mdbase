@@ -2852,6 +2852,7 @@ fields:
   private async queryCanonicalUnobserved(input: CanonicalQueryInput): Promise<CanonicalQueryResult> {
     return await executeCanonicalQuery(input, {
       typeDefs: this.typeDefs,
+      timezone: this.config.settings.timezone,
       scanFiles: () => this.scanFiles(),
       read: (relativePath: string) => this.read(relativePath),
       buildFileCache: async (files: string[]) => {
