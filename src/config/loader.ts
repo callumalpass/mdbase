@@ -8,6 +8,7 @@ import * as path from "node:path";
 import * as yaml from "js-yaml";
 
 export interface MdbaseSettings {
+  timezone?: string;
   record_extensions: string[];
   extensions: string[];
   exclude: string[];
@@ -78,6 +79,7 @@ const KNOWN_TOP_LEVEL_KEYS = new Set([
 ]);
 
 const KNOWN_SETTINGS_KEYS = new Set([
+  "timezone",
   "record_extensions",
   "extensions",
   "exclude",
@@ -594,6 +596,30 @@ function parseSettings(
       };
     }
     settings.cache_folder = raw.cache_folder;
+  }
+
+  if (raw.timezone !== undefined) {
+    if (typeof raw.timezone !== "string" || !raw.timezone.trim()) {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: "settings.timezone must be a non-empty string",
+        },
+      };
+    }
+    try {
+      new Intl.DateTimeFormat("en", { timeZone: raw.timezone }).format();
+    } catch {
+      return {
+        valid: false,
+        error: {
+          code: "invalid_config",
+          message: `Unknown IANA timezone "${raw.timezone}"`,
+        },
+      };
+    }
+    settings.timezone = raw.timezone;
   }
 
   return { valid: true, settings };

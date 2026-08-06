@@ -5,6 +5,7 @@ import {
   collectMdbaseCelProjectionReferences,
   evaluateMdbaseCel,
   validateMdbaseCelSyntax,
+  type MdbaseCelTemporalContext,
 } from "../expressions/cel.js";
 import { querySchema, viewSchema } from "../generated/v03-schemas.js";
 import type { TypeDefinition } from "../types/loader.js";
@@ -26,6 +27,7 @@ export interface CanonicalSelectionExpression {
 
 export interface CanonicalQueryInput {
   types?: string[];
+  timezone?: string;
   context?: { this: { path: string } };
   projections?: Record<string, CanonicalProjection>;
   where?: string;
@@ -44,6 +46,7 @@ export interface CanonicalQueryInput {
 export interface ExecuteViewInput {
   path: string;
   view: string;
+  timezone?: string;
   context?: { path: string } | null;
   limit?: number;
   offset?: number;
@@ -125,6 +128,7 @@ export interface CanonicalQueryDeps {
   scanFiles: () => Promise<string[]>;
   read: (relativePath: string) => Promise<IndexedReadResult>;
   buildFileCache?: (files: string[]) => Promise<Map<string, IndexedReadResult>>;
+  timezone?: string;
 }
 
 export interface CanonicalViewDeps {
@@ -434,6 +438,7 @@ function buildViewQuery(
       : Array.isArray(sharedQuery.types)
         ? { types: sharedQuery.types.map(String) }
         : {}),
+    ...(input.timezone ? { timezone: input.timezone } : {}),
     ...(contextPath ? { context: { this: { path: contextPath } } } : {}),
     ...((Object.keys(sharedProjections).length > 0 || Object.keys(localProjections).length > 0)
       ? { projections: { ...sharedProjections, ...localProjections } as CanonicalQueryInput["projections"] }
@@ -467,6 +472,9 @@ export async function executeCanonicalQuery(
 ): Promise<CanonicalQueryResult> {
   const schemaDiagnostics = validateCanonicalQueryInput(input);
   if (schemaDiagnostics.length > 0) return failedQuery(schemaDiagnostics);
+
+  const temporal = temporalContext(input.timezone ?? deps.timezone);
+  if ("diagnostic" in temporal) return failedQuery([temporal.diagnostic]);
 
   const expressionDiagnostics = validateQueryExpressions(input);
   if (expressionDiagnostics.length > 0) return failedQuery(expressionDiagnostics);
@@ -513,6 +521,7 @@ export async function executeCanonicalQuery(
     for (const name of projectionOrder.names) {
       const definition = input.projections![name];
       const evaluated = evaluateMdbaseCel(definition.expr, {
+        temporal,
         record: effective,
         raw,
         knownFields,
@@ -534,6 +543,7 @@ export async function executeCanonicalQuery(
 
     if (input.where) {
       const evaluated = evaluateMdbaseCel(input.where, {
+        temporal,
         record: effective,
         raw,
         knownFields,
@@ -566,7 +576,7 @@ export async function executeCanonicalQuery(
       knownFields,
     };
     if (input.select) {
-      row.values = evaluateSelection(input.select, row, contextRecord, diagnostics);
+      row.values = evaluateSelection(input.select, row, contextRecord, temporal, diagnostics);
     }
     candidates.push(row);
   }
@@ -579,7 +589,7 @@ export async function executeCanonicalQuery(
 
   const totalCount = candidates.length;
   const groups = input.group_by || input.summaries
-    ? buildGroups(candidates, input, contextRecord, diagnostics)
+    ? buildGroups(candidates, input, contextRecord, temporal, diagnostics)
     : undefined;
   const offset = input.offset ?? 0;
   const end = input.limit === undefined ? candidates.length : offset + input.limit;
@@ -596,6 +606,30 @@ export async function executeCanonicalQuery(
     },
     diagnostics,
   };
+}
+
+function temporalContext(
+  timezone: string | undefined,
+): MdbaseCelTemporalContext | { diagnostic: CanonicalDiagnostic } {
+  const effective = timezone?.trim() || Intl.DateTimeFormat().resolvedOptions().timeZone;
+  try {
+    if (
+      !effective ||
+      effective.toLowerCase() === "local" ||
+      /^[+-]\d{2}:\d{2}$/.test(effective)
+    ) throw new RangeError();
+    new Intl.DateTimeFormat("en", { timeZone: effective }).format();
+  } catch {
+    return {
+      diagnostic: {
+        severity: "error",
+        code: "invalid_timezone",
+        message: `Unknown IANA timezone "${timezone ?? effective ?? ""}"`,
+        field: "timezone",
+      },
+    };
+  }
+  return { now: new Date(), timezone: effective };
 }
 
 function failedQuery(diagnostics: CanonicalDiagnostic[]): CanonicalQueryResult {
@@ -852,6 +886,7 @@ function evaluateSelection(
   select: NonNullable<CanonicalQueryInput["select"]>,
   row: CandidateRow,
   context: ContextRecord | undefined,
+  temporal: MdbaseCelTemporalContext,
   diagnostics: CanonicalDiagnostic[],
 ): Record<string, unknown> {
   const result: Record<string, unknown> = {};
@@ -862,6 +897,7 @@ function evaluateSelection(
       continue;
     }
     const evaluated = evaluateMdbaseCel(selection.expr, {
+      temporal,
       record: row.effective,
       raw: row.raw,
       knownFields: row.knownFields,
@@ -930,6 +966,7 @@ function buildGroups(
   rows: CandidateRow[],
   input: CanonicalQueryInput,
   context: ContextRecord | undefined,
+  temporal: MdbaseCelTemporalContext,
   diagnostics: CanonicalDiagnostic[],
 ): NonNullable<CanonicalQueryResult["meta"]["groups"]> {
   const groupBy = input.group_by ?? [];
@@ -959,7 +996,7 @@ function buildGroups(
   return groups.map((group) => ({
     values: group.values,
     count: group.rows.length,
-    summaries: evaluateSummaries(group.rows, input, context, diagnostics),
+    summaries: evaluateSummaries(group.rows, input, context, temporal, diagnostics),
   }));
 }
 
@@ -967,6 +1004,7 @@ function evaluateSummaries(
   rows: CandidateRow[],
   input: CanonicalQueryInput,
   context: ContextRecord | undefined,
+  temporal: MdbaseCelTemporalContext,
   diagnostics: CanonicalDiagnostic[],
 ): Record<string, unknown> {
   const results: Record<string, unknown> = {};
@@ -975,6 +1013,7 @@ function evaluateSummaries(
     const values = rows.map((row) => resolveValue(summary.field, row));
     if (input.summary_functions?.[summary.function]) {
       const evaluated = evaluateMdbaseCel(input.summary_functions[summary.function].expr, {
+        temporal,
         thisRecord: context?.binding ?? null,
         values,
       });
