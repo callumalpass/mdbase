@@ -32,4 +32,29 @@ describe("config loader", () => {
       "The mdbase runtime 0.1 config section is superseded. Runtime 0.2 host enablement and policy selection belong in host settings; install the standard runtime pack for portable records.",
     );
   });
+
+  it("accepts only durable IANA collection timezones", async () => {
+    for (const timezone of ["local", "+10:00", "Australia/Atlantis"]) {
+      const root = await fs.mkdtemp(path.join(os.tmpdir(), "mdbase-config-timezone-"));
+      await fs.writeFile(
+        path.join(root, "mdbase.yaml"),
+        `spec_version: "0.3.0"\nsettings:\n  timezone: ${timezone}\n`,
+      );
+      const result = await loadConfigAsync(root);
+      expect(result.valid).toBe(false);
+      expect(result.error).toMatchObject({
+        code: "invalid_config",
+        message: `Unknown IANA timezone "${timezone}"`,
+      });
+    }
+
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "mdbase-config-timezone-"));
+    await fs.writeFile(
+      path.join(root, "mdbase.yaml"),
+      'spec_version: "0.3.0"\nsettings:\n  timezone: Australia/Melbourne\n',
+    );
+    expect((await loadConfigAsync(root)).config?.settings.timezone).toBe(
+      "Australia/Melbourne",
+    );
+  });
 });
