@@ -25,6 +25,11 @@ export const configSchema: Record<string, unknown> = {
     "settings": {
       "type": "object",
       "properties": {
+        "timezone": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Durable IANA timezone for collection-authority calendar semantics"
+        },
         "types_folder": {
           "type": "string",
           "minLength": 1

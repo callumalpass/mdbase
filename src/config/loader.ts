@@ -608,18 +608,23 @@ function parseSettings(
         },
       };
     }
+    const timezone = raw.timezone.trim();
     try {
-      new Intl.DateTimeFormat("en", { timeZone: raw.timezone }).format();
+      if (
+        timezone.toLowerCase() === "local" ||
+        /^[+-]\d{2}:\d{2}$/.test(timezone)
+      ) throw new RangeError();
+      new Intl.DateTimeFormat("en", { timeZone: timezone }).format();
     } catch {
       return {
         valid: false,
         error: {
           code: "invalid_config",
-          message: `Unknown IANA timezone "${raw.timezone}"`,
+          message: `Unknown IANA timezone "${timezone}"`,
         },
       };
     }
-    settings.timezone = raw.timezone;
+    settings.timezone = timezone;
   }
 
   return { valid: true, settings };
