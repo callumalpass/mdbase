@@ -71,7 +71,7 @@ interface TestContext {
 const SPEC_REPO = resolveSpecRepo();
 const V03_TESTS_DIR = path.join(SPEC_REPO, "tests", "v0.3");
 const REQUIRE_V03_CONFORMANCE = process.env.MDBASE_REQUIRE_V03_CONFORMANCE === "1";
-const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.4.yml");
+const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.5.yml");
 
 function resolveSpecRepo(): string {
   const candidates = [

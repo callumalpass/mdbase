@@ -3,7 +3,7 @@ status: verified
 implementation:
   id: mdbase-ts
   name: mdbase TypeScript implementation
-  version: 0.3.0-rc.4
+  version: 0.3.0-rc.5
   language: TypeScript
   target: npm
   url: https://github.com/callumalpass/mdbase
@@ -70,7 +70,7 @@ evidence:
   - kind: testbed_transcript
     command: npm run test:testbed -- --evidence conformance/testbed-v0.1.json
     result: pass
-    verified_at: "2026-07-29T09:21:42+10:00"
+    verified_at: "2026-08-07T23:57:00+10:00"
     artifact: conformance/testbed-v0.1.json
     environment: Linux x86_64, Node.js 22
     testbed_protocol_version: "0.1"
@@ -80,17 +80,17 @@ evidence:
   - kind: conformance_suite
     command: npm run test -- test/v03-conformance.test.ts
     result: pass
-    verified_at: "2026-07-28T15:14:00+10:00"
+    verified_at: "2026-08-07T23:57:00+10:00"
     artifact: test/v03-conformance.test.ts
     environment: Linux x86_64, Node.js 22
   - kind: test_suite
     command: npm test
     result: pass
-    verified_at: "2026-07-28T15:14:00+10:00"
+    verified_at: "2026-08-07T23:57:00+10:00"
     environment: Linux x86_64, Node.js 22
   - kind: package_smoke
     command: npm pack --dry-run
     result: pass
-    verified_at: "2026-07-28T15:14:00+10:00"
-    artifact: callumalpass-mdbase-0.3.0-rc.4.tgz
+    verified_at: "2026-08-07T23:57:00+10:00"
+    artifact: callumalpass-mdbase-0.3.0-rc.5.tgz
     environment: Linux x86_64, Node.js 22

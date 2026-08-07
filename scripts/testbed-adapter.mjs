@@ -9,7 +9,7 @@ import { Collection } from "../dist/index.js";
 const implementation = {
   id: "mdbase-ts",
   name: "mdbase TypeScript implementation",
-  version: "0.3.0-rc.4",
+  version: "0.3.0-rc.5",
   language: "TypeScript",
   target: "Node.js"
 };

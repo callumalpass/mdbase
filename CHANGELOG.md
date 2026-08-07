@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.0-rc.5 - 2026-08-07
+
+- Install and evolve data-contract type packs through reviewed, atomic
+  transactions with conflict detection and recovery.
+- Execute date and datetime expressions in an explicit query timezone and
+  validate durable collection timezone authority.
+- Verify shared contract consumption through the specification-owned portable
+  testbed and the frozen mdbase `0.3.0-rc.3` artifacts.
+
+## 0.3.0-rc.4 - 2026-07-29
+
 - Remove the parallel runtime contract registry, implicit contracts,
   proprietary event-envelope validation, materialization helpers, and
   collection-level workflow preflight.
@@ -16,6 +27,8 @@
 
 - Make `mdbase.contract` a discriminated `record`, `event`, or `action`
   artifact with subject-specific JSON Schemas.
+- Add first-class record data contracts, normalized projections, transactional
+  type-pack artifacts, and standard JSON Pointer field mappings.
 - Restrict type-file `implements` entries to record contracts while allowing
   several types to implement and expose the same normalized record interface.
 - Remove the legacy Runtime Contracts conformance claim pending its rebuild on

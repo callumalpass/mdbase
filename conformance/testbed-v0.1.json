@@ -4,7 +4,7 @@
   "implementation": {
     "id": "mdbase-ts",
     "name": "mdbase TypeScript implementation",
-    "version": "0.3.0-rc.4",
+    "version": "0.3.0-rc.5",
     "language": "TypeScript",
     "target": "Node.js"
   },
@@ -14,7 +14,7 @@
       "id": "core.shared-contract-consumers",
       "profile": "core_read",
       "result": "pass",
-      "transcript_digest": "sha256:21f76dcc40721ff7790f60faa6a35be81b183bd4341020fe60cb92844fb94ac6"
+      "transcript_digest": "sha256:b6cd8b6aafb4f969a90f021aeda38120d80ed073d41d0c904613793456ef828f"
     }
   ]
 }
