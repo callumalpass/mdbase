@@ -1857,7 +1857,7 @@ fields:
 
       for (const [fieldName, fieldDef] of Object.entries(typeDef.fields)) {
         if (fieldDef.generated === "now_on_write") {
-          frontmatter[fieldName] = new Date().toISOString();
+          frontmatter[fieldName] = generateNowValue(fieldDef);
         }
       }
     }
@@ -4054,9 +4054,8 @@ fields:
         case "uuid":
           return crypto.randomUUID();
         case "now":
-          return new Date().toISOString();
         case "now_on_write":
-          return new Date().toISOString();
+          return generateNowValue(fieldDef);
         case "sequence":
           // Handled inline in create() flow
           return undefined;
@@ -4962,6 +4961,18 @@ function formatDateTimeLocal(date: Date): string {
   const mm = String(date.getUTCMinutes()).padStart(2, "0");
   const ss = String(date.getUTCSeconds()).padStart(2, "0");
   return `${y}-${m}-${d}T${hh}:${mm}:${ss}`;
+}
+
+/**
+ * Generate the current timestamp for a `now`/`now_on_write` field, formatted
+ * to match the field's declared type so the generated value passes validation:
+ * `date` → YYYY-MM-DD, `time` → HH:MM:SS, anything else → full ISO datetime.
+ */
+function generateNowValue(fieldDef: FieldDefinition): string {
+  const iso = new Date().toISOString();
+  if (fieldDef.type === "date") return iso.slice(0, 10);
+  if (fieldDef.type === "time") return iso.slice(11, 19);
+  return iso;
 }
 
 function slugify(str: string): string {
