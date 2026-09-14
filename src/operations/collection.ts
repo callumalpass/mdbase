@@ -2291,11 +2291,12 @@ fields:
     const fileCache = await this.buildFileCache(files);
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
-    const basenameCounts = new Map<string, number>();
-    for (const filePath of files) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      basenameCounts.set(basename, (basenameCounts.get(basename) ?? 0) + 1);
-    }
+    const previousFiles = files.map((filePath) => filePath === newPath ? oldPath : filePath);
+    const previousCache = new Map(fileCache);
+    const renamed = previousCache.get(newPath);
+    previousCache.delete(newPath);
+    if (renamed) previousCache.set(oldPath, renamed);
+    const priorResolution = this.linkResolver.buildIndex(previousFiles, previousCache);
     const referencesUpdated: Array<{ path: string; field?: string; location?: string }> = [];
     const warnings: Array<{ path: string; message_contains?: string; message?: string }> = [];
     const partialFailures: Array<{ path: string; reason: string }> = [];
@@ -2365,7 +2366,7 @@ fields:
               files,
               fileCache,
               nonMdSet,
-              basenameCounts,
+              priorResolution,
             );
             if (result.warning) {
               warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
@@ -2401,7 +2402,7 @@ fields:
                 files,
                 fileCache,
                 nonMdSet,
-                basenameCounts,
+                priorResolution,
               );
               if (result.warning) {
                 warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
@@ -2434,7 +2435,7 @@ fields:
           files,
           fileCache,
           nonMdSet,
-          basenameCounts,
+          priorResolution,
         )
         : body;
       if (newBody !== body) {
@@ -2536,7 +2537,7 @@ fields:
     knownFiles?: string[],
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
-    basenameCounts?: Map<string, number>,
+    priorResolution?: LinkResolutionIndex,
   ): { updated: boolean; newValue: string; warning?: string } {
     let parsed: ParsedLink | null;
     try {
@@ -2586,25 +2587,18 @@ fields:
       }
     }
 
-    // Check if the link is ambiguous because other files also match the same simple name
-    // (the original link was ambiguous before the rename)
-    if (parsed.format === "wikilink" && !target.includes("/") && !target.startsWith("./") && !target.startsWith("../")) {
-      if (basenameCounts) {
-        const newPathBase = path.basename(newPath, path.extname(newPath));
-        const matchingCount = (basenameCounts.get(normalizedTarget) ?? 0) - (newPathBase === normalizedTarget ? 1 : 0);
-        if (matchingCount > 0) {
-          return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
-        }
-      } else {
-        const files = knownFiles ?? [];
-        const matchingFiles = files.filter((f) => {
-          const base = path.basename(f, path.extname(f));
-          return base === normalizedTarget && f !== newPath;
-        });
-        if (matchingFiles.length > 0) {
-          return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
-        }
+    // Reuse ordinary resolution against the pre-rename identity snapshot.
+    // Duplicate basenames alone are not ambiguity: directory/path tie-breakers
+    // may select one record. Never rewrite a link which selected another file.
+    if (priorResolution && parsed.format === "wikilink" && !target.includes("/")) {
+      const resolution = this.resolveLinkFullWithFiles(
+        linkValue, fromFile === newPath ? oldPath : fromFile, [], undefined,
+        undefined, undefined, priorResolution.fileSet, priorResolution,
+      );
+      if (resolution.ambiguous) {
+        return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
       }
+      if (resolution.resolved !== oldPath) return { updated: false, newValue: linkValue };
     }
 
     // Compute new link value preserving style
@@ -2718,7 +2712,7 @@ fields:
     knownFiles?: string[],
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
-    basenameCounts?: Map<string, number>,
+    priorResolution?: LinkResolutionIndex,
   ): string {
     if (!body) return body;
 
@@ -2781,7 +2775,7 @@ fields:
           knownFiles,
           knownFileCache,
           nonMarkdownFiles,
-          basenameCounts,
+          priorResolution,
         );
 
         if (updateResult.updated && updateResult.newValue !== raw) {
