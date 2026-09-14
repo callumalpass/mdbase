@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0-rc.6 - 2026-09-14
+
+- Use ordinary deterministic link resolution for rename references instead of
+  treating all duplicate basenames as ambiguous.
 - Validate all inferred memberships on selected-type creation without forcing
   declaration fields in inference-only collections. Keep ordinary `type` data.
 - Check final persisted membership after path derivation and serialization
