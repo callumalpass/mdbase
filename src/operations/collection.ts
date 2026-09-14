@@ -29,7 +29,7 @@ import {
   type DataContractDefinition,
   type DataContractImplementationDescriptor,
 } from "../data-contracts/registry.js";
-import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
+import { filterFrontmatter, parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateExpression } from "../expressions/evaluator.js";
@@ -643,7 +643,7 @@ fields:
    * Determine all types for a file, using explicit declarations or match rules.
    * If explicit types are declared, they take precedence and match rules are skipped.
    */
-  getTypesForFile(relativePath: string, frontmatter: Record<string, unknown>): string[] {
+  getTypesForFile(relativePath: string, frontmatter: Record<string, unknown>, matchErrors?: string[]): string[] {
     // Check for explicit type declaration
     const explicit = this.getExplicitTypes(frontmatter);
     if (explicit !== null) {
@@ -655,7 +655,7 @@ fields:
     const matchedTypes: string[] = [];
     for (const [typeName, typeDef] of this.typeDefs) {
       if (!typeDef.match) continue;
-      if (this.matchesType(relativePath, frontmatter, typeDef)) {
+      if (this.matchesType(relativePath, frontmatter, typeDef, matchErrors)) {
         matchedTypes.push(typeName);
       }
     }
@@ -670,6 +670,7 @@ fields:
     relativePath: string,
     frontmatter: Record<string, unknown>,
     typeDef: TypeDefinition,
+    matchErrors?: string[],
   ): boolean {
     const match = typeDef.match!;
     // path_glob
@@ -702,7 +703,10 @@ fields:
         knownFields: this.getTypeFieldNames(typeDef),
         file: this.buildMatchFileBinding(relativePath),
       });
-      if (result.diagnostics.length > 0) return false;
+      if (result.diagnostics.length > 0) {
+        matchErrors?.push(...result.diagnostics.map((diagnostic) => `${typeDef.name}: ${diagnostic.message}`));
+        return false;
+      }
       return result.value === true;
     }
 
@@ -1518,6 +1522,16 @@ fields:
       }
     }
 
+    const initiallyExplicit = this.getExplicitTypes(frontmatter) !== null;
+    if (this.config.spec_profile === "v0.3" && !initiallyExplicit) {
+      const matchErrors: string[] = [];
+      const inferred = this.getTypesForFile(input.path ?? "", frontmatter, matchErrors);
+      if (matchErrors.length) {
+        return { error: { code: "expression_evaluation_error", message: matchErrors.sort().join("; ") } };
+      }
+      for (const name of inferred) if (!typeNames.includes(name)) typeNames.push(name);
+    }
+
     const createLifecycleIssues = this.applyV03Lifecycle(typeNames, "on_create", frontmatter, {
       relativePath: input.path,
     });
@@ -1526,13 +1540,6 @@ fields:
         valid: false,
         error: { code: "validation_failed", message: "Lifecycle validation failed on create" },
         issues: createLifecycleIssues,
-      };
-    }
-    const postLifecycleTypes = this.getTypesForFile(input.path ?? "", frontmatter);
-    if (this.config.spec_profile === "v0.3" && !sameStringSet(typeNames, postLifecycleTypes)) {
-      return {
-        valid: false,
-        error: { code: "type_membership_changed", message: "Lifecycle changed type membership during create" },
       };
     }
 
@@ -1680,8 +1687,22 @@ fields:
       }
     }
 
-    // Verify created file will satisfy match rules for explicit types
-    for (const typeName of typeNames) {
+    // Check persisted values and the final path, not effective read defaults.
+    // Explicit declarations bypass inferred matching rather than satisfying both.
+    if (this.config.spec_profile === "v0.3") {
+      const matchErrors: string[] = [];
+      const persisted = filterFrontmatter(diskFrontmatter, this.config.settings.write_nulls, this.config.settings.write_empty_lists);
+      const finalTypes = this.getTypesForFile(relativePath, persisted, matchErrors);
+      if (matchErrors.length) {
+        return { error: { code: "expression_evaluation_error", message: matchErrors.sort().join("; ") } };
+      }
+      if ((initiallyExplicit && this.getExplicitTypes(persisted) === null)
+        || !sameStringSet(typeNames, finalTypes)) {
+        return { error: { code: "type_membership_changed", message: "Final persisted record does not retain the intended type membership" } };
+      }
+    }
+    // Preserve the legacy v0.2 match policy.
+    for (const typeName of this.config.spec_profile === "v0.3" ? [] : typeNames) {
       const typeDef = this.typeDefs.get(typeName);
       if (typeDef?.match) {
         if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef)) {

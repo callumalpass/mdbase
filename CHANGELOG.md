@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Validate all inferred memberships on selected-type creation without forcing
+  declaration fields in inference-only collections. Keep ordinary `type` data.
+- Check final persisted membership after path derivation and serialization
+  filtering; propagate create-time CEL matching errors rather than ignoring them.
+- Explicitly declared v0.3 creates no longer also need to satisfy inferred rules.
+
 ## 0.3.0-rc.5 - 2026-08-07
 
 - Install and evolve data-contract type packs through reviewed, atomic

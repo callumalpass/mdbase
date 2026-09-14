@@ -203,7 +203,7 @@ export function serializeFile(
   return result;
 }
 
-function filterFrontmatter(
+export function filterFrontmatter(
   data: Record<string, unknown>,
   writeNulls: "omit" | "explicit",
   writeEmptyLists: boolean,
