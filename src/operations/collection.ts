@@ -29,7 +29,7 @@ import {
   type DataContractDefinition,
   type DataContractImplementationDescriptor,
 } from "../data-contracts/registry.js";
-import { parseFileAsync, serializeFile } from "../frontmatter/parser.js";
+import { filterFrontmatter, parseFileAsync, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateExpression } from "../expressions/evaluator.js";
@@ -643,7 +643,7 @@ fields:
    * Determine all types for a file, using explicit declarations or match rules.
    * If explicit types are declared, they take precedence and match rules are skipped.
    */
-  getTypesForFile(relativePath: string, frontmatter: Record<string, unknown>): string[] {
+  getTypesForFile(relativePath: string, frontmatter: Record<string, unknown>, matchErrors?: string[]): string[] {
     // Check for explicit type declaration
     const explicit = this.getExplicitTypes(frontmatter);
     if (explicit !== null) {
@@ -655,7 +655,7 @@ fields:
     const matchedTypes: string[] = [];
     for (const [typeName, typeDef] of this.typeDefs) {
       if (!typeDef.match) continue;
-      if (this.matchesType(relativePath, frontmatter, typeDef)) {
+      if (this.matchesType(relativePath, frontmatter, typeDef, matchErrors)) {
         matchedTypes.push(typeName);
       }
     }
@@ -670,6 +670,7 @@ fields:
     relativePath: string,
     frontmatter: Record<string, unknown>,
     typeDef: TypeDefinition,
+    matchErrors?: string[],
   ): boolean {
     const match = typeDef.match!;
     // path_glob
@@ -702,7 +703,10 @@ fields:
         knownFields: this.getTypeFieldNames(typeDef),
         file: this.buildMatchFileBinding(relativePath),
       });
-      if (result.diagnostics.length > 0) return false;
+      if (result.diagnostics.length > 0) {
+        matchErrors?.push(...result.diagnostics.map((diagnostic) => `${typeDef.name}: ${diagnostic.message}`));
+        return false;
+      }
       return result.value === true;
     }
 
@@ -1518,6 +1522,16 @@ fields:
       }
     }
 
+    const initiallyExplicit = this.getExplicitTypes(frontmatter) !== null;
+    if (this.config.spec_profile === "v0.3" && !initiallyExplicit) {
+      const matchErrors: string[] = [];
+      const inferred = this.getTypesForFile(input.path ?? "", frontmatter, matchErrors);
+      if (matchErrors.length) {
+        return { error: { code: "expression_evaluation_error", message: matchErrors.sort().join("; ") } };
+      }
+      for (const name of inferred) if (!typeNames.includes(name)) typeNames.push(name);
+    }
+
     const createLifecycleIssues = this.applyV03Lifecycle(typeNames, "on_create", frontmatter, {
       relativePath: input.path,
     });
@@ -1526,13 +1540,6 @@ fields:
         valid: false,
         error: { code: "validation_failed", message: "Lifecycle validation failed on create" },
         issues: createLifecycleIssues,
-      };
-    }
-    const postLifecycleTypes = this.getTypesForFile(input.path ?? "", frontmatter);
-    if (this.config.spec_profile === "v0.3" && !sameStringSet(typeNames, postLifecycleTypes)) {
-      return {
-        valid: false,
-        error: { code: "type_membership_changed", message: "Lifecycle changed type membership during create" },
       };
     }
 
@@ -1680,8 +1687,22 @@ fields:
       }
     }
 
-    // Verify created file will satisfy match rules for explicit types
-    for (const typeName of typeNames) {
+    // Check persisted values and the final path, not effective read defaults.
+    // Explicit declarations bypass inferred matching rather than satisfying both.
+    if (this.config.spec_profile === "v0.3") {
+      const matchErrors: string[] = [];
+      const persisted = filterFrontmatter(diskFrontmatter, this.config.settings.write_nulls, this.config.settings.write_empty_lists);
+      const finalTypes = this.getTypesForFile(relativePath, persisted, matchErrors);
+      if (matchErrors.length) {
+        return { error: { code: "expression_evaluation_error", message: matchErrors.sort().join("; ") } };
+      }
+      if ((initiallyExplicit && this.getExplicitTypes(persisted) === null)
+        || !sameStringSet(typeNames, finalTypes)) {
+        return { error: { code: "type_membership_changed", message: "Final persisted record does not retain the intended type membership" } };
+      }
+    }
+    // Preserve the legacy v0.2 match policy.
+    for (const typeName of this.config.spec_profile === "v0.3" ? [] : typeNames) {
       const typeDef = this.typeDefs.get(typeName);
       if (typeDef?.match) {
         if (!this.matchesType(relativePath, effectiveFrontmatter, typeDef)) {
@@ -2270,11 +2291,12 @@ fields:
     const fileCache = await this.buildFileCache(files);
     const allFiles = await this.scanAllFiles();
     const nonMdSet = this.buildNonMarkdownSet(allFiles);
-    const basenameCounts = new Map<string, number>();
-    for (const filePath of files) {
-      const basename = path.basename(filePath, path.extname(filePath));
-      basenameCounts.set(basename, (basenameCounts.get(basename) ?? 0) + 1);
-    }
+    const previousFiles = files.map((filePath) => filePath === newPath ? oldPath : filePath);
+    const previousCache = new Map(fileCache);
+    const renamed = previousCache.get(newPath);
+    previousCache.delete(newPath);
+    if (renamed) previousCache.set(oldPath, renamed);
+    const priorResolution = this.linkResolver.buildIndex(previousFiles, previousCache);
     const referencesUpdated: Array<{ path: string; field?: string; location?: string }> = [];
     const warnings: Array<{ path: string; message_contains?: string; message?: string }> = [];
     const partialFailures: Array<{ path: string; reason: string }> = [];
@@ -2344,7 +2366,7 @@ fields:
               files,
               fileCache,
               nonMdSet,
-              basenameCounts,
+              priorResolution,
             );
             if (result.warning) {
               warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
@@ -2380,7 +2402,7 @@ fields:
                 files,
                 fileCache,
                 nonMdSet,
-                basenameCounts,
+                priorResolution,
               );
               if (result.warning) {
                 warnings.push({ path: filePath, message_contains: "ambiguous", message: result.warning });
@@ -2413,7 +2435,7 @@ fields:
           files,
           fileCache,
           nonMdSet,
-          basenameCounts,
+          priorResolution,
         )
         : body;
       if (newBody !== body) {
@@ -2515,7 +2537,7 @@ fields:
     knownFiles?: string[],
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
-    basenameCounts?: Map<string, number>,
+    priorResolution?: LinkResolutionIndex,
   ): { updated: boolean; newValue: string; warning?: string } {
     let parsed: ParsedLink | null;
     try {
@@ -2565,25 +2587,18 @@ fields:
       }
     }
 
-    // Check if the link is ambiguous because other files also match the same simple name
-    // (the original link was ambiguous before the rename)
-    if (parsed.format === "wikilink" && !target.includes("/") && !target.startsWith("./") && !target.startsWith("../")) {
-      if (basenameCounts) {
-        const newPathBase = path.basename(newPath, path.extname(newPath));
-        const matchingCount = (basenameCounts.get(normalizedTarget) ?? 0) - (newPathBase === normalizedTarget ? 1 : 0);
-        if (matchingCount > 0) {
-          return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
-        }
-      } else {
-        const files = knownFiles ?? [];
-        const matchingFiles = files.filter((f) => {
-          const base = path.basename(f, path.extname(f));
-          return base === normalizedTarget && f !== newPath;
-        });
-        if (matchingFiles.length > 0) {
-          return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
-        }
+    // Reuse ordinary resolution against the pre-rename identity snapshot.
+    // Duplicate basenames alone are not ambiguity: directory/path tie-breakers
+    // may select one record. Never rewrite a link which selected another file.
+    if (priorResolution && parsed.format === "wikilink" && !target.includes("/")) {
+      const resolution = this.resolveLinkFullWithFiles(
+        linkValue, fromFile === newPath ? oldPath : fromFile, [], undefined,
+        undefined, undefined, priorResolution.fileSet, priorResolution,
+      );
+      if (resolution.ambiguous) {
+        return { updated: false, newValue: linkValue, warning: `ambiguous link '${linkValue}' not updated` };
       }
+      if (resolution.resolved !== oldPath) return { updated: false, newValue: linkValue };
     }
 
     // Compute new link value preserving style
@@ -2697,7 +2712,7 @@ fields:
     knownFiles?: string[],
     knownFileCache?: Map<string, ReadResult>,
     nonMarkdownFiles?: Set<string>,
-    basenameCounts?: Map<string, number>,
+    priorResolution?: LinkResolutionIndex,
   ): string {
     if (!body) return body;
 
@@ -2760,7 +2775,7 @@ fields:
           knownFiles,
           knownFileCache,
           nonMarkdownFiles,
-          basenameCounts,
+          priorResolution,
         );
 
         if (updateResult.updated && updateResult.newValue !== raw) {
