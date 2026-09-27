@@ -931,14 +931,14 @@ function validateV03ImplementationsShape(
     if (candidate.binding !== undefined && !isPlainObject(candidate.binding)) {
       return invalidV03TypeShape(typeName, `implements[${index}].binding must be a mapping`);
     }
-    const identity = `${candidate.contract}\0${candidate.version}`;
-    if (identities.has(identity)) {
+    // A type implements each contract ID once, whatever versions the entries request.
+    if (identities.has(candidate.contract)) {
       return invalidV03TypeShape(
         typeName,
-        `implements contains duplicate contract identity "${candidate.contract}" ${candidate.version}`,
+        `implements data contract "${candidate.contract}" more than once`,
       );
     }
-    identities.add(identity);
+    identities.add(candidate.contract);
   }
   return null;
 }
