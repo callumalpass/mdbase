@@ -1,4 +1,5 @@
-import { Environment } from "@marcbachmann/cel-js";
+import { Environment, serialize } from "@marcbachmann/cel-js";
+import { rewriteLinkProvenance, type CelNode } from "./link-provenance.js";
 
 import { extractBodyLinks, extractBodyTags } from "../links/parser.js";
 
@@ -153,33 +154,45 @@ const environment = new Environment({
     const wanted = tag.replace(/^#/, "");
     return strings(file.tags).some((existing) => existing === wanted || existing.startsWith(`${wanted}/`));
   })
-  .registerFunction("map.hasLink(string): bool", (file: Record<string, unknown>, link: string) => {
-    const source = typeof file.path === "string" ? file.path : "";
-    const links = host().links;
-    const wanted = links?.resolve(link, source)?.path;
-    return strings(file.links).some((candidate) => {
-      const actual = links?.resolve(candidate, source)?.path;
-      return wanted !== undefined && actual !== undefined
-        ? wanted === actual
-        : linkTarget(candidate) === linkTarget(link);
-    });
-  })
+  .registerFunction("map.hasLink(string): bool", (file: Record<string, unknown>, link: string) =>
+    hasLink(file, link, typeof file.path === "string" ? file.path : ""))
+  // Internal overloads that link provenance rewriting produces (see
+  // link-provenance.ts): the link was read from the record at `sourcePath`.
+  .registerFunction("map.hasLink(string, string): bool", (file: Record<string, unknown>, link: string, sourcePath: string) =>
+    hasLink(file, link, sourcePath))
   .registerFunction("map.asLink(): string", (file: Record<string, unknown>) => {
     if (typeof file.path !== "string") throw new Error("the value has no path");
     return `[[${file.path}]]`;
   })
   .registerFunction("link(string): string", (value: string) => value)
-  .registerFunction("string.asFile(): dyn", (link: string) => {
-    const current = host();
-    current.traversals += 1;
-    if (current.traversals > MAX_LINK_TRAVERSALS) {
-      throw new Error(`link traversal limit of ${MAX_LINK_TRAVERSALS} exceeded`);
-    }
-    const target = current.links?.resolve(link, current.source);
-    if (!target) return null;
-    const file = fileValue(target.path, target.record, target.body, target.declaredLinkSelectors ?? [], {});
-    return recordValue(target.record, target.raw, file);
+  .registerFunction("string.asFile(): dyn", (link: string) => asFile(link, host().source))
+  .registerFunction("string.asFile(string): dyn", (link: string, sourcePath: string) => asFile(link, sourcePath));
+
+/** Whether `file` links to `link`, which was read from the record at `linkSource`. */
+function hasLink(file: Record<string, unknown>, link: string, linkSource: string): boolean {
+  const source = typeof file.path === "string" ? file.path : "";
+  const links = host().links;
+  const wanted = links?.resolve(link, linkSource)?.path;
+  return strings(file.links).some((candidate) => {
+    const actual = links?.resolve(candidate, source)?.path;
+    return wanted !== undefined && actual !== undefined
+      ? wanted === actual
+      : linkTarget(candidate) === linkTarget(link);
   });
+}
+
+/** Resolve a link read from the record at `sourcePath` to its target record. */
+function asFile(link: string, sourcePath: string): unknown {
+  const current = host();
+  current.traversals += 1;
+  if (current.traversals > MAX_LINK_TRAVERSALS) {
+    throw new Error(`link traversal limit of ${MAX_LINK_TRAVERSALS} exceeded`);
+  }
+  const target = current.links?.resolve(link, sourcePath);
+  if (!target) return null;
+  const file = fileValue(target.path, target.record, target.body, target.declaredLinkSelectors ?? [], {});
+  return recordValue(target.record, target.raw, file);
+}
 
 const programCache = new Map<string, CompiledProgram>();
 
@@ -192,8 +205,10 @@ function compileMdbaseCel(expression: string): CompiledProgram {
     return cached;
   }
   const parsed = environment.parse(expression);
+  const provenance = rewriteLinkProvenance(parsed.ast as unknown as CelNode);
+  const executable = provenance ? environment.parse(serialize(provenance as never)) : parsed;
   const compiled: CompiledProgram = {
-    run: (bindings) => parsed(bindings),
+    run: (bindings) => executable(bindings),
     facts: analyze(parsed.ast as AstNode),
   };
   if (programCache.size >= MDBASE_CEL_PROGRAM_CACHE_LIMIT) {

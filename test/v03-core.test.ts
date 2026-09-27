@@ -29,6 +29,33 @@ async function open(root: string): Promise<Collection> {
 }
 
 describe("v0.3 core", () => {
+  it("resolves links relative to the record they were read from", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "projects/alpha.md", '---\nlead: "[Bob](people/bob.md)"\nrelated: ["[[./beta]]"]\n---\n');
+    await write(root, "projects/beta.md", "---\ntitle: Beta\n---\n");
+    await write(root, "projects/people/bob.md", "---\nname: Bob\n---\n");
+    await write(root, "tasks/t1.md", '---\nproject: "[[alpha]]"\n---\n');
+    const collection = await open(root);
+    try {
+      const evaluate = async (expression: string) =>
+        (await collection.evaluateCel({ path: "tasks/t1.md", expression })).value;
+      // A link read from an asFile() result resolves relative to that target.
+      expect(await evaluate("project.asFile().lead.asFile().name")).toBe("Bob");
+      expect(await evaluate("project.asFile().related.map(r, r.asFile().file.path)")).toEqual(["projects/beta.md"]);
+      expect(await evaluate('project.asFile().file.hasLink(link(project.asFile().related[0]))')).toBe(true);
+
+      const query = await collection.queryCanonical({
+        context: { this: { path: "projects/alpha.md" } },
+        where: 'file.inFolder("tasks") && this.related.exists(r, r.asFile().title == "Beta")',
+        select: [{ name: "lead", expr: "this.lead.asFile().name" }],
+      } as never);
+      expect(query.results.map((result) => result.values)).toEqual([{ lead: "Bob" }]);
+    } finally {
+      await collection.close();
+    }
+  });
+
   it("initializes a minimal v0.3 collection by default", async () => {
     const root = await tempCollection();
     const result = await Collection.init(root, {
