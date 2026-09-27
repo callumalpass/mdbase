@@ -32,6 +32,10 @@ schema:
     properties:
       type: { const: ${type} }
       title: { type: string }
+collection:
+  unique:
+    - field: id
+      scope: type
 ---
 `, "utf8");
   }
@@ -101,7 +105,7 @@ describe("in-memory cache mutation regressions", () => {
     await collection.close();
   });
 
-  it("still scans and rejects a supplied duplicate ID", async () => {
+  it("still scans and rejects a supplied duplicate unique value", async () => {
     const collection = await fixture();
     const first = await collection.create({
       path: "first-id.md",
@@ -117,7 +121,7 @@ describe("in-memory cache mutation regressions", () => {
     });
     expect(duplicate.error?.code).toBe("validation_failed");
     expect(duplicate.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: "duplicate_id", field: "id" }),
+      expect.objectContaining({ code: "duplicate_value", field: "id" }),
     ]));
     await collection.close();
   });

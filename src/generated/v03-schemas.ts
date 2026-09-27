@@ -66,9 +66,6 @@ export const configSchema: Record<string, unknown> = {
           "type": "string",
           "minLength": 1
         },
-        "include_subfolders": {
-          "type": "boolean"
-        },
         "exclude": {
           "type": "array",
           "items": {
@@ -821,9 +818,6 @@ export const typeFileSchema: Record<string, unknown> = {
     "lifecycle": {
       "$ref": "#/$defs/lifecycle"
     },
-    "migrations": {
-      "$ref": "#/$defs/migrations"
-    },
     "implements": {
       "$ref": "#/$defs/implementations"
     }
@@ -857,7 +851,7 @@ export const typeFileSchema: Record<string, unknown> = {
       "pattern": "^(/([^/~]|~0|~1)*)*$"
     },
     "fieldReference": {
-      "description": "A legacy mdbase field path or a non-root RFC 6901 JSON Pointer.",
+      "description": "An mdbase field path or a non-root RFC 6901 JSON Pointer.",
       "oneOf": [
         {
           "$ref": "#/$defs/fieldPath"
@@ -1208,12 +1202,6 @@ export const typeFileSchema: Record<string, unknown> = {
         },
         "on_update": {
           "$ref": "#/$defs/lifecycleEvent"
-        },
-        "on_delete": {
-          "$ref": "#/$defs/lifecycleEvent"
-        },
-        "on_rename": {
-          "$ref": "#/$defs/lifecycleEvent"
         }
       },
       "additionalProperties": false
@@ -1341,53 +1329,6 @@ export const typeFileSchema: Record<string, unknown> = {
         }
       ]
     },
-    "migrations": {
-      "type": "array",
-      "items": {
-        "type": "object",
-        "required": [
-          "from",
-          "to"
-        ],
-        "properties": {
-          "from": {
-            "type": "integer",
-            "minimum": 0
-          },
-          "to": {
-            "type": "integer",
-            "minimum": 1
-          },
-          "steps": {
-            "type": "array",
-            "items": {
-              "type": "object",
-              "minProperties": 1,
-              "additionalProperties": true
-            }
-          },
-          "action": {
-            "$ref": "#/$defs/identifier"
-          },
-          "description": {
-            "type": "string"
-          }
-        },
-        "oneOf": [
-          {
-            "required": [
-              "steps"
-            ]
-          },
-          {
-            "required": [
-              "action"
-            ]
-          }
-        ],
-        "additionalProperties": false
-      }
-    },
     "implementations": {
       "type": "array",
       "minItems": 1,
@@ -1407,7 +1348,7 @@ export const typeFileSchema: Record<string, unknown> = {
           "$ref": "#/$defs/contractId"
         },
         "version": {
-          "$ref": "#/$defs/semanticVersion"
+          "$ref": "#/$defs/semanticVersionRequirement"
         },
         "fields": {
           "type": "object",
@@ -1434,6 +1375,10 @@ export const typeFileSchema: Record<string, unknown> = {
       "minLength": 3,
       "maxLength": 128,
       "pattern": "^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$"
+    },
+    "semanticVersionRequirement": {
+      "type": "string",
+      "pattern": "^(?:[\\^~=]?(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?|(?:>=|<=|>|<|=)(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?: (?:>=|<=|>|<|=)(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)\\.(?:0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?(?:\\+[0-9A-Za-z-]+(?:\\.[0-9A-Za-z-]+)*)?)*)$"
     },
     "semanticVersion": {
       "type": "string",

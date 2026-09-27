@@ -23,6 +23,11 @@ export interface LinkIndexBuildParams {
   fileCache: Map<string, IndexedReadResult>;
   typeDefs: Map<string, TypeDefinition>;
   resolveLink: (linkValue: string, fromPath: string) => LinkResolutionResult;
+  /**
+   * v0.3 counts undeclared frontmatter wikilinks and self-links (spec
+   * Chapter 08); v0.2 counts declared link fields only and omits self-links.
+   */
+  specProfile?: string;
 }
 
 export interface LinkIndex {
@@ -33,6 +38,7 @@ export interface LinkIndex {
 
 export function buildLinkIndex(params: LinkIndexBuildParams): LinkIndex {
   const { files, fileCache, typeDefs, resolveLink } = params;
+  const v03 = params.specProfile === "v0.3";
   const outgoing = new Map<string, Set<string>>();
   const incoming = new Map<string, Set<string>>();
 
@@ -63,6 +69,16 @@ export function buildLinkIndex(params: LinkIndexBuildParams): LinkIndex {
       }
     }
 
+    if (v03) {
+      for (const value of Object.values(frontmatter)) {
+        for (const item of Array.isArray(value) ? value : [value]) {
+          if (typeof item === "string" && /^\[\[[^\]]+\]\]$/.test(item.trim())) {
+            linkValues.push(item.trim());
+          }
+        }
+      }
+    }
+
     const bodyLinks = extractBodyLinks(body);
     for (const bodyLink of bodyLinks) {
       linkValues.push(bodyLink.raw);
@@ -76,7 +92,7 @@ export function buildLinkIndex(params: LinkIndexBuildParams): LinkIndex {
       const targetPath = resolution.resolved;
       resolvedTargets.add(targetPath);
 
-      if (targetPath === sourcePath) continue;
+      if (targetPath === sourcePath && !v03) continue;
       let sources = incoming.get(targetPath);
       if (!sources) {
         sources = new Set<string>();

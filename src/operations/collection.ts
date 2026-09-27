@@ -9,10 +9,13 @@ import { createHash } from "node:crypto";
 import { dump } from "js-yaml";
 import { validateCanonicalSchema } from "../validation/canonical.js";
 import picomatch from "picomatch";
+import { portableGlobMatch } from "../path-glob.js";
 import { ulid } from "ulid";
 import {
   getFieldReferenceValue,
   getFieldReferenceValues,
+  parseFieldReference,
+  removeFieldReferenceValue,
   setFieldReferenceValue,
 } from "../field-references.js";
 import {
@@ -33,7 +36,12 @@ import { filterFrontmatter, parseFileAsync, serializeFile } from "../frontmatter
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateExpression } from "../expressions/evaluator.js";
-import { evaluateMdbaseCel } from "../expressions/cel.js";
+import {
+  evaluateMdbaseCel,
+  mdbaseCelFacts,
+  type MdbaseCelDiagnostic,
+  type MdbaseCelLinks,
+} from "../expressions/cel.js";
 import { extractBodyLinks, parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
@@ -55,7 +63,6 @@ import type {
   QueryResult,
   ReadResult,
   RenameInput,
-  TypeMigrationEntry,
   UpdateResult,
   UpdateInput,
   V03CreateInput,
@@ -76,6 +83,7 @@ import {
   executeCanonicalQuery,
   executeCanonicalView,
   listCanonicalViews,
+  celTypeFacts,
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
@@ -90,6 +98,15 @@ import {
   matchesFieldConditions,
 } from "./structured-where.js";
 import { recoverInterruptedTypePackTransactions } from "../type-packs/recovery.js";
+import {
+  BATCH_TRANSACTIONS_FOLDER,
+  batchRequestError,
+  commitStagedChanges,
+  stageCollection,
+  stagedChanges,
+  type V03BatchInput,
+  type V03BatchItem,
+} from "./batch.js";
 
 export type {
   BatchResult,
@@ -100,7 +117,6 @@ export type {
   QueryGroupResult,
   QueryResult,
   ReadResult,
-  TypeMigrationEntry,
   UpdateResult,
   V03CreateInput,
   V03DeleteInput,
@@ -174,7 +190,10 @@ export class Collection {
     this.runtimeCache = new CollectionRuntimeCache();
     this.observer = new OperationObserver(options.observability);
     this.linkResolver = new LinkResolver({
-      idField: config.settings.id_field,
+      // v0.3 resolves wikilinks by ID only when an id field is configured.
+      idField: config.spec_profile === "v0.3" && !config.settings.id_field_explicit
+        ? undefined
+        : config.settings.id_field,
       recordExtensions: config.settings.record_extensions,
     });
     this.scanner = new CollectionScanner({
@@ -186,6 +205,7 @@ export class Collection {
       contractsFolder: config.settings.contracts_folder,
       cacheFolder: config.settings.cache_folder,
       migrationsFolder: config.settings.migrations_folder,
+      specProfile: config.spec_profile,
     });
   }
 
@@ -212,6 +232,54 @@ export class Collection {
 
   private invalidateRuntimeCaches(options?: RuntimeCacheInvalidation): void {
     this.runtimeCache.invalidate(options);
+  }
+
+  /** Match a collection path glob; v0.3 uses the portable grammar of Chapter 02. */
+  private globMatches(pattern: string, relativePath: string): boolean {
+    return this.config.spec_profile === "v0.3"
+      ? portableGlobMatch(pattern, relativePath)
+      : picomatch(pattern, { dot: true })(relativePath);
+  }
+
+  /**
+   * `unsupported_feature` warnings for type sections this engine loads but
+   * does not implement (spec Chapter 07, "Projections"). With `types`, only
+   * those types are reported.
+   */
+  unsupportedFeatureDiagnostics(types?: string[]): V03Diagnostic[] {
+    const wanted = types ? new Set(types.map((name) => name.toLowerCase())) : undefined;
+    return [...this.typeDefs.values()]
+      .filter((typeDef) => !wanted || wanted.has(typeDef.name.toLowerCase()))
+      .filter((typeDef) => typeDef.collection?.projections !== undefined)
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((typeDef) => ({
+        severity: "warning" as const,
+        code: "unsupported_feature",
+        message: `Type "${typeDef.name}" declares collection.projections, which this implementation does not evaluate; projection values are absent.`,
+        ...(typeDef.source_path ? { path: typeDef.source_path } : {}),
+        type: typeDef.name,
+        details: { feature: "collection_projections" },
+      }));
+  }
+
+  /** The configured record validation level (spec Chapter 04). */
+  get validationLevel(): MdbaseConfig["settings"]["default_validation"] {
+    return this.config.settings.default_validation;
+  }
+
+  /** Whether a collection-relative file has a record extension. */
+  isRecordFile(relativePath: string): boolean {
+    return this.scanner.isRecordFile(relativePath);
+  }
+
+  /** The collection root, for operations that stage a copy of it. */
+  get rootPath(): string {
+    return this.root;
+  }
+
+  /** Drop in-memory state after files were changed outside this instance. */
+  refreshAfterExternalWrites(): void {
+    this.invalidateRuntimeCaches();
   }
 
   static async init(
@@ -455,6 +523,7 @@ fields:
       async () => {
         if (!options.skipTypePackRecovery) {
           await recoverInterruptedTypePackTransactions(collectionRoot);
+          await recoverInterruptedTypePackTransactions(collectionRoot, BATCH_TRANSACTIONS_FOLDER);
         }
         const configResult = await loadConfigAsync(collectionRoot, { allowFutureMinor: true });
         if (!configResult.valid || !configResult.config) {
@@ -676,7 +745,7 @@ fields:
     // path_glob
     if (match.path_glob !== undefined) {
       const patterns = Array.isArray(match.path_glob) ? match.path_glob : [match.path_glob];
-      if (!patterns.some((pattern) => picomatch(pattern, { dot: true })(relativePath))) {
+      if (!patterns.some((pattern) => this.globMatches(pattern, relativePath))) {
         return false;
       }
     }
@@ -700,7 +769,6 @@ fields:
       const result = evaluateMdbaseCel(match.expr.$expr, {
         record: frontmatter,
         raw: frontmatter,
-        knownFields: this.getTypeFieldNames(typeDef),
         file: this.buildMatchFileBinding(relativePath),
       });
       if (result.diagnostics.length > 0) {
@@ -711,16 +779,6 @@ fields:
     }
 
     return true;
-  }
-
-  private getTypeFieldNames(typeDef: TypeDefinition): string[] {
-    const schemaProperties = typeDef.schema?.value?.properties;
-    return [
-      ...Object.keys(typeDef.fields ?? {}),
-      ...(schemaProperties !== null && typeof schemaProperties === "object" && !Array.isArray(schemaProperties)
-        ? Object.keys(schemaProperties)
-        : []),
-    ];
   }
 
   private buildMatchFileBinding(relativePath: string): Record<string, unknown> {
@@ -1015,109 +1073,126 @@ fields:
     }
   }
 
+  /**
+   * Apply lifecycle actions (spec Chapter 09). Actions run in list order, and
+   * every provider in one `set` reads the draft as it was before that action.
+   * Different assignments to one field from different types are rejected
+   * before any action runs.
+   */
   private applyV03Lifecycle(
     types: string[],
     event: "on_create" | "on_update",
     frontmatter: Record<string, unknown>,
     context: { oldFrontmatter?: Record<string, unknown>; relativePath?: string } = {},
   ): MdbaseError[] {
-    const issues: MdbaseError[] = [];
-    const assignments = new Map<string, {
-      value: unknown;
-      typeName: string;
-      lifecyclePath: string;
-    }>();
+    const policies = [...new Set(types)].sort().flatMap((typeName) => {
+      const eventPolicy = this.typeDefs.get(typeName)?.lifecycle?.[event];
+      if (!eventPolicy) return [];
+      return [{ typeName, actions: Array.isArray(eventPolicy) ? eventPolicy : [eventPolicy] }];
+    });
 
-    for (const typeName of types) {
-      const typeDef = this.typeDefs.get(typeName);
-      const eventPolicy = typeDef?.lifecycle?.[event];
-      if (!eventPolicy) continue;
-      const actions = Array.isArray(eventPolicy) ? eventPolicy : [eventPolicy];
+    // Fields assigned identically by several types run once, for the first type.
+    const owners = new Map<string, { typeName: string; provider: string; lifecyclePath: string }>();
+    const shared = new Map<string, string>();
+    for (const { typeName, actions } of policies) {
+      for (const [index, action] of actions.entries()) {
+        for (const [fieldPath, provider] of Object.entries(action.set ?? {})) {
+          const lifecyclePath = `${typeName}.lifecycle.${event}[${index}].set.${fieldPath}`;
+          const normalized = JSON.stringify(provider);
+          const owner = owners.get(fieldPath);
+          if (!owner) {
+            owners.set(fieldPath, { typeName, provider: normalized, lifecyclePath });
+          } else if (owner.typeName === typeName) {
+            continue;
+          } else if (owner.provider === normalized) {
+            shared.set(fieldPath, owner.typeName);
+          } else {
+            return [{
+              code: "type_conflict",
+              message: `Conflicting lifecycle assignments for "${fieldPath}": ${owner.lifecyclePath} and ${lifecyclePath}`,
+              field: fieldPath,
+              type: `${owner.typeName},${typeName}`,
+              details: { event, types: [owner.typeName, typeName], lifecycle_paths: [owner.lifecyclePath, lifecyclePath] },
+              severity: "error",
+            }];
+          }
+        }
+      }
+    }
+
+    const instant = new Date().toISOString();
+    for (const { typeName, actions } of policies) {
       for (const [index, action] of actions.entries()) {
         if (action.if) {
           const guard = evaluateMdbaseCel(action.if, {
             record: frontmatter,
             raw: frontmatter,
             old: context.oldFrontmatter ?? {},
+            // Lifecycle guards type date-time fields as timestamps (Chapter 10).
+            dateTimeFields: celTypeFacts(types, this.typeDefs).dateTimeFields,
             operation: {
               event,
               path: context.relativePath,
             },
           });
           if (guard.diagnostics.length > 0) {
-            issues.push({
+            return [{
               code: "lifecycle_expression_error",
               message: `Lifecycle guard on ${typeName}.${event}[${index}] failed: ${guard.diagnostics[0].message}`,
               severity: "error",
-            });
-            continue;
+            }];
           }
-          if (guard.value !== true) {
-            continue;
-          }
+          if (guard.value !== true) continue;
         }
-        for (const [fieldPath, lifecycleValue] of Object.entries(action.set)) {
-          const value = this.evaluateLifecycleValue(lifecycleValue, frontmatter, context);
-          const lifecyclePath = `${typeName}.lifecycle.${event}[${index}].set.${fieldPath}`;
-          if (assignments.has(fieldPath)) {
-            const previous = assignments.get(fieldPath)!;
-            if (JSON.stringify(previous.value) !== JSON.stringify(value)) {
-              issues.push({
-                code: "type_conflict",
-                message: `Conflicting lifecycle assignments for "${fieldPath}": ${previous.lifecyclePath} and ${lifecyclePath}`,
-                field: fieldPath,
-                type: `${previous.typeName},${typeName}`,
-                severity: "error",
-              });
-              continue;
+        const snapshot = cloneJsonLike(frontmatter) as Record<string, unknown>;
+        for (const [fieldPath, provider] of Object.entries(action.set ?? {})) {
+          const owner = shared.get(fieldPath);
+          if (owner !== undefined && owner !== typeName) continue;
+          try {
+            const value = this.evaluateLifecycleValue(provider, snapshot, instant);
+            if (value.remove) {
+              removeFieldReferenceValue(frontmatter, fieldPath);
+            } else {
+              setFieldReferenceValue(frontmatter, fieldPath, value.value);
             }
+          } catch (error) {
+            return [{
+              code: "invalid_lifecycle_path",
+              message: (error as Error).message,
+              field: fieldPath,
+              severity: "error",
+            }];
           }
-          assignments.set(fieldPath, { value, typeName, lifecyclePath });
         }
       }
     }
-
-    if (issues.some((issue) => issue.severity === "error" || !issue.severity)) {
-      return issues;
-    }
-
-    for (const [fieldPath, assignment] of assignments) {
-      try {
-        setFieldReferenceValue(frontmatter, fieldPath, assignment.value);
-      } catch (error) {
-        issues.push({
-          code: "invalid_lifecycle_path",
-          message: (error as Error).message,
-          field: fieldPath,
-          severity: "error",
-        });
-      }
-    }
-    return issues;
+    return [];
   }
 
+  /** The value a provider assigns, or `remove` when the target key is removed. */
   private evaluateLifecycleValue(
     lifecycleValue: unknown,
-    frontmatter: Record<string, unknown>,
-    context: { oldFrontmatter?: Record<string, unknown>; relativePath?: string },
-  ): unknown {
+    snapshot: Record<string, unknown>,
+    instant: string,
+  ): { value?: unknown; remove?: true } {
     if (!lifecycleValue || typeof lifecycleValue !== "object" || Array.isArray(lifecycleValue)) {
-      return lifecycleValue;
+      return { value: lifecycleValue };
     }
     const value = lifecycleValue as Record<string, unknown>;
-    if (value.now === true) return new Date().toISOString();
-    if (value.today === true) return new Date().toISOString().slice(0, 10);
-    if (value.uuid === true) return crypto.randomUUID();
-    if (value.ulid === true) return ulid();
+    if (value.now === true) return { value: instant };
+    if (value.today === true) return { value: instant.slice(0, 10) };
+    if (value.uuid === true) return { value: crypto.randomUUID() };
+    if (value.ulid === true) return { value: ulid() };
     if (typeof value.slugify === "string") {
-      const source = getFieldReferenceValue(frontmatter, value.slugify).value;
-      return source === null || source === undefined ? null : slugify(String(source));
+      const source = getFieldReferenceValue(snapshot, value.slugify).value;
+      return { value: typeof source === "string" ? slugify(source) : null };
     }
     if (typeof value.copy === "string") {
-      return cloneJsonLike(getFieldReferenceValue(frontmatter, value.copy).value);
+      const source = getFieldReferenceValue(snapshot, value.copy);
+      return source.present ? { value: cloneJsonLike(source.value) } : { remove: true };
     }
-    if ("literal" in value) return cloneJsonLike(value.literal);
-    return undefined;
+    if ("literal" in value) return { value: cloneJsonLike(value.literal) };
+    return { value: undefined };
   }
 
   /**
@@ -1371,29 +1446,6 @@ fields:
     };
   }
 
-  listTypeMigrations(options: { type?: string; from?: number; to?: number } = {}): TypeMigrationEntry[] {
-    const requestedType = options.type?.toLowerCase();
-    const entries: TypeMigrationEntry[] = [];
-    for (const [typeName, typeDef] of this.typeDefs) {
-      if (requestedType && typeName !== requestedType) continue;
-      for (const migration of typeDef.migrations ?? []) {
-        if (options.from !== undefined && migration.from !== options.from) continue;
-        if (options.to !== undefined && migration.to !== options.to) continue;
-        entries.push({
-          type: typeName,
-          source_path: typeDef.source_path,
-          migration,
-        });
-      }
-    }
-    return entries.sort((a, b) => {
-      const typeCompare = a.type.localeCompare(b.type);
-      if (typeCompare !== 0) return typeCompare;
-      if (a.migration.from !== b.migration.from) return a.migration.from - b.migration.from;
-      return a.migration.to - b.migration.to;
-    });
-  }
-
   private checkCrossFileConstraints(
     allFiles: Map<string, Record<string, unknown>>,
     issues: MdbaseError[],
@@ -1451,10 +1503,11 @@ fields:
       }
     }
 
-    // Check id_field uniqueness
+    // Check id_field uniqueness. v0.3 has no ID validator: a duplicated
+    // configured ID only makes ID-based link resolution ambiguous.
     const idField = this.config.settings.id_field;
     const seen = new Map<string, string>();
-    for (const [filePath, frontmatter] of allFiles) {
+    for (const [filePath, frontmatter] of this.config.spec_profile === "v0.3" ? [] : allFiles) {
       const value = frontmatter[idField];
       if (value === null || value === undefined) continue;
       const key = JSON.stringify(value);
@@ -1773,7 +1826,7 @@ fields:
     }
 
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
-    await fs.promises.writeFile(fullPath, content);
+    await writeFileAtomic(fullPath, content);
     await this.updateCacheForPath(relativePath);
     this.invalidateRuntimeCaches();
 
@@ -1829,6 +1882,11 @@ fields:
     const readMtime = (await fs.promises.stat(fullPath)).mtimeMs;
 
     const existing = await parseFileAsync(fullPath);
+    if (this.config.spec_profile === "v0.3" && existing.error?.details?.reason === "non_mapping_frontmatter") {
+      // A structured update never silently discards non-mapping frontmatter
+      // (spec Chapter 03); a document replacement can repair it.
+      return { valid: false, error: existing.error };
+    }
     const originalFrontmatter: Record<string, unknown> = { ...existing.frontmatter };
     const frontmatter: Record<string, unknown> = { ...existing.frontmatter };
 
@@ -1836,6 +1894,12 @@ fields:
     const updates = input.fields ?? input.frontmatter;
     if (updates) {
       Object.assign(frontmatter, updates);
+    }
+    for (const reference of input.unset ?? []) {
+      const removal = removeFieldReferenceValue(frontmatter, reference);
+      if (removal.error) {
+        return { valid: false, error: { code: "invalid_request", message: removal.error } };
+      }
     }
 
     // Determine types
@@ -1982,7 +2046,7 @@ fields:
       };
     }
 
-    await fs.promises.writeFile(fullPath, content);
+    await writeFileAtomic(fullPath, content);
     await this.updateCacheForPath(relativePath);
 
     // Evaluate computed fields on the effective frontmatter for the return value
@@ -2182,7 +2246,7 @@ fields:
 
     const content = serializeFile(typeFrontmatter, "", "omit", true);
     await fs.promises.mkdir(typesFolder, { recursive: true });
-    await fs.promises.writeFile(typeFilePath, content);
+    await writeFileAtomic(typeFilePath, content);
 
     return {
       valid: true,
@@ -2466,7 +2530,7 @@ fields:
             this.config.settings.write_nulls,
             this.config.settings.write_empty_lists,
           );
-          await fs.promises.writeFile(fullPath, updatedContent);
+          await writeFileAtomic(fullPath, updatedContent);
           await this.upsertCacheFromData(filePath, nextFrontmatter, nextBody);
 
           for (const field of fmUpdatedFields) {
@@ -2874,7 +2938,86 @@ fields:
         const built = await this.buildFileCache(files);
         return built as Map<string, IndexedReadResult>;
       },
+      celLinks: (files, fileCache) => this.buildCelLinks(files, fileCache),
     });
+  }
+
+  /**
+   * The CEL link host for one collection state: `asFile()` resolution and the
+   * backlinks index, both using the v0.3 link rules.
+   */
+  private async buildCelLinks(
+    files: string[],
+    fileCache: Map<string, IndexedReadResult>,
+  ): Promise<MdbaseCelLinks> {
+    const nonMarkdownFiles = this.buildNonMarkdownSet(await this.scanAllFiles());
+    const resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
+    const resolvePath = (link: string, fromPath: string) =>
+      this.linkResolver.resolve(link, fromPath, files, {
+        fileCache,
+        nonMarkdownFiles,
+        knownFileSet: resolutionIndex.fileSet,
+        resolutionIndex,
+      });
+    const index = buildLinkIndex({
+      files,
+      fileCache,
+      typeDefs: this.typeDefs,
+      resolveLink: resolvePath,
+      specProfile: this.config.spec_profile,
+    });
+    return {
+      resolve: (link, fromPath) => {
+        const target = resolvePath(link, fromPath).resolved;
+        const read = target ? fileCache.get(target) : undefined;
+        if (!target || !read || read.error) return null;
+        return {
+          path: target,
+          record: read.frontmatter ?? {},
+          raw: read.rawFrontmatter ?? read.frontmatter ?? {},
+          body: read.body ?? "",
+          declaredLinkSelectors: celTypeFacts(read.types ?? [], this.typeDefs).declaredLinkSelectors,
+        };
+      },
+      backlinks: (targetPath) => [...(index.incoming.get(targetPath) ?? [])],
+    };
+  }
+
+  /** Evaluate a CEL expression against one record in the query context. */
+  async evaluateCel(input: {
+    path: string;
+    expression: string;
+    timezone?: string;
+  }): Promise<{ valid: boolean; value: unknown; diagnostics: MdbaseCelDiagnostic[] }> {
+    const read = await this.read(input.path);
+    if (!read.frontmatter && read.error) {
+      return {
+        valid: false,
+        value: null,
+        diagnostics: [{ code: read.error.code, message: read.error.message, expression: input.expression }],
+      };
+    }
+    const types = read.types ?? [];
+    let links: MdbaseCelLinks | undefined;
+    try {
+      if (mdbaseCelFacts(input.expression).needsLinkGraph) {
+        const files = await this.scanFiles();
+        links = await this.buildCelLinks(files, await this.buildFileCache(files) as Map<string, IndexedReadResult>);
+      }
+    } catch {
+      // A parse error is reported by evaluateMdbaseCel below.
+    }
+    const temporal = { now: new Date(), timezone: input.timezone ?? this.config.settings.timezone ?? "UTC" };
+    const result = evaluateMdbaseCel(input.expression, {
+      temporal,
+      record: read.frontmatter ?? {},
+      raw: read.rawFrontmatter ?? read.frontmatter ?? {},
+      file: { ...(read.file ?? {}), path: input.path, body: read.body ?? "" },
+      links,
+      ...celTypeFacts(types, this.typeDefs),
+    });
+    const compileError = result.diagnostics.some((diagnostic) => diagnostic.code === "expression_compile_error");
+    return { valid: !compileError, value: result.value, diagnostics: result.diagnostics };
   }
 
   /** Discover valid canonical saved-view records. */
@@ -2997,7 +3140,7 @@ fields:
     if (scope === "collection") return true;
     if (scope === "type") return fileTypes.includes(typeName);
     if (scope === "path_glob") {
-      return typeof rule.path_glob === "string" && picomatch(rule.path_glob, { dot: true })(relativePath);
+      return typeof rule.path_glob === "string" && this.globMatches(rule.path_glob, relativePath);
     }
     return false;
   }
@@ -3056,10 +3199,10 @@ fields:
       }
     }
 
-    // Check id_field uniqueness
+    // Check id_field uniqueness (v0.2 only; see checkCrossFileConstraints).
     const idField = this.config.settings.id_field;
     const myIdValue = frontmatter[idField];
-    if (myIdValue !== null && myIdValue !== undefined) {
+    if (this.config.spec_profile !== "v0.3" && myIdValue !== null && myIdValue !== undefined) {
       for (const [otherPath, otherFm] of otherFiles) {
         const otherValue = otherFm[idField];
         if (otherValue !== null && otherValue !== undefined &&
@@ -3864,7 +4007,7 @@ fields:
           this.config.settings.write_empty_lists,
         );
         const fullPath = path.join(this.root, upd.path);
-        await fs.promises.writeFile(fullPath, content);
+        await writeFileAtomic(fullPath, content);
         await this.updateCacheForPath(upd.path);
         succeeded++;
       } catch {
@@ -4653,11 +4796,14 @@ export class V03Operations {
   constructor(private readonly collection: Collection) {}
 
   async read(input: V03ReadInput): Promise<V03OperationResult> {
-    return await this.normalize("read", input, await this.collection.read(input.path));
+    return await this.withRecordValidation("read", await this.normalize("read", input, await this.collection.read(input.path)));
   }
 
   async validate(input: V03ValidateInput = {}): Promise<V03OperationResult> {
-    return await this.normalize("validate", input, await this.collection.validate(input.path));
+    const result = await this.normalize("validate", input, await this.collection.validate(input.path));
+    const types = input.path ? (await this.collection.read(input.path)).types ?? [] : undefined;
+    const unsupported = this.collection.unsupportedFeatureDiagnostics(types);
+    return unsupported.length === 0 ? result : { ...result, diagnostics: [...result.diagnostics, ...unsupported] };
   }
 
   async query(input: CanonicalQueryInput): Promise<V03OperationResult> {
@@ -4721,11 +4867,100 @@ export class V03Operations {
   }
 
   async create(input: V03CreateInput): Promise<V03OperationResult> {
-    return await this.normalize("create", input, await this.collection.create(input));
+    return await this.withRecordValidation("create", await this.normalize("create", input, await this.collection.create(input)));
+  }
+
+  /**
+   * Apply create, update, delete, and rename operations as one request
+   * (spec Chapter 12, "Batch"). Atomic batches and dry runs prepare every
+   * operation against a staged copy of the collection.
+   */
+  async batch(input: V03BatchInput): Promise<V03OperationResult> {
+    const invalid = batchRequestError(input);
+    if (invalid) return { valid: false, result: {}, diagnostics: [invalid] };
+    const dryRun = input.dry_run === true;
+    if (input.allow_partial === true && !dryRun) {
+      return batchEnvelope(await this.runBatchItems(input.operations), false, false);
+    }
+
+    const staged = await stageCollection(this.collection.rootPath, {
+      isRecordFile: (relativePath) => this.collection.isRecordFile(relativePath),
+    });
+    try {
+      const opened = await Collection.open(staged.root, { skipTypePackRecovery: true });
+      if (!opened.collection) {
+        return {
+          valid: false,
+          result: {},
+          diagnostics: [{ severity: "error", code: opened.error?.code ?? "invalid_config", message: opened.error?.message ?? "Failed to stage the collection." }],
+        };
+      }
+      let items: Record<string, unknown>[];
+      try {
+        items = await opened.collection.v03Operations().runBatchItems(input.operations);
+      } finally {
+        await opened.collection.close();
+      }
+      const failed = items.some((item) => item.valid !== true);
+      if (dryRun || (failed && input.allow_partial !== true)) {
+        return batchEnvelope(items, true, dryRun);
+      }
+      const conflict = await commitStagedChanges(this.collection.rootPath, staged, await stagedChanges(staged));
+      this.collection.refreshAfterExternalWrites();
+      if (conflict) {
+        return { ...batchEnvelope(items, true, false), valid: false, diagnostics: [conflict] };
+      }
+      return batchEnvelope(items, false, false);
+    } finally {
+      await staged.cleanup();
+    }
+  }
+
+  /** Run batch items in request order against this collection. */
+  async runBatchItems(operations: V03BatchItem[]): Promise<Record<string, unknown>[]> {
+    const items: Record<string, unknown>[] = [];
+    for (const [index, { kind, input }] of operations.entries()) {
+      let outcome: V03OperationResult;
+      try {
+        outcome = await this.runBatchItem(kind, input);
+      } catch (error) {
+        if (!(error instanceof V03ProfileError)) throw error;
+        outcome = { valid: false, result: {}, diagnostics: [error.diagnostic] };
+      }
+      items.push({ index, kind, valid: outcome.valid, result: outcome.result, diagnostics: outcome.diagnostics });
+    }
+    return items;
+  }
+
+  private async runBatchItem(kind: V03BatchItem["kind"], input: Record<string, unknown>): Promise<V03OperationResult> {
+    switch (kind) {
+      case "create":
+        return await this.create(input as V03CreateInput);
+      case "update":
+        return await this.update(input as unknown as V03UpdateInput);
+      case "delete":
+        return await this.delete(input as unknown as V03DeleteInput);
+      case "rename":
+        return await this.rename(input as unknown as V03RenameInput);
+    }
   }
 
   async update(input: V03UpdateInput): Promise<V03OperationResult> {
-    return await this.normalize("update", input, await this.collection.update(input));
+    const invalid = invalidV03Update(input);
+    if (invalid) {
+      return {
+        valid: false,
+        result: {},
+        diagnostics: [{ severity: "error", code: "invalid_request", message: invalid, path: input.path }],
+      };
+    }
+    return await this.withRecordValidation("update", await this.normalize("update", input, await this.collection.update({
+      path: input.path,
+      fields: input.patch,
+      unset: input.unset,
+      body: input.body,
+      if_revision: input.if_revision,
+    })));
   }
 
   async delete(input: V03DeleteInput): Promise<V03OperationResult> {
@@ -4740,7 +4975,33 @@ export class V03Operations {
   }
 
   async rename(input: V03RenameInput): Promise<V03OperationResult> {
-    return await this.normalize("rename", input, await this.collection.rename(input));
+    return await this.withRecordValidation("rename", await this.normalize("rename", input, await this.collection.rename(input)));
+  }
+
+  /**
+   * Attach record validation issues at the configured level (spec Chapter 04,
+   * "Validation Levels"): reads report them at `warn` and `error`, and writes,
+   * which already fail at `error`, report them as warnings at `warn`.
+   */
+  private async withRecordValidation(
+    operation: "read" | "create" | "update" | "rename",
+    envelope: V03OperationResult,
+  ): Promise<V03OperationResult> {
+    const level = this.collection.validationLevel;
+    const recordPath = envelope.result.path;
+    if (!envelope.valid || level === "off" || typeof recordPath !== "string") return envelope;
+    if (operation !== "read" && level !== "warn") return envelope;
+    const validated = await this.collection.validate(recordPath);
+    const severity = level === "warn" ? "warning" : "error";
+    const issues = collectV03Diagnostics(validated as unknown as Record<string, unknown>, recordPath)
+      .filter((diagnostic) => diagnostic.severity !== "info")
+      .map((diagnostic) => ({ ...diagnostic, severity }) as V03Diagnostic);
+    const diagnostics = deduplicateV03Diagnostics([...envelope.diagnostics, ...issues]);
+    return {
+      ...envelope,
+      valid: !diagnostics.some((diagnostic) => diagnostic.severity === "error"),
+      diagnostics,
+    };
   }
 
   private async normalize(
@@ -5017,4 +5278,56 @@ function sameStringSet(left: string[], right: string[]): boolean {
 async function computeRevision(filePath: string): Promise<string> {
   const content = await fs.promises.readFile(filePath);
   return `sha256:${createHash("sha256").update(content).digest("hex")}`;
+}
+
+/** Reject v0.3 update inputs that cannot be applied unambiguously (spec Chapter 12). */
+function invalidV03Update(input: V03UpdateInput): string | undefined {
+  const members = input as unknown as Record<string, unknown>;
+  for (const alias of ["fields", "frontmatter"]) {
+    if (members[alias] !== undefined) {
+      return `update takes patch and unset; '${alias}' is not a v0.3 update member`;
+    }
+  }
+  if (input.unset === undefined) return undefined;
+  if (!Array.isArray(input.unset) || !input.unset.every((reference) => typeof reference === "string")) {
+    return "unset must be an array of field references";
+  }
+  for (const reference of input.unset) {
+    const segments = parseFieldReference(reference);
+    if (!segments) return `Invalid field reference '${reference}'`;
+    if (segments.some((segment) => segment.each)) return `Cannot unset array items through '${reference}'`;
+    if (input.patch && Object.prototype.hasOwnProperty.call(input.patch, segments[0].key)) {
+      return `unset '${reference}' overlaps a key set by patch`;
+    }
+  }
+  return undefined;
+}
+
+function batchEnvelope(items: Record<string, unknown>[], preflight: boolean, dryRun: boolean): V03OperationResult {
+  const succeeded = items.filter((item) => item.valid === true).length;
+  return {
+    valid: succeeded === items.length,
+    result: { operations: items, succeeded, failed: items.length - succeeded, preflight, dry_run: dryRun },
+    diagnostics: items.flatMap((item) => item.diagnostics as V03Diagnostic[]),
+  };
+}
+
+/**
+ * Replace a file through a temporary sibling and a rename, keeping the
+ * existing file mode. Readers never see a partial file, and a batch staged
+ * with hard links never writes through to the original file.
+ */
+async function writeFileAtomic(target: string, content: string | Uint8Array): Promise<void> {
+  const mode = await fs.promises.stat(target).then((stat) => stat.mode, () => undefined);
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.mdbase-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  try {
+    await fs.promises.writeFile(temporary, content, mode === undefined ? undefined : { mode });
+    await fs.promises.rename(temporary, target);
+  } catch (error) {
+    await fs.promises.rm(temporary, { force: true });
+    throw error;
+  }
 }

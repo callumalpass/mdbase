@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-import { mkdtemp, mkdir, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { stringify } from "yaml";
@@ -9,7 +9,7 @@ import { Collection } from "../dist/index.js";
 const implementation = {
   id: "mdbase-ts",
   name: "mdbase TypeScript implementation",
-  version: "0.3.0-rc.5",
+  version: JSON.parse(await readFile(new URL("../package.json", import.meta.url), "utf8")).version,
   language: "TypeScript",
   target: "Node.js"
 };
@@ -22,7 +22,7 @@ if (command === "describe") {
     kind: "mdbase.testbed.adapter",
     protocol_version: "0.1",
     implementation,
-    profiles: ["core_read"],
+    profiles: ["data_contracts"],
     roles: ["contract_store", "record_consumer"],
     scenarios: [scenarioId]
   });

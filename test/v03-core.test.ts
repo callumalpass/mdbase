@@ -29,6 +29,116 @@ async function open(root: string): Promise<Collection> {
 }
 
 describe("v0.3 core", () => {
+  it("stages atomic batches outside the collection and leaves originals intact until commit", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "notes/a.md", "---\ntitle: A\n---\n");
+    await write(root, "notes/b.md", "---\ntitle: B\n---\n");
+    const collection = await open(root);
+    try {
+      const before = await fs.stat(path.join(root, "notes/a.md"));
+      const failed = await collection.v03Operations().batch({
+        operations: [
+          { kind: "update", input: { path: "notes/a.md", patch: { title: "A2" } } },
+          { kind: "update", input: { path: "notes/missing.md", patch: { title: "X" } } },
+        ],
+      });
+      expect(failed.valid).toBe(false);
+      expect(failed.result.preflight).toBe(true);
+      // Preparation neither touched the original nor left anything in the collection.
+      const after = await fs.stat(path.join(root, "notes/a.md"));
+      expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+      expect(await fs.readFile(path.join(root, "notes/a.md"), "utf8")).toBe("---\ntitle: A\n---\n");
+      expect(fsSync.existsSync(path.join(root, ".mdbase", "batch-staging"))).toBe(false);
+
+      const committed = await collection.v03Operations().batch({
+        operations: [
+          { kind: "update", input: { path: "notes/a.md", patch: { title: "A2" } } },
+          { kind: "delete", input: { path: "notes/b.md" } },
+        ],
+      });
+      expect(committed.valid).toBe(true);
+      expect(await fs.readFile(path.join(root, "notes/a.md"), "utf8")).toContain("title: A2");
+      expect(fsSync.existsSync(path.join(root, "notes/b.md"))).toBe(false);
+    } finally {
+      await collection.close();
+    }
+  });
+
+  it("warns that collection projections are unsupported instead of ignoring them", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "_types/task.md", `---
+kind: mdbase.type
+name: task
+version: 1
+match:
+  path_glob: "tasks/**/*.md"
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+collection:
+  projections:
+    is_overdue:
+      expr: 'due != null && due < today()'
+---
+`);
+    await write(root, "tasks/a.md", "---\ntitle: A\n---\n");
+    await write(root, "notes/b.md", "---\ntitle: B\n---\n");
+    const collection = await open(root);
+    try {
+      const operations = collection.v03Operations();
+      const expected = {
+        severity: "warning",
+        code: "unsupported_feature",
+        path: "_types/task.md",
+        type: "task",
+        details: { feature: "collection_projections" },
+      };
+      expect((await operations.validate()).diagnostics).toContainEqual(expect.objectContaining(expected));
+      const record = await operations.validate({ path: "tasks/a.md" });
+      expect(record.valid).toBe(true);
+      expect(record.diagnostics).toContainEqual(expect.objectContaining(expected));
+      expect((await operations.validate({ path: "notes/b.md" })).diagnostics).toEqual([]);
+    } finally {
+      await collection.close();
+    }
+  });
+
+  it("resolves links relative to the record they were read from", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "projects/alpha.md", '---\nlead: "[Bob](people/bob.md)"\nrelated: ["[[./beta]]"]\n---\nSee [the plan](plan.md) and [[projects/beta|Beta]].\n');
+    await write(root, "projects/plan.md", "---\ntitle: Plan\n---\n");
+    await write(root, "projects/beta.md", "---\ntitle: Beta\n---\n");
+    await write(root, "projects/people/bob.md", "---\nname: Bob\n---\n");
+    await write(root, "tasks/t1.md", '---\nproject: "[[alpha]]"\n---\n');
+    const collection = await open(root);
+    try {
+      const evaluate = async (expression: string) =>
+        (await collection.evaluateCel({ path: "tasks/t1.md", expression })).value;
+      // A link read from an asFile() result resolves relative to that target.
+      expect(await evaluate("project.asFile().lead.asFile().name")).toBe("Bob");
+      expect(await evaluate("project.asFile().related.map(r, r.asFile().file.path)")).toEqual(["projects/beta.md"]);
+      expect(await evaluate('project.asFile().file.hasLink(link(project.asFile().related[0]))')).toBe(true);
+      expect(await evaluate('project.asFile().file.links.exists(l, l.asFile().title == "Plan")')).toBe(true);
+      // file.links holds link values that resolve as the originals did.
+      expect(await evaluate("project.asFile().file.links")).toEqual(["./beta", "[[projects/beta]]", "./plan.md"]);
+      expect(await evaluate('project.asFile().file.links.map(l, l.asFile() == null ? "" : l.asFile().file.path)'))
+        .toEqual(["projects/beta.md", "projects/beta.md", "projects/plan.md"]);
+
+      const query = await collection.queryCanonical({
+        context: { this: { path: "projects/alpha.md" } },
+        where: 'file.inFolder("tasks") && this.related.exists(r, r.asFile().title == "Beta")',
+        select: [{ name: "lead", expr: "this.lead.asFile().name" }],
+      } as never);
+      expect(query.results.map((result) => result.values)).toEqual([{ lead: "Bob" }]);
+    } finally {
+      await collection.close();
+    }
+  });
+
   it("initializes a minimal v0.3 collection by default", async () => {
     const root = await tempCollection();
     const result = await Collection.init(root, {
@@ -179,7 +289,7 @@ lifecycle:
 
       const updated = await operations.update({
         path: "notes/one.md",
-        fields: { status: "done" },
+        patch: { status: "done" },
         if_revision: String(created.result.revision),
       });
       expect(updated.valid).toBe(true);
@@ -371,7 +481,7 @@ name: open_task
 version: 1
 match:
   expr:
-    $expr: 'status == "open" && present.raw.status'
+    $expr: 'status == "open" && has(raw.status)'
 schema:
   dialect: json-schema-2020-12
   value:
@@ -503,8 +613,8 @@ lifecycle:
     expect(String(statusChange.frontmatter?.dateModified)).not.toBe(firstModified);
   });
 
-  it("exposes v0.3 CEL presence maps for raw and effective records", () => {
-    const result = evaluateMdbaseCel("present.raw.status == false && present.record.status", {
+  it("tests raw and effective presence with has()", () => {
+    const result = evaluateMdbaseCel("!has(raw.status) && has(record.status) && missing == null", {
       raw: { title: "A" },
       record: { title: "A", status: "open" },
     });
@@ -1105,51 +1215,6 @@ schema:
     expect(opened.error?.code).toBe("unsupported_profile");
   });
 
-  it("loads and filters v0.3 type migration metadata", async () => {
-    const root = await tempCollection();
-    await write(root, "mdbase.yaml", `spec_version: "0.3.0"
-settings:
-  validation: error
-`);
-    await write(root, "_types/task.md", `---
-kind: mdbase.type
-name: task
-version: 2
-schema:
-  dialect: json-schema-2020-12
-  value:
-    type: object
-migrations:
-  - from: 0
-    to: 1
-    description: Convert v0 fields to JSON Schema shape
-    steps:
-      - move_default:
-          from: fields.status.default
-          to: collection.read_defaults.status
-  - from: 1
-    to: 2
-    action: tasknotes.type.upgrade
----
-`);
-
-    const collection = await open(root);
-    const all = collection.listTypeMigrations({ type: "TASK" });
-    expect(all).toHaveLength(2);
-    expect(all[0]).toMatchObject({
-      type: "task",
-      source_path: "_types/task.md",
-      migration: { from: 0, to: 1 },
-    });
-    expect(collection.listTypeMigrations({ type: "task", from: 1 })).toEqual([
-      {
-        type: "task",
-        source_path: "_types/task.md",
-        migration: { from: 1, to: 2, action: "tasknotes.type.upgrade" },
-      },
-    ]);
-  });
-
   it("migrates the TaskNotes v0.2 fixture into a loadable v0.3 type file", async () => {
     const source = "/home/calluma/projects/mdbase-spec/examples/v0.3/tasknotes-migration/current-v0.2/_types/task.md";
     if (!fsSync.existsSync(source)) {
@@ -1247,7 +1312,7 @@ settings:
     );
   });
 
-  it("rejects invalid v0.3 type migration metadata", async () => {
+  it("rejects the removed v0.3 type migrations section", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", `spec_version: "0.3.0"
 settings:
@@ -1265,15 +1330,13 @@ migrations:
   - from: 0
     to: 1
     action: tasknotes.type.upgrade
-    steps:
-      - noop: true
 ---
 `);
 
     const opened = await Collection.open(root);
     expect(opened.collection).toBeUndefined();
     expect(opened.error?.code).toBe("invalid_type_definition");
-    expect(opened.error?.message).toContain("exactly one of steps or action");
+    expect(opened.error?.message).toContain('unknown top-level key "migrations"');
   });
 
   it("rejects typoed v0.3 type-file keys", async () => {
@@ -1425,7 +1488,7 @@ id: temporal.views
 version: 1
 name: Temporal
 query:
-  where: date(scheduled) == '2026-08-05'
+  where: date(timestamp(scheduled)) == '2026-08-05'
 views:
   - id: local-day
     name: Local day
@@ -1434,12 +1497,12 @@ views:
     const collection = await open(root);
     const melbourne = await collection.queryCanonical({
       timezone: "Australia/Melbourne",
-      where: "date(scheduled) == '2026-08-06'",
+      where: "date(timestamp(scheduled)) == '2026-08-06'",
     });
     expect(melbourne.meta.total_count).toBe(1);
     const losAngeles = await collection.queryCanonical({
       timezone: "America/Los_Angeles",
-      where: "date(scheduled) == '2026-08-05'",
+      where: "date(timestamp(scheduled)) == '2026-08-05'",
     });
     expect(losAngeles.meta.total_count).toBe(1);
     expect((await collection.executeView({

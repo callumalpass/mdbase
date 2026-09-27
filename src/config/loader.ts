@@ -244,6 +244,15 @@ export async function loadConfigAsync(
     spec_profile: isLegacyV02 ? "v0.2" : "v0.3",
     settings: settingsResult.settings!,
   };
+  if (config.spec_profile === "v0.3") {
+    // A null patch value persists an explicit null; `unset` removes keys.
+    config.settings.write_nulls = "explicit";
+    // v0.3 validates records at error level unless configured otherwise.
+    if (rawSettings?.validation === undefined && rawSettings?.default_validation === undefined &&
+      rawConfig.default_validation === undefined) {
+      config.settings.default_validation = "error";
+    }
+  }
 
   // Support top-level id_field shorthand
   if (rawConfig.id_field !== undefined && !(rawSettings && rawSettings.id_field !== undefined)) {

@@ -6,6 +6,9 @@ import {
   evaluateMdbaseCel,
   validateMdbaseCelSyntax,
   type MdbaseCelTemporalContext,
+  mdbaseCelFacts,
+  type MdbaseCelLinks,
+  MDBASE_CEL_RESERVED_NAMES,
 } from "../expressions/cel.js";
 import { querySchema, viewSchema } from "../generated/v03-schemas.js";
 import type { TypeDefinition } from "../types/loader.js";
@@ -129,6 +132,33 @@ export interface CanonicalQueryDeps {
   read: (relativePath: string) => Promise<IndexedReadResult>;
   buildFileCache?: (files: string[]) => Promise<Map<string, IndexedReadResult>>;
   timezone?: string;
+  /** Link host for `asFile()`, `hasLink()`, and `file.backlinks`. */
+  celLinks?: (files: string[], fileCache: Map<string, IndexedReadResult>) => Promise<MdbaseCelLinks>;
+}
+
+/** CEL typing and link facts that depend on a record's matched types. */
+export interface CelTypeFacts {
+  dateTimeFields: string[];
+  declaredLinkSelectors: string[];
+}
+
+export function celTypeFacts(types: string[], typeDefs: Map<string, TypeDefinition>): CelTypeFacts {
+  const definitions = types
+    .map((name) => typeDefs.get(name) ?? typeDefs.get(name.toLowerCase()))
+    .filter((definition): definition is TypeDefinition => definition !== undefined);
+  const properties = definitions.map((definition) => {
+    const value = definition.schema?.value?.properties;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? value as Record<string, { format?: unknown }>
+      : {};
+  });
+  const dateTimeFields = definitions.length === 0
+    ? []
+    : Object.keys(properties[0]).filter((field) =>
+      properties.every((schema) => schema[field]?.format === "date-time"));
+  const declaredLinkSelectors = [...new Set(definitions.flatMap((definition) =>
+    Object.keys(definition.collection?.links ?? {})))].sort();
+  return { dateTimeFields, declaredLinkSelectors };
 }
 
 export interface CanonicalViewDeps {
@@ -155,7 +185,8 @@ interface CandidateRow {
   types: string[];
   body: string;
   projection: Record<string, unknown>;
-  knownFields: string[];
+  typeFacts: CelTypeFacts;
+  links?: MdbaseCelLinks;
   values?: Record<string, unknown>;
 }
 
@@ -466,6 +497,21 @@ function buildViewQuery(
   };
 }
 
+function queryNeedsLinks(input: CanonicalQueryInput): boolean {
+  const expressions = [
+    input.where,
+    ...Object.values(input.projections ?? {}).map((projection) => projection.expr),
+    ...(input.select ?? []).map((selection) => typeof selection === "string" ? undefined : selection.expr),
+  ].filter((expression): expression is string => typeof expression === "string");
+  return expressions.some((expression) => {
+    try {
+      return mdbaseCelFacts(expression).needsLinkGraph;
+    } catch {
+      return false;
+    }
+  });
+}
+
 export async function executeCanonicalQuery(
   input: CanonicalQueryInput,
   deps: CanonicalQueryDeps,
@@ -498,6 +544,9 @@ export async function executeCanonicalQuery(
   const fileCache = deps.buildFileCache
     ? await deps.buildFileCache(files)
     : await buildFileCache(files, deps.read);
+  const links = deps.celLinks && queryNeedsLinks(input)
+    ? await deps.celLinks(files, fileCache)
+    : undefined;
   const diagnostics: CanonicalDiagnostic[] = [];
   const candidates: CandidateRow[] = [];
 
@@ -509,7 +558,7 @@ export async function executeCanonicalQuery(
 
     const effective = readResult.frontmatter ?? {};
     const raw = readResult.rawFrontmatter ?? effective;
-    const knownFields = getKnownFieldNames(types, deps.typeDefs, effective, raw);
+    const typeFacts = celTypeFacts(types, deps.typeDefs);
     const file = buildFileBinding(
       (readResult as Record<string, unknown>).file as Record<string, unknown> | undefined,
       relativePath,
@@ -524,7 +573,8 @@ export async function executeCanonicalQuery(
         temporal,
         record: effective,
         raw,
-        knownFields,
+        ...typeFacts,
+        links,
         file,
         thisRecord: contextRecord?.binding ?? null,
         projection,
@@ -546,7 +596,8 @@ export async function executeCanonicalQuery(
         temporal,
         record: effective,
         raw,
-        knownFields,
+        ...typeFacts,
+        links,
         file,
         thisRecord: contextRecord?.binding ?? null,
         projection,
@@ -573,7 +624,8 @@ export async function executeCanonicalQuery(
       types,
       body: readResult.body ?? "",
       projection,
-      knownFields,
+      typeFacts,
+      links,
     };
     if (input.select) {
       row.values = evaluateSelection(input.select, row, contextRecord, temporal, diagnostics);
@@ -712,44 +764,15 @@ async function readContext(
     read.body,
     effective,
   );
-  const known = new Set(getKnownFieldNames(types, deps.typeDefs, effective, raw));
   const binding = {
     ...Object.fromEntries(
-      [...known]
-        .filter((field) => !Object.prototype.hasOwnProperty.call(effective, field))
-        .map((field) => [field, null]),
+      Object.entries(effective).filter(([key]) => !MDBASE_CEL_RESERVED_NAMES.has(key)),
     ),
-    ...effective,
     record: effective,
-    note: effective,
     raw,
-    present: {
-      record: presenceMap(effective, known),
-      raw: presenceMap(raw, known),
-    },
     file,
   };
   return { path, effective, raw, file, types, binding };
-}
-
-function getKnownFieldNames(
-  types: string[],
-  typeDefs: Map<string, TypeDefinition>,
-  effective: Record<string, unknown>,
-  raw: Record<string, unknown>,
-): string[] {
-  const fields = new Set([...Object.keys(effective), ...Object.keys(raw)]);
-  for (const typeName of types) {
-    const typeDef = typeDefs.get(typeName) ?? typeDefs.get(typeName.toLowerCase());
-    for (const name of Object.keys(typeDef?.fields ?? {})) fields.add(name);
-    const properties = typeDef?.schema?.value?.properties;
-    if (properties && typeof properties === "object" && !Array.isArray(properties)) {
-      for (const name of Object.keys(properties)) fields.add(name);
-    }
-    for (const name of Object.keys(typeDef?.collection?.read_defaults ?? {})) fields.add(name);
-    for (const name of Object.keys(typeDef?.collection?.projections ?? {})) fields.add(name);
-  }
-  return [...fields];
 }
 
 function buildFileBinding(
@@ -763,16 +786,6 @@ function buildFileBinding(
     ? tagsValue.map(String)
     : typeof tagsValue === "string" ? [tagsValue] : [];
   return { ...(file ?? {}), path, body: body ?? "", tags };
-}
-
-function presenceMap(
-  value: Record<string, unknown>,
-  keys: Set<string>,
-): Record<string, boolean> {
-  return Object.fromEntries([...keys].map((key) => [
-    key,
-    Object.prototype.hasOwnProperty.call(value, key),
-  ]));
 }
 
 function orderProjectionNames(
@@ -900,7 +913,8 @@ function evaluateSelection(
       temporal,
       record: row.effective,
       raw: row.raw,
-      knownFields: row.knownFields,
+      ...row.typeFacts,
+      links: row.links,
       file: row.file,
       thisRecord: context?.binding ?? null,
       projection: row.projection,

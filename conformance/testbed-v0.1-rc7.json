@@ -1,0 +1,20 @@
+{
+  "kind": "mdbase.testbed.evidence",
+  "protocol_version": "0.1",
+  "implementation": {
+    "id": "mdbase-ts",
+    "name": "mdbase TypeScript implementation",
+    "version": "0.3.0-rc.7",
+    "language": "TypeScript",
+    "target": "Node.js"
+  },
+  "result": "pass",
+  "scenarios": [
+    {
+      "id": "core.shared-contract-consumers",
+      "profile": "data_contracts",
+      "result": "pass",
+      "transcript_digest": "sha256:5853cbb460eee2ab7ea41d10d5516465f77b10dca34e8e25d16baecf5a16085e"
+    }
+  ]
+}

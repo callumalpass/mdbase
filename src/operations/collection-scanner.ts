@@ -1,6 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import picomatch from "picomatch";
+import { portableGlobMatch } from "../path-glob.js";
 
 export interface CollectionScannerOptions {
   root: string;
@@ -11,7 +12,12 @@ export interface CollectionScannerOptions {
   contractsFolder: string;
   cacheFolder: string;
   migrationsFolder: string;
+  /** v0.3 discovery uses built-in exclusions and portable globs (spec Chapter 02). */
+  specProfile?: "v0.2" | "v0.3";
 }
+
+/** Directory names that v0.3 discovery never enters, besides dot-prefixed ones. */
+const V03_BUILTIN_EXCLUDED_NAMES = new Set(["node_modules"]);
 
 /** Filesystem traversal and collection-boundary policy for a collection. */
 export class CollectionScanner {
@@ -20,10 +26,13 @@ export class CollectionScanner {
   private readonly recordExtensions: Set<string>;
   private readonly reservedFolders: string[];
   private readonly excludeMatchers: Array<(candidate: string) => boolean>;
+  private readonly builtinExclusions: boolean;
 
   constructor(options: CollectionScannerOptions) {
     this.root = options.root;
-    this.includeSubfolders = options.includeSubfolders;
+    const v03 = options.specProfile === "v0.3";
+    this.builtinExclusions = v03;
+    this.includeSubfolders = v03 || options.includeSubfolders;
     this.recordExtensions = new Set(options.recordExtensions);
     this.reservedFolders = [
       options.typesFolder,
@@ -31,21 +40,29 @@ export class CollectionScanner {
       options.cacheFolder,
       options.migrationsFolder,
     ];
-    this.excludeMatchers = options.exclude.flatMap((pattern) => {
-      if (!pattern.includes("/") && !pattern.includes("*") && !pattern.includes("?")) {
-        return [
-          picomatch(pattern, { dot: true }),
-          picomatch(`${pattern}/**`, { dot: true }),
-        ];
-      }
-      if (!pattern.includes("/")) {
-        return [picomatch(pattern, { dot: true, matchBase: true })];
-      }
-      return [picomatch(pattern, { dot: true })];
-    });
+    this.excludeMatchers = v03
+      ? options.exclude.map((pattern) => (candidate: string) => portableGlobMatch(pattern, candidate))
+      : options.exclude.flatMap((pattern) => {
+        if (!pattern.includes("/") && !pattern.includes("*") && !pattern.includes("?")) {
+          return [
+            picomatch(pattern, { dot: true }),
+            picomatch(`${pattern}/**`, { dot: true }),
+          ];
+        }
+        if (!pattern.includes("/")) {
+          return [picomatch(pattern, { dot: true, matchBase: true })];
+        }
+        return [picomatch(pattern, { dot: true })];
+      });
   }
 
   isExcluded(relativePath: string): boolean {
+    if (
+      this.builtinExclusions &&
+      relativePath.split("/").some((name) => name.startsWith(".") || V03_BUILTIN_EXCLUDED_NAMES.has(name))
+    ) {
+      return true;
+    }
     if (this.excludeMatchers.some((matcher) => matcher(relativePath))) return true;
     return this.reservedFolders.some((folder) =>
       relativePath === folder || relativePath.startsWith(`${folder}/`),

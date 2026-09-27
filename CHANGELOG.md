@@ -2,6 +2,32 @@
 
 ## Unreleased
 
+## 0.3.0-rc.7 - 2026-09-27
+
+Implements mdbase spec v0.3.0-rc.4.
+
+- Evaluate expressions with standard CEL (`@marcbachmann/cel-js`): missing
+  fields are null, selection on null is an error, optional types, `has()`,
+  string dates with the date helpers, and `lower()`/`upper()`.
+- Resolve links relative to the record they were read from, including `this`
+  and `asFile()` results; `file.links` holds alias-free link values.
+- Update takes `patch` and `unset`; the `fields` and `frontmatter` aliases are
+  rejected. Structured updates refuse non-mapping frontmatter.
+- Add atomic batches with `allow_partial` and `dry_run`, staged outside the
+  collection and committed under a recovery journal. Record writes replace
+  files atomically.
+- Validation defaults to `error`; reads report record issues at the configured
+  level and warn-level writes report warnings.
+- Ordered lifecycle actions with typed guards; `on_delete`, `on_rename`, and
+  type-file `migrations` are rejected.
+- v0.3 discovery: built-in exclusions, portable globs, no `include_subfolders`.
+  Wikilinks resolve by ID only when `id_field` is configured.
+- Version requirements for `implements`, display-free implementation digests,
+  one implementation per contract ID, and `unsupported_feature` warnings for
+  collection projections.
+- v0.2 configuration migration follows spec Chapter 13.
+- Claim the `data_contracts` and `type_packs` profiles.
+
 ## 0.3.0-rc.6 - 2026-09-14
 
 - Use ordinary deterministic link resolution for rename references instead of

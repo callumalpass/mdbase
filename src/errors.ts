@@ -97,6 +97,7 @@ export interface MdbaseError {
   column?: number;
   end_line?: number;
   end_column?: number;
+  details?: Record<string, unknown>;
 }
 
 export interface ValidationResult {
