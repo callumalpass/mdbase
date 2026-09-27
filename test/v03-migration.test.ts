@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { load } from "js-yaml";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   analyzeV02CollectionMigration,
@@ -88,6 +89,31 @@ describe("v0.2 to v0.3 collection migration", () => {
     expect(first.proposedFiles?.["_types/note.md"]).toContain("fields.slug.plugin_hint: keep-me");
     expect(first.proposedFiles?.["mdbase.yaml"]).toContain("custom_config_value: keep-me");
     expect(first.proposedFiles?.["mdbase.yaml"]).toContain("custom_setting: 42");
+  });
+
+  it("translates v0.2 discovery and default settings into v0.3 configuration", async () => {
+    const root = await makeCollection();
+    await writeFile(path.join(root, "mdbase.yaml"), `spec_version: "0.2.1"
+settings:
+  include_subfolders: false
+  default_strict: true
+  exclude: [".git", "node_modules", archive, "*.draft.md", "drafts/**", "{a,b}/x"]
+`);
+
+    const analysis = await analyzeV02CollectionMigration(root);
+
+    expect(analysis.valid).toBe(true);
+    const config = load(analysis.proposedFiles!["mdbase.yaml"]!) as Record<string, any>;
+    expect(config.settings).toEqual({
+      exclude: ["archive/**", "**/*.draft.md", "drafts/**", "{a,b}/x", "*/**"],
+      record_extensions: ["md"],
+      validation: "warn",
+      id_field: "id",
+    });
+    expect(config["x-legacy-v0.2"].settings).toEqual({ default_strict: true });
+    expect(analysis.report?.warnings).toContainEqual(
+      expect.objectContaining({ code: "non_portable_exclude", field: "settings.exclude" }),
+    );
   });
 
   it("backs up and atomically applies an analyzed migration, then rejects re-application", async () => {

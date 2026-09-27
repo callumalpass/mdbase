@@ -95,23 +95,16 @@ const KNOWN_CONFIG_KEYS = new Set([
   "id_field",
   "default_validation",
 ]);
-const KNOWN_SETTINGS_KEYS = new Set([
-  "record_extensions",
-  "extensions",
-  "exclude",
-  "include_subfolders",
+/** Settings with a v0.3 meaning; other v0.2 settings move under x-legacy-v0.2. */
+const V03_SETTINGS_KEYS = new Set([
   "types_folder",
-  "migrations_folder",
-  "explicit_type_keys",
-  "default_validation",
-  "default_strict",
-  "id_field",
-  "write_nulls",
-  "write_empty_lists",
-  "write_defaults",
-  "rename_update_refs",
-  "cache_folder",
+  "contracts_folder",
+  "record_extensions",
   "validation",
+  "explicit_type_keys",
+  "id_field",
+  "exclude",
+  "timezone",
 ]);
 
 export async function analyzeV02CollectionMigration(
@@ -148,7 +141,8 @@ export async function analyzeV02CollectionMigration(
   }
 
   const proposedFiles: Record<string, string | null> = {};
-  const targetConfig = migrateConfig(rawConfig);
+  const warnings: CollectionMigrationDiagnostic[] = [];
+  const targetConfig = migrateConfig(rawConfig, warnings);
   proposedFiles["mdbase.yaml"] = `${dump(targetConfig, { noRefs: true, lineWidth: 100, sortKeys: false }).trimEnd()}\n`;
 
   const settings = isPlainObject(rawConfig.settings) ? rawConfig.settings : {};
@@ -159,7 +153,6 @@ export async function analyzeV02CollectionMigration(
   const typeFiles = await findMarkdownFiles(path.join(root, typesFolder));
   const typeReports: TypeMigrationReport[] = [];
   const unsupported: Array<{ path: string; feature: string }> = [];
-  const warnings: CollectionMigrationDiagnostic[] = [];
   const generatedEvidence: CollectionMigrationReport["generated_file_evidence"] = [];
 
   for (const fullPath of typeFiles) {
@@ -462,7 +455,7 @@ export async function recoverV02CollectionMigration(
   return { valid: true, restored_paths: recovery.restored };
 }
 
-function migrateConfig(rawConfig: Dict): Dict {
+function migrateConfig(rawConfig: Dict, warnings: CollectionMigrationDiagnostic[]): Dict {
   const target = cloneJsonLike(rawConfig);
   target.spec_version = TARGET_VERSION;
   const settings = isPlainObject(target.settings) ? target.settings : {};
@@ -483,6 +476,33 @@ function migrateConfig(rawConfig: Dict): Dict {
   if (settings.id_field === undefined && target.id_field !== undefined) {
     settings.id_field = target.id_field;
   }
+  // v0.2 validated at warn level and resolved wikilinks by ID by default.
+  settings.validation ??= "warn";
+  settings.id_field ??= "id";
+
+  const typesFolder = typeof settings.types_folder === "string" ? settings.types_folder : "_types";
+  const exclude = (Array.isArray(settings.exclude) ? settings.exclude : [])
+    .map(String)
+    .flatMap((pattern) => migrateExcludePattern(pattern, typesFolder) ?? []);
+  for (const pattern of exclude) {
+    if (!isPortableGlob(pattern)) {
+      warnings.push({
+        code: "non_portable_exclude",
+        message: `exclude pattern "${pattern}" is not a portable v0.3 glob; review it`,
+        path: "mdbase.yaml",
+        field: "settings.exclude",
+        severity: "warning",
+      });
+    }
+  }
+  if (settings.include_subfolders === false) exclude.push("*/**");
+  delete settings.include_subfolders;
+  delete settings.default_validation;
+  if (exclude.length > 0) {
+    settings.exclude = exclude;
+  } else {
+    delete settings.exclude;
+  }
 
   const legacy: Dict = isPlainObject(target["x-legacy-v0.2"])
     ? cloneJsonLike(target["x-legacy-v0.2"] as Dict)
@@ -496,22 +516,41 @@ function migrateConfig(rawConfig: Dict): Dict {
   }
   const unknownSettings: Dict = {};
   for (const key of Object.keys(settings)) {
-    if (!KNOWN_SETTINGS_KEYS.has(key)) {
+    if (!V03_SETTINGS_KEYS.has(key)) {
       unknownSettings[key] = settings[key];
       delete settings[key];
     }
   }
-  if (settings.extensions !== undefined) {
-    unknownSettings.extensions = settings.extensions;
-    delete settings.extensions;
-  }
-  delete settings.default_validation;
   delete target.id_field;
   delete target.default_validation;
   if (Object.keys(unknownTop).length > 0) legacy.config = unknownTop;
   if (Object.keys(unknownSettings).length > 0) legacy.settings = unknownSettings;
   if (Object.keys(legacy).length > 0) target["x-legacy-v0.2"] = legacy;
   return target;
+}
+
+/**
+ * The portable glob that excludes what a v0.2 exclude pattern excluded, or
+ * null when the built-in exclusions or the types folder already cover it
+ * (spec Chapter 13, "Configuration").
+ */
+export function migrateExcludePattern(pattern: string, typesFolder: string): string | null {
+  if (!/[/*?[]/.test(pattern)) {
+    // A bare name excluded that root path and everything below it.
+    if (pattern.startsWith(".") || pattern === "node_modules" || pattern === typesFolder) return null;
+    return `${pattern}/**`;
+  }
+  // A wildcard pattern without a slash matched file names at any depth.
+  if (!pattern.includes("/")) return `**/${pattern}`;
+  return pattern;
+}
+
+/** Whether a glob uses only the portable grammar of spec Chapter 02. */
+function isPortableGlob(pattern: string): boolean {
+  return pattern !== "" &&
+    !pattern.startsWith("/") &&
+    !/[{}\\]/.test(pattern) &&
+    pattern.split("/").every((component) => component === "**" || !component.includes("**"));
 }
 
 async function buildOperations(root: string, proposedFiles: Record<string, string | null>): Promise<CollectionMigrationOperation[]> {
