@@ -1,0 +1,75 @@
+kind: mdbase.conformance
+status: verified
+implementation:
+  id: mdbase-ts
+  name: mdbase TypeScript implementation
+  version: 0.3.0-rc.7
+  language: TypeScript
+  target: npm
+  url: https://github.com/callumalpass/mdbase
+spec_version: 0.3.0
+profiles: [core_read, collection_semantics, data_contracts, cel, cel_match, cel_query, links, core_write, type_packs, lifecycle]
+optional_features: [view_records]
+json_schema:
+  dialect: https://json-schema.org/draft/2020-12/schema
+  keywords:
+    - type
+    - required
+    - properties
+    - additionalProperties
+    - items
+    - enum
+    - const
+    - oneOf
+    - anyOf
+    - allOf
+    - if
+    - then
+    - else
+    - minimum
+    - maximum
+    - exclusiveMinimum
+    - exclusiveMaximum
+    - multipleOf
+    - minLength
+    - maxLength
+    - pattern
+    - minItems
+    - maxItems
+    - uniqueItems
+    - $defs
+    - $ref
+    - title
+    - description
+    - default
+    - examples
+  formats: [date, date-time, time]
+  remote_refs: false
+compatibility:
+  v0_2_read: true
+  v0_2_migrate: true
+limits:
+  external_schema_refs: false
+  schema_ref_roots: [collection_root, ancestor_pack_schemas/v0.3]
+  operation_surface: v03Operations
+evidence:
+  - kind: testbed_transcript
+    command: npm run test:testbed -- --evidence conformance/testbed-v0.1-rc7.json
+    result: pass
+    verified_at: "2026-09-27T05:01:26Z"
+    artifact: conformance/testbed-v0.1-rc7.json
+    environment: Linux x86_64, Node.js 22.22.0
+    testbed_protocol_version: "0.1"
+    scenario_ids: [core.shared-contract-consumers]
+    evidence_digest: sha256:8508ac4fe7f6d349901d62fdbe17137c61b3bfef584d3028f1f72fca05918e3e
+  - kind: test_suite
+    command: npm run test:all
+    result: pass
+    verified_at: "2026-09-27T05:01:26Z"
+    environment: Linux x86_64, Node.js 22.22.0
+  - kind: conformance_suite
+    command: npm test -- test/v03-conformance.test.ts
+    result: pass
+    verified_at: "2026-09-27T05:01:26Z"
+    artifact: test/v03-conformance.test.ts
+    environment: Linux x86_64, Node.js 22.22.0

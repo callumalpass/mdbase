@@ -75,7 +75,7 @@ interface TestContext {
 const SPEC_REPO = resolveSpecRepo();
 const V03_TESTS_DIR = path.join(SPEC_REPO, "tests", "v0.3");
 const REQUIRE_V03_CONFORMANCE = process.env.MDBASE_REQUIRE_V03_CONFORMANCE === "1";
-const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.5.yml");
+const CLAIM_PATH = path.join(process.cwd(), "conformance", "v0.3.0-rc.7.yml");
 
 function resolveSpecRepo(): string {
   const candidates = [
@@ -92,14 +92,9 @@ function resolveSpecRepo(): string {
   return candidates[0] ?? path.resolve(process.cwd(), "../mdbase-spec");
 }
 
-// The spec split data contracts out of core_read and type packs out of
-// core_write after the last published claim; this engine implements both, so
-// their fixture sets run until the next claim lists them.
-const UNCLAIMED_IMPLEMENTED_PROFILES = ["data_contracts", "type_packs"];
-
 function loadClaimedProfiles(): Set<string> {
   const claim = yaml.load(fs.readFileSync(CLAIM_PATH, "utf8")) as { profiles?: string[] };
-  return new Set([...(claim.profiles ?? []), ...UNCLAIMED_IMPLEMENTED_PROFILES]);
+  return new Set(claim.profiles ?? []);
 }
 
 function discoverV03Suites(): Array<{
