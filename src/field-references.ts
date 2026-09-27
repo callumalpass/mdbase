@@ -206,3 +206,27 @@ function setOwnProperty(target: Record<string, unknown>, key: string, value: unk
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
+
+/**
+ * Remove the object member addressed by `reference`. A missing member or
+ * missing intermediate object is not an error; addressing an array item is.
+ */
+export function removeFieldReferenceValue(
+  target: Record<string, unknown>,
+  reference: string,
+): { error?: string } {
+  const segments = parseFieldReference(reference);
+  if (!segments) return { error: `Invalid field reference '${reference}'` };
+  if (segments.some((segment) => segment.each)) {
+    return { error: `Cannot unset array items through '${reference}'` };
+  }
+  let current: Record<string, unknown> = target;
+  for (const segment of segments.slice(0, -1)) {
+    const next = current[segment.key];
+    if (Array.isArray(next)) return { error: `Cannot unset array items through '${reference}'` };
+    if (next === null || typeof next !== "object") return {};
+    current = next as Record<string, unknown>;
+  }
+  delete current[segments[segments.length - 1].key];
+  return {};
+}

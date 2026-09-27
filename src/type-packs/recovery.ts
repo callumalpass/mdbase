@@ -20,6 +20,9 @@ export interface TypePackTransactionJournal {
 /**
  * Complete recovery before a collection is opened.
  *
+ * Batch transactions share this journal format under their own folder and
+ * follow the same rule: a journal that did not reach `committed` rolls back.
+ *
  * A pack transaction is committed only after the complete collection has
  * reopened successfully. Any earlier journal therefore restores every target
  * to its pre-install state. Restoring every entry also covers a crash between
@@ -27,9 +30,10 @@ export interface TypePackTransactionJournal {
  */
 export async function recoverInterruptedTypePackTransactions(
   collectionRoot: string,
+  transactionsFolder: string = TYPE_PACK_TRANSACTIONS_FOLDER,
 ): Promise<void> {
   const root = path.resolve(collectionRoot);
-  const transactionsRoot = resolveInside(root, TYPE_PACK_TRANSACTIONS_FOLDER);
+  const transactionsRoot = resolveInside(root, transactionsFolder);
   let directories: string[];
   try {
     directories = (await fs.readdir(transactionsRoot, { withFileTypes: true }))

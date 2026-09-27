@@ -179,7 +179,7 @@ lifecycle:
 
       const updated = await operations.update({
         path: "notes/one.md",
-        fields: { status: "done" },
+        patch: { status: "done" },
         if_revision: String(created.result.revision),
       });
       expect(updated.valid).toBe(true);
@@ -1105,51 +1105,6 @@ schema:
     expect(opened.error?.code).toBe("unsupported_profile");
   });
 
-  it("loads and filters v0.3 type migration metadata", async () => {
-    const root = await tempCollection();
-    await write(root, "mdbase.yaml", `spec_version: "0.3.0"
-settings:
-  validation: error
-`);
-    await write(root, "_types/task.md", `---
-kind: mdbase.type
-name: task
-version: 2
-schema:
-  dialect: json-schema-2020-12
-  value:
-    type: object
-migrations:
-  - from: 0
-    to: 1
-    description: Convert v0 fields to JSON Schema shape
-    steps:
-      - move_default:
-          from: fields.status.default
-          to: collection.read_defaults.status
-  - from: 1
-    to: 2
-    action: tasknotes.type.upgrade
----
-`);
-
-    const collection = await open(root);
-    const all = collection.listTypeMigrations({ type: "TASK" });
-    expect(all).toHaveLength(2);
-    expect(all[0]).toMatchObject({
-      type: "task",
-      source_path: "_types/task.md",
-      migration: { from: 0, to: 1 },
-    });
-    expect(collection.listTypeMigrations({ type: "task", from: 1 })).toEqual([
-      {
-        type: "task",
-        source_path: "_types/task.md",
-        migration: { from: 1, to: 2, action: "tasknotes.type.upgrade" },
-      },
-    ]);
-  });
-
   it("migrates the TaskNotes v0.2 fixture into a loadable v0.3 type file", async () => {
     const source = "/home/calluma/projects/mdbase-spec/examples/v0.3/tasknotes-migration/current-v0.2/_types/task.md";
     if (!fsSync.existsSync(source)) {
@@ -1247,7 +1202,7 @@ settings:
     );
   });
 
-  it("rejects invalid v0.3 type migration metadata", async () => {
+  it("rejects the removed v0.3 type migrations section", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", `spec_version: "0.3.0"
 settings:
@@ -1265,15 +1220,13 @@ migrations:
   - from: 0
     to: 1
     action: tasknotes.type.upgrade
-    steps:
-      - noop: true
 ---
 `);
 
     const opened = await Collection.open(root);
     expect(opened.collection).toBeUndefined();
     expect(opened.error?.code).toBe("invalid_type_definition");
-    expect(opened.error?.message).toContain("exactly one of steps or action");
+    expect(opened.error?.message).toContain('unknown top-level key "migrations"');
   });
 
   it("rejects typoed v0.3 type-file keys", async () => {

@@ -10,6 +10,8 @@ import picomatch from "picomatch";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import addFormatsImport from "ajv-formats";
 import { Collection, type V03OperationResult } from "../src/operations/collection.js";
+import type { V03BatchInput } from "../src/operations/batch.js";
+import type { V03UpdateInput } from "../src/operations/contracts.js";
 import { loadConfig } from "../src/config/loader.js";
 import { getType, loadTypesAsync } from "../src/types/loader.js";
 import { DataContractRegistry, dataContractDigest } from "../src/data-contracts/registry.js";
@@ -41,8 +43,10 @@ interface V03Setup {
 interface V03TestCase {
   name: string;
   operation: string;
+  setup?: V03Setup;
   input?: Dict;
   expect?: Dict;
+  verify_after?: V03TestCase;
 }
 
 interface V03Group {
@@ -372,11 +376,8 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
         const collection = await open(root);
         try {
           const before = await collection.v03Operations().read({ path: String(input.path) });
-          const result = await collection.v03Operations().update({
-            path: String(input.path),
-            fields: (input.patch ?? input.fields ?? input.frontmatter) as Dict | undefined,
-            body: input.body as string | undefined,
-          });
+          const { collection: _root, ...updateInput } = input;
+          const result = await collection.v03Operations().update(updateInput as unknown as V03UpdateInput);
           const adapted = adapterResult(result, result.result as Dict);
           return {
             ...adapted,
@@ -385,6 +386,28 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
               result.result.frontmatter as Dict | undefined ?? {},
             ),
           };
+        } finally {
+          await collection.close();
+        }
+      });
+
+    case "batch":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const result = await collection.v03Operations().batch(input as unknown as V03BatchInput);
+          return adapterResult(result, result.result as Dict);
+        } finally {
+          await collection.close();
+        }
+      });
+
+    case "resolve_link":
+      return await withOperationRoot(context, input, async (root) => {
+        const collection = await open(root);
+        try {
+          const resolved = await collectResolvedLinks(collection, String(input.path), String(input.field));
+          return { valid: true, resolved: resolved[String(input.field)] ?? null };
         } finally {
           await collection.close();
         }
@@ -538,7 +561,9 @@ function adapterResult(
     diagnostics: envelope.diagnostics,
     issues: envelope.diagnostics,
     ...(warnings.length > 0 ? { warnings } : {}),
-    ...(firstError ? { error: { code: firstError.code, message: firstError.message } } : {}),
+    ...(firstError
+      ? { error: { code: firstError.code, message: firstError.message, details: firstError.details } }
+      : {}),
   };
 }
 
@@ -551,7 +576,11 @@ function adaptCanonicalQueryResult(result: Awaited<ReturnType<Collection["queryC
   };
 }
 
-async function collectResolvedLinks(collection: Collection, relativePath: string): Promise<Dict> {
+async function collectResolvedLinks(
+  collection: Collection,
+  relativePath: string,
+  undeclaredField?: string,
+): Promise<Dict> {
   const read = await collection.read(relativePath);
   if (read.error) return {};
   const resolved: Dict = {};
@@ -568,6 +597,10 @@ async function collectResolvedLinks(collection: Collection, relativePath: string
       const link = await collectionAny.resolveLinkFull(value, relativePath, rule.target_type);
       resolved[field] = link.resolved ?? null;
     }
+  }
+  const undeclared = undeclaredField === undefined ? undefined : frontmatter[undeclaredField];
+  if (undeclaredField !== undefined && !(undeclaredField in resolved) && typeof undeclared === "string") {
+    resolved[undeclaredField] = (await collectionAny.resolveLinkFull(undeclared, relativePath)).resolved ?? null;
   }
   return resolved;
 }
@@ -1042,6 +1075,24 @@ async function assertExpectation(actual: Dict, expected: Dict, testName: string,
   }
   if (expected.error && typeof expected.error === "object") {
     expect((actual.error as Dict | undefined)?.code, `${testName}: error.code`).toBe((expected.error as Dict).code);
+    if ((expected.error as Dict).details) {
+      assertSubset((actual.error as Dict).details, (expected.error as Dict).details, `${testName}: error.details`);
+    }
+  }
+  for (const key of ["succeeded", "failed", "preflight", "dry_run", "resolved"]) {
+    if (key in expected) {
+      expect(actual[key], `${testName}: ${key}`).toEqual(expected[key]);
+    }
+  }
+  if (Array.isArray(expected.operations)) {
+    const operations = actual.operations as Dict[] | undefined ?? [];
+    for (const expectedOperation of expected.operations as Dict[]) {
+      const index = Number(expectedOperation.index);
+      assertSubset(operations[index], expectedOperation, `${testName}: operations[${index}]`);
+    }
+  }
+  if (typeof expected.body_contains === "string") {
+    expect(String(actual.body ?? ""), `${testName}: body_contains`).toContain(expected.body_contains);
   }
   if (typeof expected.error_contains === "string") {
     expect(String((actual.error as Dict | undefined)?.message ?? actual.error ?? ""), `${testName}: error_contains`)
@@ -1214,16 +1265,24 @@ if (suites.length === 0) {
             });
             for (const testCase of group.tests) {
               it(testCase.name, async () => {
-                const context = useSharedContext
+                const ownSetup = testCase.setup !== undefined;
+                const context = useSharedContext && !ownSetup
                   ? sharedContext ??= await materializeSetup(group.setup)
-                  : await materializeSetup(group.setup);
+                  : await materializeSetup({ ...group.setup, ...testCase.setup });
                 try {
                   const actual = await executeOperation(context, testCase);
                   if (testCase.expect) {
                     await assertExpectation(actual, testCase.expect, testCase.name, context);
                   }
+                  const verify = testCase.verify_after;
+                  if (verify) {
+                    const verified = await executeOperation(context, { ...verify, name: `${testCase.name} (verify_after)` });
+                    if (verify.expect) {
+                      await assertExpectation(verified, verify.expect, `${testCase.name} (verify_after)`, context);
+                    }
+                  }
                 } finally {
-                  if (!useSharedContext) {
+                  if (!useSharedContext || ownSetup) {
                     await context.cleanup?.();
                   }
                 }

@@ -10,6 +10,7 @@ import * as path from "node:path";
 import matter from "gray-matter";
 import { MdbaseConfig } from "../config/loader.js";
 import { isValidFieldReference } from "../field-references.js";
+import { isPortableVersionRequirement } from "../data-contracts/version-requirement.js";
 
 export interface FieldDefinition {
   type: string;
@@ -101,16 +102,6 @@ export interface V03LifecycleAction {
 export interface V03Lifecycle {
   on_create?: V03LifecycleAction | V03LifecycleAction[];
   on_update?: V03LifecycleAction | V03LifecycleAction[];
-  on_delete?: V03LifecycleAction | V03LifecycleAction[];
-  on_rename?: V03LifecycleAction | V03LifecycleAction[];
-}
-
-export interface V03Migration {
-  from: number;
-  to: number;
-  steps?: Array<Record<string, unknown>>;
-  action?: string;
-  description?: string;
 }
 
 export interface V03DataContractImplementation {
@@ -136,7 +127,6 @@ export interface TypeDefinition {
   schema?: V03SchemaWrapper;
   collection?: V03CollectionSemantics;
   lifecycle?: V03Lifecycle;
-  migrations?: V03Migration[];
   implements?: V03DataContractImplementation[];
   source_path?: string;
   domain?: Record<string, unknown>;
@@ -395,16 +385,6 @@ export async function loadTypesAsync(
       }
       if (data.lifecycle !== undefined && data.lifecycle !== null && typeof data.lifecycle === "object" && !Array.isArray(data.lifecycle)) {
         typeDef.lifecycle = data.lifecycle as V03Lifecycle;
-      }
-      if (data.migrations !== undefined) {
-        const migrations = parseV03Migrations(data.migrations, typeName);
-        if (!migrations.valid) {
-          return {
-            valid: false,
-            error: migrations.error,
-          };
-        }
-        typeDef.migrations = migrations.migrations;
       }
       if (data.implements !== undefined) {
         typeDef.implements = (data.implements as V03DataContractImplementation[]).map((implementation) => ({
@@ -885,7 +865,6 @@ function validateV03TypeFileShape(data: Record<string, unknown>, typeName: strin
     "schema",
     "collection",
     "lifecycle",
-    "migrations",
     "implements",
   ]);
 
@@ -926,7 +905,6 @@ function validateV03ImplementationsShape(
   }
   const identities = new Set<string>();
   const contractPattern = /^[a-z][a-z0-9]*(?:[._-][a-z0-9]+)+$/;
-  const semverPattern = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
   for (const [index, candidate] of value.entries()) {
     if (!isPlainObject(candidate)) {
       return invalidV03TypeShape(typeName, `implements[${index}] must be a mapping`);
@@ -939,8 +917,8 @@ function validateV03ImplementationsShape(
     if (typeof candidate.contract !== "string" || !contractPattern.test(candidate.contract)) {
       return invalidV03TypeShape(typeName, `implements[${index}].contract is not a valid contract ID`);
     }
-    if (typeof candidate.version !== "string" || !semverPattern.test(candidate.version)) {
-      return invalidV03TypeShape(typeName, `implements[${index}].version must be an exact semantic version`);
+    if (typeof candidate.version !== "string" || !isPortableVersionRequirement(candidate.version)) {
+      return invalidV03TypeShape(typeName, `implements[${index}].version must be a portable version requirement`);
     }
     if (!isPlainObject(candidate.fields)) {
       return invalidV03TypeShape(typeName, `implements[${index}].fields must be a mapping`);
@@ -1107,7 +1085,7 @@ function validateV03UniqueShape(value: unknown, typeName: string): { code: strin
 
 function validateV03LifecycleShape(value: unknown, typeName: string): { code: string; message: string } | null {
   if (!isPlainObject(value)) return invalidV03TypeShape(typeName, "lifecycle section must be a mapping");
-  const allowed = new Set(["on_create", "on_update", "on_delete", "on_rename"]);
+  const allowed = new Set(["on_create", "on_update"]);
   for (const [key, eventValue] of Object.entries(value)) {
     if (!allowed.has(key)) return invalidV03TypeShape(typeName, `lifecycle has unknown key "${key}"`);
     const actions = Array.isArray(eventValue) ? eventValue : [eventValue];
@@ -1171,95 +1149,6 @@ function invalidV03TypeShape(typeName: string, message: string): { code: string;
   return {
     code: "invalid_type_definition",
     message: `Type "${typeName}" ${message}`,
-  };
-}
-
-function parseV03Migrations(
-  value: unknown,
-  typeName: string,
-): { valid: boolean; migrations?: V03Migration[]; error?: { code: string; message: string } } {
-  if (!Array.isArray(value)) {
-    return {
-      valid: false,
-      error: {
-        code: "invalid_type_definition",
-        message: `Type "${typeName}" migrations must be a list`,
-      },
-    };
-  }
-
-  const migrations: V03Migration[] = [];
-  for (const [index, entry] of value.entries()) {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-      return invalidV03Migration(typeName, index, "must be a mapping");
-    }
-    const migration = entry as Record<string, unknown>;
-    const allowedKeys = new Set(["from", "to", "steps", "action", "description"]);
-    for (const key of Object.keys(migration)) {
-      if (!allowedKeys.has(key)) {
-        return invalidV03Migration(typeName, index, `has unknown key "${key}"`);
-      }
-    }
-
-    const from = migration.from;
-    const to = migration.to;
-    if (!Number.isInteger(from) || (from as number) < 0) {
-      return invalidV03Migration(typeName, index, "from must be an integer >= 0");
-    }
-    if (!Number.isInteger(to) || (to as number) < 1) {
-      return invalidV03Migration(typeName, index, "to must be an integer >= 1");
-    }
-    const hasSteps = migration.steps !== undefined;
-    const hasAction = migration.action !== undefined;
-    if (hasSteps === hasAction) {
-      return invalidV03Migration(typeName, index, "must define exactly one of steps or action");
-    }
-
-    const parsed: V03Migration = {
-      from: from as number,
-      to: to as number,
-    };
-    if (migration.description !== undefined) {
-      if (typeof migration.description !== "string") {
-        return invalidV03Migration(typeName, index, "description must be a string");
-      }
-      parsed.description = migration.description;
-    }
-    if (hasAction) {
-      if (typeof migration.action !== "string" || migration.action.length === 0) {
-        return invalidV03Migration(typeName, index, "action must be a non-empty string");
-      }
-      parsed.action = migration.action;
-    }
-    if (hasSteps) {
-      if (!Array.isArray(migration.steps)) {
-        return invalidV03Migration(typeName, index, "steps must be a list");
-      }
-      parsed.steps = [];
-      for (const [stepIndex, step] of migration.steps.entries()) {
-        if (typeof step !== "object" || step === null || Array.isArray(step) || Object.keys(step).length === 0) {
-          return invalidV03Migration(typeName, index, `steps[${stepIndex}] must be a non-empty mapping`);
-        }
-        parsed.steps.push(step as Record<string, unknown>);
-      }
-    }
-    migrations.push(parsed);
-  }
-
-  return { valid: true, migrations };
-}
-
-function invalidV03Migration(
-  typeName: string,
-  index: number,
-  message: string,
-): { valid: false; error: { code: string; message: string } } {
-  return {
-    valid: false,
-    error: {
-      code: "invalid_type_definition",
-      message: `Type "${typeName}" migrations[${index}] ${message}`,
-    },
   };
 }
 

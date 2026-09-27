@@ -22,7 +22,7 @@ if (command === "describe") {
     kind: "mdbase.testbed.adapter",
     protocol_version: "0.1",
     implementation,
-    profiles: ["core_read"],
+    profiles: ["data_contracts"],
     roles: ["contract_store", "record_consumer"],
     scenarios: [scenarioId]
   });

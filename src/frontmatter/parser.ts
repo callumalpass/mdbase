@@ -34,7 +34,7 @@ export interface ParsedFile {
   frontmatter: Record<string, unknown>;
   body: string;
   raw: string;
-  error?: { code: string; message: string };
+  error?: { code: string; message: string; details?: { reason: string } };
   /** If true, this is a YAML syntax error (always fatal regardless of validation level) */
   fatalError?: boolean;
 }
@@ -140,6 +140,7 @@ function parseContent(rawBuffer: Buffer): ParsedFile {
         error: {
           code: "invalid_frontmatter",
           message: "Frontmatter must be a YAML mapping, got null",
+          details: { reason: "non_mapping_frontmatter" },
         },
       };
     }
@@ -159,6 +160,7 @@ function parseContent(rawBuffer: Buffer): ParsedFile {
       error: {
         code: "invalid_frontmatter",
         message: "Frontmatter must be a YAML mapping, got list",
+        details: { reason: "non_mapping_frontmatter" },
       },
     };
   }
@@ -171,6 +173,7 @@ function parseContent(rawBuffer: Buffer): ParsedFile {
       error: {
         code: "invalid_frontmatter",
         message: `Frontmatter must be a YAML mapping, got ${typeof data}`,
+        details: { reason: "non_mapping_frontmatter" },
       },
     };
   }

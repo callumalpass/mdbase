@@ -1,9 +1,9 @@
 import type { MdbaseError } from "../errors.js";
-import type { V03Migration } from "../types/loader.js";
 
 export interface OperationError {
   code: string;
   message: string;
+  details?: Record<string, unknown>;
 }
 
 export interface OperationWarning extends OperationError {}
@@ -109,6 +109,8 @@ export interface UpdateInput {
   path: string;
   fields?: Record<string, unknown>;
   frontmatter?: Record<string, unknown>;
+  /** Field references whose keys are removed after the patch is applied. */
+  unset?: string[];
   body?: string;
   if_revision?: string;
 }
@@ -157,12 +159,6 @@ export interface BackfillInput {
   dry_run?: boolean;
 }
 
-export interface TypeMigrationEntry {
-  type: string;
-  source_path?: string;
-  migration: V03Migration;
-}
-
 export interface V03Diagnostic {
   severity: "info" | "warning" | "error";
   code: string;
@@ -198,7 +194,10 @@ export interface V03CreateInput {
 
 export interface V03UpdateInput {
   path: string;
-  fields?: Record<string, unknown>;
+  /** Top-level keys to set; a null value persists an explicit null. */
+  patch?: Record<string, unknown>;
+  /** Field references whose keys are removed. */
+  unset?: string[];
   body?: string;
   if_revision?: string;
 }

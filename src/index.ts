@@ -38,7 +38,6 @@ export type {
   V03LifecycleAction,
   V03LifecycleValue,
   V03LinkRule,
-  V03Migration,
   V03SchemaWrapper,
   V03UniqueRule,
 } from "./types/loader.js";
@@ -105,7 +104,6 @@ export type {
 } from "./migrations/collection-migration.js";
 export { Collection, V03Operations, V03ProfileError } from "./operations/collection.js";
 export type {
-  TypeMigrationEntry,
   V03CreateInput,
   V03DeleteInput,
   V03Diagnostic,

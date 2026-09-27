@@ -13,6 +13,7 @@ import {
   setFieldReferenceValue,
 } from "../field-references.js";
 import { dataContractSchema } from "../generated/v03-schemas.js";
+import { resolveVersionRequirement } from "./version-requirement.js";
 import type {
   TypeDefinition,
   V03DataContractImplementation,
@@ -198,14 +199,24 @@ export class DataContractRegistry {
     const implementations = new Map<string, DataContractImplementationDescriptor[]>();
     for (const typeDef of [...typeDefs.values()].sort((left, right) => left.name.localeCompare(right.name))) {
       for (const implementation of typeDef.implements ?? []) {
-        const identity = contractKey(implementation.contract, implementation.version);
-        const registered = contracts.get(identity);
-        if (!registered) {
+        const registeredVersions = [...contracts.values()]
+          .filter(({ definition }) => definition.id === implementation.contract)
+          .map(({ definition }) => definition.version);
+        if (registeredVersions.length === 0) {
           return invalid(
             "data_contract_not_found",
-            `Type "${typeDef.name}" implements missing exact data contract "${implementation.contract}" ${implementation.version}`,
+            `Type "${typeDef.name}" implements data contract "${implementation.contract}", which is not registered`,
           );
         }
+        const version = resolveVersionRequirement(implementation.version, registeredVersions);
+        if (version === null) {
+          return invalid(
+            "data_contract_version_mismatch",
+            `Type "${typeDef.name}" requires data contract "${implementation.contract}" ${implementation.version}, but no registered version satisfies it`,
+          );
+        }
+        const identity = contractKey(implementation.contract, version);
+        const registered = contracts.get(identity)!;
         if (registered.definition.contract_type !== "record") {
           return invalid(
             "data_contract_field_invalid",
@@ -216,7 +227,7 @@ export class DataContractRegistry {
         if (implementationError) return invalid(implementationError.code, implementationError.message);
         const descriptor: DataContractImplementationDescriptor = {
           contract: implementation.contract,
-          version: implementation.version,
+          version,
           contract_digest: registered.definition.digest,
           type: typeDef.name,
           type_version: typeDef.version ?? 1,
@@ -385,7 +396,8 @@ function digestImplementation(
     ...(typeDef.version !== undefined ? { version: typeDef.version } : {}),
     ...(typeDef.match !== undefined ? { match: typeDef.match } : {}),
     ...(typeDef.schema !== undefined ? { schema: typeDef.schema } : {}),
-    ...(typeDef.collection !== undefined ? { collection: typeDef.collection } : {}),
+    // Advisory display metadata never changes implementation identity.
+    ...(typeDef.collection !== undefined ? { collection: withoutDisplay(typeDef.collection) } : {}),
     ...(typeDef.lifecycle !== undefined ? { lifecycle: typeDef.lifecycle } : {}),
   };
   return digestCanonical({
@@ -393,6 +405,11 @@ function digestImplementation(
     type: typeSemantics,
     implementation,
   });
+}
+
+function withoutDisplay(collection: NonNullable<TypeDefinition["collection"]>): Record<string, unknown> {
+  const { display: _display, ...portable } = collection as Record<string, unknown>;
+  return portable;
 }
 
 export function dataContractDigest(frontmatter: Record<string, unknown>): string {
