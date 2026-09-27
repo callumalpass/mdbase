@@ -294,7 +294,7 @@ export function buildMdbaseCelBindings(context: MdbaseCelContext): Record<string
   Object.assign(bindings, {
     record,
     raw,
-    old: context.old ?? {},
+    old: typeFields(context.old ?? {}, dateTimes),
     event: context.event ?? {},
     steps: context.steps ?? {},
     vars: context.vars ?? {},

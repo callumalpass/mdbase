@@ -1102,6 +1102,8 @@ fields:
             record: frontmatter,
             raw: frontmatter,
             old: context.oldFrontmatter ?? {},
+            // Lifecycle guards type date-time fields as timestamps (Chapter 10).
+            dateTimeFields: celTypeFacts(types, this.typeDefs).dateTimeFields,
             operation: {
               event,
               path: context.relativePath,
