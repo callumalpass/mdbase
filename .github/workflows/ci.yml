@@ -24,7 +24,7 @@ jobs:
         uses: actions/checkout@v5
         with:
           repository: mdbase-dev/mdbase-spec
-          ref: 0dd606c02576586dbb3970fcea29a5b85234e540
+          ref: 18637e52e293567bd3f99a9927b028e5a5052ec7
           path: mdbase-spec
           persist-credentials: false
       - name: Install portable testbed runner

@@ -141,6 +141,9 @@ const environment = new Environment({
     const weekday = new Date(epochDay(parseFullDate(value)) * 86_400_000).getUTCDay();
     return BigInt(weekday === 0 ? 7 : weekday);
   })
+  // Unicode default full case mappings, without locale tailoring.
+  .registerFunction("string.lower(): string", (value: string) => value.toLowerCase())
+  .registerFunction("string.upper(): string", (value: string) => value.toUpperCase())
   .registerFunction("map.inFolder(string): bool", (file: Record<string, unknown>, folder: string) => {
     const actual = typeof file.folder === "string" ? file.folder : "";
     const wanted = folder.replace(/^\/+|\/+$/g, "");
