@@ -371,7 +371,7 @@ name: open_task
 version: 1
 match:
   expr:
-    $expr: 'status == "open" && present.raw.status'
+    $expr: 'status == "open" && has(raw.status)'
 schema:
   dialect: json-schema-2020-12
   value:
@@ -503,8 +503,8 @@ lifecycle:
     expect(String(statusChange.frontmatter?.dateModified)).not.toBe(firstModified);
   });
 
-  it("exposes v0.3 CEL presence maps for raw and effective records", () => {
-    const result = evaluateMdbaseCel("present.raw.status == false && present.record.status", {
+  it("tests raw and effective presence with has()", () => {
+    const result = evaluateMdbaseCel("!has(raw.status) && has(record.status) && missing == null", {
       raw: { title: "A" },
       record: { title: "A", status: "open" },
     });
@@ -1425,7 +1425,7 @@ id: temporal.views
 version: 1
 name: Temporal
 query:
-  where: date(scheduled) == '2026-08-05'
+  where: date(timestamp(scheduled)) == '2026-08-05'
 views:
   - id: local-day
     name: Local day
@@ -1434,12 +1434,12 @@ views:
     const collection = await open(root);
     const melbourne = await collection.queryCanonical({
       timezone: "Australia/Melbourne",
-      where: "date(scheduled) == '2026-08-06'",
+      where: "date(timestamp(scheduled)) == '2026-08-06'",
     });
     expect(melbourne.meta.total_count).toBe(1);
     const losAngeles = await collection.queryCanonical({
       timezone: "America/Los_Angeles",
-      where: "date(scheduled) == '2026-08-05'",
+      where: "date(timestamp(scheduled)) == '2026-08-05'",
     });
     expect(losAngeles.meta.total_count).toBe(1);
     expect((await collection.executeView({

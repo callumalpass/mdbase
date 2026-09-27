@@ -88,9 +88,14 @@ function resolveSpecRepo(): string {
   return candidates[0] ?? path.resolve(process.cwd(), "../mdbase-spec");
 }
 
+// The spec split data contracts out of core_read and type packs out of
+// core_write after the last published claim; this engine implements both, so
+// their fixture sets run until the next claim lists them.
+const UNCLAIMED_IMPLEMENTED_PROFILES = ["data_contracts", "type_packs"];
+
 function loadClaimedProfiles(): Set<string> {
   const claim = yaml.load(fs.readFileSync(CLAIM_PATH, "utf8")) as { profiles?: string[] };
-  return new Set(claim.profiles ?? []);
+  return new Set([...(claim.profiles ?? []), ...UNCLAIMED_IMPLEMENTED_PROFILES]);
 }
 
 function discoverV03Suites(): Array<{
@@ -577,19 +582,18 @@ async function evaluateCel(context: TestContext, input: Dict): Promise<Dict> {
     return { valid: true, value: result.value, diagnostics: result.diagnostics };
   }
 
+  if (!input.path) {
+    const result = evaluateMdbaseCel(expression, {});
+    return { valid: true, value: result.value, diagnostics: result.diagnostics };
+  }
   const collection = await open(context.root);
   try {
-    const read = input.path ? await collection.read(String(input.path)) : undefined;
-    const record = read?.frontmatter ?? {};
-    const raw = read?.rawFrontmatter ?? record;
-    const file = {
-      ...(read?.file ?? {}),
-      body: read?.body ?? "",
-      tags: collectTags(record),
-      links: [],
-    };
-    const result = evaluateMdbaseCel(expression, { record, raw, file });
-    return { valid: true, value: result.value, diagnostics: result.diagnostics };
+    const result = await collection.evaluateCel({
+      path: String(input.path),
+      expression,
+      timezone: input.timezone as string | undefined,
+    });
+    return { valid: result.valid, value: result.value, diagnostics: result.diagnostics };
   } finally {
     await collection.close();
   }
@@ -611,13 +615,6 @@ function evaluateWorkflowInput(context: TestContext, input: Dict): Dict {
     return value;
   };
   return { valid: true, value: evaluateValue(input.template) } as Dict;
-}
-
-function collectTags(record: Dict): string[] {
-  const tags = record.tags;
-  if (Array.isArray(tags)) return tags.filter((tag): tag is string => typeof tag === "string");
-  if (typeof tags === "string") return [tags];
-  return [];
 }
 
 function diffFields(before: Dict, after: Dict): string[] {

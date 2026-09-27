@@ -33,7 +33,12 @@ import { filterFrontmatter, parseFileAsync, serializeFile } from "../frontmatter
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateExpression } from "../expressions/evaluator.js";
-import { evaluateMdbaseCel } from "../expressions/cel.js";
+import {
+  evaluateMdbaseCel,
+  mdbaseCelFacts,
+  type MdbaseCelDiagnostic,
+  type MdbaseCelLinks,
+} from "../expressions/cel.js";
 import { extractBodyLinks, parseLink, ParsedLink } from "../links/parser.js";
 import { BacklinkEntry } from "../expressions/evaluator.js";
 import { CacheStoreAsync, CachedFile } from "../cache/async-store.js";
@@ -76,6 +81,7 @@ import {
   executeCanonicalQuery,
   executeCanonicalView,
   listCanonicalViews,
+  celTypeFacts,
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
@@ -700,7 +706,6 @@ fields:
       const result = evaluateMdbaseCel(match.expr.$expr, {
         record: frontmatter,
         raw: frontmatter,
-        knownFields: this.getTypeFieldNames(typeDef),
         file: this.buildMatchFileBinding(relativePath),
       });
       if (result.diagnostics.length > 0) {
@@ -711,16 +716,6 @@ fields:
     }
 
     return true;
-  }
-
-  private getTypeFieldNames(typeDef: TypeDefinition): string[] {
-    const schemaProperties = typeDef.schema?.value?.properties;
-    return [
-      ...Object.keys(typeDef.fields ?? {}),
-      ...(schemaProperties !== null && typeof schemaProperties === "object" && !Array.isArray(schemaProperties)
-        ? Object.keys(schemaProperties)
-        : []),
-    ];
   }
 
   private buildMatchFileBinding(relativePath: string): Record<string, unknown> {
@@ -2874,7 +2869,86 @@ fields:
         const built = await this.buildFileCache(files);
         return built as Map<string, IndexedReadResult>;
       },
+      celLinks: (files, fileCache) => this.buildCelLinks(files, fileCache),
     });
+  }
+
+  /**
+   * The CEL link host for one collection state: `asFile()` resolution and the
+   * backlinks index, both using the v0.3 link rules.
+   */
+  private async buildCelLinks(
+    files: string[],
+    fileCache: Map<string, IndexedReadResult>,
+  ): Promise<MdbaseCelLinks> {
+    const nonMarkdownFiles = this.buildNonMarkdownSet(await this.scanAllFiles());
+    const resolutionIndex = this.linkResolver.buildIndex(files, fileCache);
+    const resolvePath = (link: string, fromPath: string) =>
+      this.linkResolver.resolve(link, fromPath, files, {
+        fileCache,
+        nonMarkdownFiles,
+        knownFileSet: resolutionIndex.fileSet,
+        resolutionIndex,
+      });
+    const index = buildLinkIndex({
+      files,
+      fileCache,
+      typeDefs: this.typeDefs,
+      resolveLink: resolvePath,
+      specProfile: this.config.spec_profile,
+    });
+    return {
+      resolve: (link, fromPath) => {
+        const target = resolvePath(link, fromPath).resolved;
+        const read = target ? fileCache.get(target) : undefined;
+        if (!target || !read || read.error) return null;
+        return {
+          path: target,
+          record: read.frontmatter ?? {},
+          raw: read.rawFrontmatter ?? read.frontmatter ?? {},
+          body: read.body ?? "",
+          declaredLinkSelectors: celTypeFacts(read.types ?? [], this.typeDefs).declaredLinkSelectors,
+        };
+      },
+      backlinks: (targetPath) => [...(index.incoming.get(targetPath) ?? [])],
+    };
+  }
+
+  /** Evaluate a CEL expression against one record in the query context. */
+  async evaluateCel(input: {
+    path: string;
+    expression: string;
+    timezone?: string;
+  }): Promise<{ valid: boolean; value: unknown; diagnostics: MdbaseCelDiagnostic[] }> {
+    const read = await this.read(input.path);
+    if (!read.frontmatter && read.error) {
+      return {
+        valid: false,
+        value: null,
+        diagnostics: [{ code: read.error.code, message: read.error.message, expression: input.expression }],
+      };
+    }
+    const types = read.types ?? [];
+    let links: MdbaseCelLinks | undefined;
+    try {
+      if (mdbaseCelFacts(input.expression).needsLinkGraph) {
+        const files = await this.scanFiles();
+        links = await this.buildCelLinks(files, await this.buildFileCache(files) as Map<string, IndexedReadResult>);
+      }
+    } catch {
+      // A parse error is reported by evaluateMdbaseCel below.
+    }
+    const temporal = { now: new Date(), timezone: input.timezone ?? this.config.settings.timezone ?? "UTC" };
+    const result = evaluateMdbaseCel(input.expression, {
+      temporal,
+      record: read.frontmatter ?? {},
+      raw: read.rawFrontmatter ?? read.frontmatter ?? {},
+      file: { ...(read.file ?? {}), path: input.path, body: read.body ?? "" },
+      links,
+      ...celTypeFacts(types, this.typeDefs),
+    });
+    const compileError = result.diagnostics.some((diagnostic) => diagnostic.code === "expression_compile_error");
+    return { valid: !compileError, value: result.value, diagnostics: result.diagnostics };
   }
 
   /** Discover valid canonical saved-view records. */
