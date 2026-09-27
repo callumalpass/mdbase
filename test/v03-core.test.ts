@@ -32,7 +32,8 @@ describe("v0.3 core", () => {
   it("resolves links relative to the record they were read from", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
-    await write(root, "projects/alpha.md", '---\nlead: "[Bob](people/bob.md)"\nrelated: ["[[./beta]]"]\n---\n');
+    await write(root, "projects/alpha.md", '---\nlead: "[Bob](people/bob.md)"\nrelated: ["[[./beta]]"]\n---\nSee [the plan](plan.md) and [[projects/beta|Beta]].\n');
+    await write(root, "projects/plan.md", "---\ntitle: Plan\n---\n");
     await write(root, "projects/beta.md", "---\ntitle: Beta\n---\n");
     await write(root, "projects/people/bob.md", "---\nname: Bob\n---\n");
     await write(root, "tasks/t1.md", '---\nproject: "[[alpha]]"\n---\n');
@@ -44,6 +45,11 @@ describe("v0.3 core", () => {
       expect(await evaluate("project.asFile().lead.asFile().name")).toBe("Bob");
       expect(await evaluate("project.asFile().related.map(r, r.asFile().file.path)")).toEqual(["projects/beta.md"]);
       expect(await evaluate('project.asFile().file.hasLink(link(project.asFile().related[0]))')).toBe(true);
+      expect(await evaluate('project.asFile().file.links.exists(l, l.asFile().title == "Plan")')).toBe(true);
+      // file.links holds link values that resolve as the originals did.
+      expect(await evaluate("project.asFile().file.links")).toEqual(["./beta", "[[projects/beta]]", "./plan.md"]);
+      expect(await evaluate('project.asFile().file.links.map(l, l.asFile() == null ? "" : l.asFile().file.path)'))
+        .toEqual(["projects/beta.md", "projects/beta.md", "projects/plan.md"]);
 
       const query = await collection.queryCanonical({
         context: { this: { path: "projects/alpha.md" } },

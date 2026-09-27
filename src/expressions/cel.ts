@@ -362,9 +362,13 @@ function fileValue(
     file.tags = tags(record, body);
     file.links = [
       ...frontmatterLinks(record, declaredLinkSelectors),
-      ...bodyLinks.filter((link) => !link.is_embed).map((link) => link.target),
+      // Body wikilinks, then body markdown links (spec Chapter 08).
+      ...bodyLinks.filter((link) => !link.is_embed && link.format === "wikilink").map((link) => linkValue(link.target, true)),
+      ...bodyLinks.filter((link) => !link.is_embed && link.format !== "wikilink").map((link) => linkValue(link.target, false)),
     ];
-    file.embeds = bodyLinks.filter((link) => link.is_embed).map((link) => link.target);
+    file.embeds = bodyLinks
+      .filter((link) => link.is_embed)
+      .map((link) => linkValue(link.target, link.format === "wikilink"));
     const sources = [...new Set(active.links?.backlinks(path) ?? [])].sort();
     file.backlinks = sources.map((source) => `[[${source}]]`);
   }
@@ -423,7 +427,18 @@ function pushLinks(value: unknown, links: string[], declared: boolean): void {
   const isWikilink = text.startsWith("[[") && text.endsWith("]]") && !text.slice(2, -2).includes("]]");
   if (!declared && !isWikilink) return;
   const target = linkTarget(text);
-  if (target) links.push(target);
+  if (target) links.push(linkValue(target, isWikilink));
+}
+
+/**
+ * The link value exposed in `file.links` and `file.embeds` (spec Chapter
+ * 08): a wikilink as `[[target]]`, and a markdown or bare-path target as an
+ * explicit relative or rooted path, so it resolves exactly as the original.
+ * Aliases and anchors are dropped.
+ */
+function linkValue(target: string, wikilink: boolean): string {
+  if (target.startsWith("/") || target.startsWith("./") || target.startsWith("../")) return target;
+  return wikilink ? `[[${target}]]` : `./${target}`;
 }
 
 /** The target of a wikilink, Markdown link, or bare path. */
