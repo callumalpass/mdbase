@@ -29,6 +29,47 @@ async function open(root: string): Promise<Collection> {
 }
 
 describe("v0.3 core", () => {
+  it("warns that collection projections are unsupported instead of ignoring them", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "_types/task.md", `---
+kind: mdbase.type
+name: task
+version: 1
+match:
+  path_glob: "tasks/**/*.md"
+schema:
+  dialect: json-schema-2020-12
+  value:
+    type: object
+collection:
+  projections:
+    is_overdue:
+      expr: 'due != null && due < today()'
+---
+`);
+    await write(root, "tasks/a.md", "---\ntitle: A\n---\n");
+    await write(root, "notes/b.md", "---\ntitle: B\n---\n");
+    const collection = await open(root);
+    try {
+      const operations = collection.v03Operations();
+      const expected = {
+        severity: "warning",
+        code: "unsupported_feature",
+        path: "_types/task.md",
+        type: "task",
+        details: { feature: "collection_projections" },
+      };
+      expect((await operations.validate()).diagnostics).toContainEqual(expect.objectContaining(expected));
+      const record = await operations.validate({ path: "tasks/a.md" });
+      expect(record.valid).toBe(true);
+      expect(record.diagnostics).toContainEqual(expect.objectContaining(expected));
+      expect((await operations.validate({ path: "notes/b.md" })).diagnostics).toEqual([]);
+    } finally {
+      await collection.close();
+    }
+  });
+
   it("resolves links relative to the record they were read from", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');

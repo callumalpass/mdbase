@@ -241,6 +241,27 @@ export class Collection {
       : picomatch(pattern, { dot: true })(relativePath);
   }
 
+  /**
+   * `unsupported_feature` warnings for type sections this engine loads but
+   * does not implement (spec Chapter 07, "Projections"). With `types`, only
+   * those types are reported.
+   */
+  unsupportedFeatureDiagnostics(types?: string[]): V03Diagnostic[] {
+    const wanted = types ? new Set(types.map((name) => name.toLowerCase())) : undefined;
+    return [...this.typeDefs.values()]
+      .filter((typeDef) => !wanted || wanted.has(typeDef.name.toLowerCase()))
+      .filter((typeDef) => typeDef.collection?.projections !== undefined)
+      .sort((left, right) => left.name.localeCompare(right.name))
+      .map((typeDef) => ({
+        severity: "warning" as const,
+        code: "unsupported_feature",
+        message: `Type "${typeDef.name}" declares collection.projections, which this implementation does not evaluate; projection values are absent.`,
+        ...(typeDef.source_path ? { path: typeDef.source_path } : {}),
+        type: typeDef.name,
+        details: { feature: "collection_projections" },
+      }));
+  }
+
   /** The configured record validation level (spec Chapter 04). */
   get validationLevel(): MdbaseConfig["settings"]["default_validation"] {
     return this.config.settings.default_validation;
@@ -4774,7 +4795,10 @@ export class V03Operations {
   }
 
   async validate(input: V03ValidateInput = {}): Promise<V03OperationResult> {
-    return await this.normalize("validate", input, await this.collection.validate(input.path));
+    const result = await this.normalize("validate", input, await this.collection.validate(input.path));
+    const types = input.path ? (await this.collection.read(input.path)).types ?? [] : undefined;
+    const unsupported = this.collection.unsupportedFeatureDiagnostics(types);
+    return unsupported.length === 0 ? result : { ...result, diagnostics: [...result.diagnostics, ...unsupported] };
   }
 
   async query(input: CanonicalQueryInput): Promise<V03OperationResult> {
