@@ -267,6 +267,11 @@ export class Collection {
     return this.config.settings.default_validation;
   }
 
+  /** Whether a collection-relative file has a record extension. */
+  isRecordFile(relativePath: string): boolean {
+    return this.scanner.isRecordFile(relativePath);
+  }
+
   /** The collection root, for operations that stage a copy of it. */
   get rootPath(): string {
     return this.root;
@@ -1821,7 +1826,7 @@ fields:
     }
 
     await fs.promises.mkdir(path.dirname(fullPath), { recursive: true });
-    await fs.promises.writeFile(fullPath, content);
+    await writeFileAtomic(fullPath, content);
     await this.updateCacheForPath(relativePath);
     this.invalidateRuntimeCaches();
 
@@ -2041,7 +2046,7 @@ fields:
       };
     }
 
-    await fs.promises.writeFile(fullPath, content);
+    await writeFileAtomic(fullPath, content);
     await this.updateCacheForPath(relativePath);
 
     // Evaluate computed fields on the effective frontmatter for the return value
@@ -2241,7 +2246,7 @@ fields:
 
     const content = serializeFile(typeFrontmatter, "", "omit", true);
     await fs.promises.mkdir(typesFolder, { recursive: true });
-    await fs.promises.writeFile(typeFilePath, content);
+    await writeFileAtomic(typeFilePath, content);
 
     return {
       valid: true,
@@ -2525,7 +2530,7 @@ fields:
             this.config.settings.write_nulls,
             this.config.settings.write_empty_lists,
           );
-          await fs.promises.writeFile(fullPath, updatedContent);
+          await writeFileAtomic(fullPath, updatedContent);
           await this.upsertCacheFromData(filePath, nextFrontmatter, nextBody);
 
           for (const field of fmUpdatedFields) {
@@ -4002,7 +4007,7 @@ fields:
           this.config.settings.write_empty_lists,
         );
         const fullPath = path.join(this.root, upd.path);
-        await fs.promises.writeFile(fullPath, content);
+        await writeFileAtomic(fullPath, content);
         await this.updateCacheForPath(upd.path);
         succeeded++;
       } catch {
@@ -4878,7 +4883,9 @@ export class V03Operations {
       return batchEnvelope(await this.runBatchItems(input.operations), false, false);
     }
 
-    const staged = await stageCollection(this.collection.rootPath);
+    const staged = await stageCollection(this.collection.rootPath, {
+      isRecordFile: (relativePath) => this.collection.isRecordFile(relativePath),
+    });
     try {
       const opened = await Collection.open(staged.root, { skipTypePackRecovery: true });
       if (!opened.collection) {
@@ -5303,4 +5310,24 @@ function batchEnvelope(items: Record<string, unknown>[], preflight: boolean, dry
     result: { operations: items, succeeded, failed: items.length - succeeded, preflight, dry_run: dryRun },
     diagnostics: items.flatMap((item) => item.diagnostics as V03Diagnostic[]),
   };
+}
+
+/**
+ * Replace a file through a temporary sibling and a rename, keeping the
+ * existing file mode. Readers never see a partial file, and a batch staged
+ * with hard links never writes through to the original file.
+ */
+async function writeFileAtomic(target: string, content: string | Uint8Array): Promise<void> {
+  const mode = await fs.promises.stat(target).then((stat) => stat.mode, () => undefined);
+  const temporary = path.join(
+    path.dirname(target),
+    `.${path.basename(target)}.mdbase-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.tmp`,
+  );
+  try {
+    await fs.promises.writeFile(temporary, content, mode === undefined ? undefined : { mode });
+    await fs.promises.rename(temporary, target);
+  } catch (error) {
+    await fs.promises.rm(temporary, { force: true });
+    throw error;
+  }
 }

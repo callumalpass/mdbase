@@ -5,6 +5,7 @@
  */
 import * as fs from "node:fs";
 import * as fsp from "node:fs/promises";
+import * as os from "node:os";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import type { V03Diagnostic } from "./contracts.js";
@@ -16,7 +17,6 @@ import {
 } from "../type-packs/recovery.js";
 
 export const BATCH_TRANSACTIONS_FOLDER = ".mdbase/batch-transactions";
-const BATCH_STAGING_FOLDER = ".mdbase/batch-staging";
 /** Never copied into a staged collection and never part of a staged diff. */
 const UNSTAGED_DIRECTORIES = new Set([".git", ".mdbase", "node_modules"]);
 
@@ -72,24 +72,47 @@ export function batchRequestError(input: V03BatchInput): V03Diagnostic | undefin
 interface FileStamp {
   size: number;
   mtimeMs: number;
+  ino: number;
 }
+
+/** Non-record files above this size are staged as empty placeholders when copying. */
+const PLACEHOLDER_THRESHOLD = 1024 * 1024;
 
 export interface StagedCollection {
   root: string;
-  /** Stamps of the original files at the time they were copied. */
+  /** Stamps of the original files when they were staged, for conflict checks. */
   snapshot: Map<string, FileStamp>;
+  /** Stamps of the staged files before any operation ran. */
+  staged: Map<string, FileStamp>;
   cleanup(): Promise<void>;
 }
 
+export interface StageOptions {
+  /** Whether a collection-relative file is a record file. */
+  isRecordFile(relativePath: string): boolean;
+  /** Set false to copy even where hard links are possible. */
+  link?: boolean;
+}
+
 /**
- * Copy the collection into a private staging directory. Copies keep their
- * source modification times so that the files an operation rewrites can be
- * found by stamp after the batch runs.
+ * Stage the collection in a private directory outside it, so that file
+ * sync and watchers never see batch preparation.
+ *
+ * On the collection's filesystem the stage uses hard links, which cost one
+ * directory entry per file. This is safe because collection writes replace
+ * files atomically rather than writing through them. Elsewhere the stage
+ * copies files, using reflinks where the filesystem supports them, and
+ * stands in empty placeholders for large non-record files such as
+ * attachments: operations only need those to exist for link resolution.
  */
-export async function stageCollection(collectionRoot: string): Promise<StagedCollection> {
+export async function stageCollection(collectionRoot: string, options: StageOptions): Promise<StagedCollection> {
   const root = path.resolve(collectionRoot);
-  const stagingRoot = resolveInside(root, `${BATCH_STAGING_FOLDER}/${randomUUID()}`);
+  const { parent, linked } = options.link === false
+    ? { parent: os.tmpdir(), linked: false }
+    : await stagingParent(root);
+  const stagingRoot = await fsp.mkdtemp(path.join(parent, "mdbase-batch-"));
   const snapshot = new Map<string, FileStamp>();
+  const staged = new Map<string, FileStamp>();
   const cleanup = async () => {
     await fsp.rm(stagingRoot, { recursive: true, force: true });
   };
@@ -98,16 +121,63 @@ export async function stageCollection(collectionRoot: string): Promise<StagedCol
       const source = path.join(root, relative);
       const target = path.join(stagingRoot, relative);
       const stat = await fsp.stat(source);
+      snapshot.set(relative, stamp(stat));
       await fsp.mkdir(path.dirname(target), { recursive: true });
-      await fsp.copyFile(source, target, fs.constants.COPYFILE_FICLONE);
-      await fsp.utimes(target, stat.atime, stat.mtime);
-      snapshot.set(relative, { size: stat.size, mtimeMs: stat.mtimeMs });
+      if (!(linked && await tryLink(source, target))) {
+        if (stat.size > PLACEHOLDER_THRESHOLD && !options.isRecordFile(relative)) {
+          await fsp.writeFile(target, "");
+        } else {
+          await fsp.copyFile(source, target, fs.constants.COPYFILE_FICLONE);
+        }
+      }
+      staged.set(relative, stamp(await fsp.stat(target)));
     }
   } catch (error) {
     await cleanup();
     throw error;
   }
-  return { root: stagingRoot, snapshot, cleanup };
+  return { root: stagingRoot, snapshot, staged, cleanup };
+}
+
+/**
+ * A staging parent outside the collection: the first of the temporary and
+ * user cache directories on the collection's filesystem, which allows hard
+ * links, or else the temporary directory.
+ */
+async function stagingParent(root: string): Promise<{ parent: string; linked: boolean }> {
+  const device = (await fsp.stat(root)).dev;
+  const candidates = [
+    os.tmpdir(),
+    path.join(process.env.XDG_CACHE_HOME ?? path.join(os.homedir(), ".cache"), "mdbase"),
+  ];
+  for (const candidate of candidates) {
+    const resolved = path.resolve(candidate);
+    if (resolved === root || resolved.startsWith(`${root}${path.sep}`)) continue;
+    try {
+      await fsp.mkdir(resolved, { recursive: true });
+      if ((await fsp.stat(resolved)).dev === device) return { parent: resolved, linked: true };
+    } catch {
+      // An unusable candidate falls through to the next one.
+    }
+  }
+  return { parent: os.tmpdir(), linked: false };
+}
+
+async function tryLink(source: string, target: string): Promise<boolean> {
+  try {
+    await fsp.link(source, target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function stamp(stat: fs.Stats): FileStamp {
+  return { size: stat.size, mtimeMs: stat.mtimeMs, ino: stat.ino };
+}
+
+function sameStamp(left: FileStamp | undefined, right: FileStamp | undefined): boolean {
+  return !!left && !!right && left.size === right.size && left.mtimeMs === right.mtimeMs && left.ino === right.ino;
 }
 
 export interface StagedChanges {
@@ -121,13 +191,11 @@ export async function stagedChanges(staged: StagedCollection): Promise<StagedCha
   const present = new Set<string>();
   for (const relative of await listFiles(staged.root)) {
     present.add(relative);
-    const before = staged.snapshot.get(relative);
-    const stat = await fsp.stat(path.join(staged.root, relative));
-    if (!before || before.size !== stat.size || before.mtimeMs !== stat.mtimeMs) {
+    if (!sameStamp(staged.staged.get(relative), stamp(await fsp.stat(path.join(staged.root, relative))))) {
       writes.push(relative);
     }
   }
-  const deletes = [...staged.snapshot.keys()].filter((relative) => !present.has(relative));
+  const deletes = [...staged.staged.keys()].filter((relative) => !present.has(relative));
   return { writes, deletes };
 }
 
@@ -150,9 +218,7 @@ export async function commitStagedChanges(
   for (const target of targets) {
     const before = staged.snapshot.get(target);
     const current = await fsp.stat(resolveInside(root, target)).catch(() => undefined);
-    const unchanged = before
-      ? current?.size === before.size && current.mtimeMs === before.mtimeMs
-      : current === undefined;
+    const unchanged = before ? sameStamp(current && stamp(current), before) : current === undefined;
     if (!unchanged) {
       return {
         severity: "error",

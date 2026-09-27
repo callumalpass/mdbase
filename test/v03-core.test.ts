@@ -29,6 +29,42 @@ async function open(root: string): Promise<Collection> {
 }
 
 describe("v0.3 core", () => {
+  it("stages atomic batches outside the collection and leaves originals intact until commit", async () => {
+    const root = await tempCollection();
+    await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
+    await write(root, "notes/a.md", "---\ntitle: A\n---\n");
+    await write(root, "notes/b.md", "---\ntitle: B\n---\n");
+    const collection = await open(root);
+    try {
+      const before = await fs.stat(path.join(root, "notes/a.md"));
+      const failed = await collection.v03Operations().batch({
+        operations: [
+          { kind: "update", input: { path: "notes/a.md", patch: { title: "A2" } } },
+          { kind: "update", input: { path: "notes/missing.md", patch: { title: "X" } } },
+        ],
+      });
+      expect(failed.valid).toBe(false);
+      expect(failed.result.preflight).toBe(true);
+      // Preparation neither touched the original nor left anything in the collection.
+      const after = await fs.stat(path.join(root, "notes/a.md"));
+      expect([after.ino, after.mtimeMs]).toEqual([before.ino, before.mtimeMs]);
+      expect(await fs.readFile(path.join(root, "notes/a.md"), "utf8")).toBe("---\ntitle: A\n---\n");
+      expect(fsSync.existsSync(path.join(root, ".mdbase", "batch-staging"))).toBe(false);
+
+      const committed = await collection.v03Operations().batch({
+        operations: [
+          { kind: "update", input: { path: "notes/a.md", patch: { title: "A2" } } },
+          { kind: "delete", input: { path: "notes/b.md" } },
+        ],
+      });
+      expect(committed.valid).toBe(true);
+      expect(await fs.readFile(path.join(root, "notes/a.md"), "utf8")).toContain("title: A2");
+      expect(fsSync.existsSync(path.join(root, "notes/b.md"))).toBe(false);
+    } finally {
+      await collection.close();
+    }
+  });
+
   it("warns that collection projections are unsupported instead of ignoring them", async () => {
     const root = await tempCollection();
     await write(root, "mdbase.yaml", 'spec_version: "0.3.0"\n');
