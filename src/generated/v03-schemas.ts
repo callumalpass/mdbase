@@ -1628,10 +1628,10 @@ export const typePackSchema: Record<string, unknown> = {
 export const viewSchema: Record<string, unknown> = {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://mdbase.dev/schemas/v0.3/view.schema.json",
-  "title": "mdbase v0.3 view record",
+  "title": "mdbase.view 1.0.0 record contract view",
+  "description": "The contract view of a saved-view record. A type implements mdbase.view by mapping these fields; the optional type property only lets the canonical view type validate its own membership value.",
   "type": "object",
   "required": [
-    "type",
     "id",
     "version",
     "name",
@@ -1639,7 +1639,8 @@ export const viewSchema: Record<string, unknown> = {
   ],
   "properties": {
     "type": {
-      "const": "view"
+      "type": "string",
+      "minLength": 1
     },
     "id": {
       "$ref": "#/$defs/identifier"

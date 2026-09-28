@@ -161,11 +161,22 @@ export function celTypeFacts(types: string[], typeDefs: Map<string, TypeDefiniti
   return { dateTimeFields, declaredLinkSelectors };
 }
 
+export const VIEW_CONTRACT = "mdbase.view";
+export const VIEW_CONTRACT_VERSION = "1.0.0";
+
+/** A record resolved through the `mdbase.view` record contract (spec Chapter 11). */
+export type ViewResolution =
+  | { kind: "not_view" }
+  | { kind: "view"; view: Record<string, unknown> }
+  | { kind: "invalid"; diagnostics: CanonicalDiagnostic[] };
+
 export interface CanonicalViewDeps {
   scanFiles: () => Promise<string[]>;
   read: (relativePath: string) => Promise<IndexedReadResult>;
   buildFileCache?: (files: string[]) => Promise<Map<string, IndexedReadResult>>;
   executeQuery: (input: CanonicalQueryInput) => Promise<CanonicalQueryResult>;
+  /** Resolve a record through its one type implementing `mdbase.view`. */
+  resolveView: (read: IndexedReadResult, path: string) => ViewResolution;
 }
 
 interface ContextRecord {
@@ -218,7 +229,7 @@ export function validateCanonicalViewRecord(
 
 /** Discover valid canonical view records in deterministic source order. */
 export async function listCanonicalViews(
-  deps: Pick<CanonicalViewDeps, "scanFiles" | "read" | "buildFileCache">,
+  deps: Pick<CanonicalViewDeps, "scanFiles" | "read" | "buildFileCache" | "resolveView">,
 ): Promise<SavedViewListResult> {
   const files = (await deps.scanFiles()).slice().sort((left, right) => left.localeCompare(right));
   const fileCache = deps.buildFileCache
@@ -229,9 +240,11 @@ export async function listCanonicalViews(
 
   for (const path of files) {
     const read = fileCache.get(path);
-    if (!read || read.error || !isViewRecord(read)) continue;
-    const frontmatter = read.frontmatter ?? {};
-    const invalid = validateCanonicalViewRecord(frontmatter, path);
+    if (!read || read.error) continue;
+    const resolution = deps.resolveView(read, path);
+    if (resolution.kind === "not_view") continue;
+    const frontmatter = resolution.kind === "view" ? resolution.view : {};
+    const invalid = resolution.kind === "invalid" ? [...resolution.diagnostics] : [];
     const namedViews = Array.isArray(frontmatter.views)
       ? frontmatter.views as Array<Record<string, unknown>>
       : [];
@@ -314,7 +327,7 @@ function propertyDescriptor(
   };
 }
 
-/** Resolve and execute an ordinary `type: view` Markdown record. */
+/** Resolve and execute a record implementing `mdbase.view`. */
 export async function executeCanonicalView(
   input: ExecuteViewInput,
   deps: CanonicalViewDeps,
@@ -324,12 +337,11 @@ export async function executeCanonicalView(
     return failedView("view_not_found", `View record "${input.path}" was not found`);
   }
 
-  const { path: viewPath, read } = resolved;
-  const viewRecord = read.frontmatter ?? {};
-  const schemaDiagnostics = validateCanonicalViewRecord(viewRecord, viewPath);
-  if (schemaDiagnostics.length > 0) {
-    return failedView("invalid_view", schemaDiagnostics[0].message, schemaDiagnostics);
+  const { path: viewPath, resolution } = resolved;
+  if (resolution.kind === "invalid") {
+    return failedView("invalid_view", resolution.diagnostics[0].message, resolution.diagnostics);
   }
+  const viewRecord = resolution.view;
 
   const views = viewRecord.views as Array<Record<string, unknown>>;
   const ids = views.map((view) => String(view.id));
@@ -413,16 +425,19 @@ export async function executeCanonicalView(
 
 async function resolveViewRecord(
   identifier: string,
-  deps: Pick<CanonicalViewDeps, "read" | "scanFiles">,
-): Promise<{ path: string; read: IndexedReadResult } | undefined> {
+  deps: Pick<CanonicalViewDeps, "read" | "scanFiles" | "resolveView">,
+): Promise<{ path: string; resolution: Exclude<ViewResolution, { kind: "not_view" }> } | undefined> {
   const direct = await deps.read(identifier);
-  if (!direct.error && isViewRecord(direct)) {
-    return { path: identifier, read: direct };
+  if (!direct.error) {
+    const resolution = deps.resolveView(direct, identifier);
+    if (resolution.kind !== "not_view") return { path: identifier, resolution };
   }
   for (const candidate of await deps.scanFiles()) {
     const read = await deps.read(candidate);
-    if (!read.error && isViewRecord(read) && read.frontmatter?.id === identifier) {
-      return { path: candidate, read };
+    if (read.error) continue;
+    const resolution = deps.resolveView(read, candidate);
+    if (resolution.kind === "view" && resolution.view.id === identifier) {
+      return { path: candidate, resolution };
     }
   }
   return undefined;
@@ -723,10 +738,6 @@ function canonicalJson(value: unknown): string {
     ).join(",")}}`;
   }
   return JSON.stringify(value);
-}
-
-function isViewRecord(read: IndexedReadResult): boolean {
-  return (read.types ?? []).some((type) => type.toLowerCase() === "view");
 }
 
 function fallbackViewRevision(read: IndexedReadResult): string {
