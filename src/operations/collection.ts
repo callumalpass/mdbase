@@ -84,6 +84,10 @@ import {
   executeCanonicalView,
   listCanonicalViews,
   celTypeFacts,
+  validateCanonicalViewRecord,
+  VIEW_CONTRACT,
+  VIEW_CONTRACT_VERSION,
+  type ViewResolution,
 } from "./canonical-query.js";
 import { buildLinkIndex, IndexedReadResult } from "./link-index.js";
 import { LinkResolutionIndex, LinkResolver } from "./link-resolver.js";
@@ -3032,11 +3036,33 @@ fields:
           const built = await this.buildFileCache(files);
           return built as Map<string, IndexedReadResult>;
         },
+        resolveView: (read, path) => this.resolveView(read, path),
       }),
     );
   }
 
-  /** Resolve and execute an ordinary `type: view` Markdown record. */
+  /** Resolve a record through its one type implementing `mdbase.view` (spec Chapter 11). */
+  private resolveView(read: IndexedReadResult, path: string): ViewResolution {
+    const implementing = this.dataContracts.getImplementations(VIEW_CONTRACT, VIEW_CONTRACT_VERSION);
+    const candidates = (read.types ?? []).filter((type) =>
+      implementing.some((implementation) => implementation.type === type));
+    if (candidates.length === 0) return { kind: "not_view" };
+    const invalid = (message: string) => ({ severity: "error" as const, code: "invalid_view", message, path });
+    if (candidates.length > 1) {
+      return { kind: "invalid", diagnostics: [invalid(`Record matches several types implementing ${VIEW_CONTRACT}`)] };
+    }
+    const projected = this.dataContracts.project(
+      candidates[0], VIEW_CONTRACT, VIEW_CONTRACT_VERSION, read.frontmatter ?? {});
+    if (!projected.valid) {
+      return { kind: "invalid", diagnostics: projected.diagnostics.map(({ message }) => invalid(message)) };
+    }
+    // An installed contract copy may differ locally; execution depends on the
+    // canonical view shape regardless.
+    const diagnostics = validateCanonicalViewRecord(projected.view, path);
+    return diagnostics.length > 0 ? { kind: "invalid", diagnostics } : { kind: "view", view: projected.view };
+  }
+
+  /** Resolve and execute a record implementing `mdbase.view`. */
   async executeView(input: ExecuteViewInput): Promise<CanonicalQueryResult> {
     return await this.observer.trace(
       "collection.execute_view",
@@ -3054,6 +3080,7 @@ fields:
         return built as Map<string, IndexedReadResult>;
       },
       executeQuery: (query) => this.queryCanonical(query),
+      resolveView: (read, path) => this.resolveView(read, path),
     });
   }
 

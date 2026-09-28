@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Identify saved views through the `mdbase.view` record contract. Listing and
+  execution resolve a record's single implementing type, project its contract
+  view, and validate the canonical view shape, so an implementing type may use
+  any name, match rule, and field mapping. `type: view` records without an
+  implementing type are no longer views.
+
 ## 0.3.0-rc.7 - 2026-09-27
 
 Implements mdbase spec v0.3.0-rc.4.

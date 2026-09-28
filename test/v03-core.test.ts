@@ -1482,6 +1482,23 @@ title: Temporal
 scheduled: 2026-08-05T23:30:00Z
 ---
 `);
+    await write(root, "_contracts/mdbase.view.md", `---
+kind: mdbase.contract
+contract_type: record
+id: mdbase.view
+version: 1.0.0
+record_schema: {dialect: json-schema-2020-12, value: {type: object, properties: {id: {}, version: {}, name: {}, query: {}, views: {}}}}
+---
+`);
+    await write(root, "_types/view.md", `---
+kind: mdbase.type
+name: view
+version: 1
+match: {where: {type: view}}
+schema: {dialect: json-schema-2020-12, value: {type: object, properties: {id: {}, version: {}, name: {}, query: {}, views: {}}}}
+implements: [{contract: mdbase.view, version: 1.0.0, fields: {id: id, version: version, name: name, query: query, views: views}}]
+---
+`);
     await write(root, "views/temporal.md", `---
 type: view
 id: temporal.views
