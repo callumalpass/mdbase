@@ -64,9 +64,20 @@ function extractFrontmatter(raw: string): { yamlStr: string; body: string } | nu
 }
 
 /**
- * Parse a markdown file's frontmatter and body.
+ * How a record file's bytes hold frontmatter and body, fixed by its extension
+ * (spec Chapter 03): a `.base` file is a YAML document whose whole file is the
+ * frontmatter; every other record is Markdown.
  */
-function parseContent(rawBuffer: Buffer): ParsedFile {
+export type RecordFormat = "markdown" | "yaml-document";
+
+export function recordFormat(filePath: string): RecordFormat {
+  return filePath.endsWith(".base") ? "yaml-document" : "markdown";
+}
+
+/**
+ * Parse a record file's frontmatter and body in its format.
+ */
+function parseContent(rawBuffer: Buffer, format: RecordFormat): ParsedFile {
   // Validate UTF-8: check for invalid sequences (bytes that don't match UTF-8 patterns)
   if (!isValidUtf8(rawBuffer)) {
     return {
@@ -80,7 +91,14 @@ function parseContent(rawBuffer: Buffer): ParsedFile {
       },
     };
   }
-  const raw = rawBuffer.toString("utf-8");
+  return parseText(rawBuffer.toString("utf-8"), format);
+}
+
+/** Parse complete record source in its format. */
+export function parseText(raw: string, format: RecordFormat): ParsedFile {
+  if (format === "yaml-document") {
+    return parseMapping(raw.startsWith("\uFEFF") ? raw.slice(1) : raw, "", raw);
+  }
 
   // Check for blank line before --- (means no frontmatter)
   if (raw.startsWith("\n") || !raw.startsWith("---")) {
@@ -101,6 +119,10 @@ function parseContent(rawBuffer: Buffer): ParsedFile {
   }
 
   const { yamlStr, body } = extracted;
+  return parseMapping(yamlStr, body, raw);
+}
+
+function parseMapping(yamlStr: string, body: string, raw: string): ParsedFile {
   const trimmedYaml = yamlStr.trim();
 
   // Empty frontmatter
@@ -187,23 +209,28 @@ function parseContent(rawBuffer: Buffer): ParsedFile {
 
 export async function parseFileAsync(filePath: string): Promise<ParsedFile> {
   const rawBuffer = await fs.promises.readFile(filePath);
-  return parseContent(rawBuffer);
+  return parseContent(rawBuffer, recordFormat(filePath));
 }
 
 export const parseFile = parseFileAsync;
 
 /**
- * Serialize frontmatter and body back to a markdown string.
+ * Serialize frontmatter and body in a record format. A YAML document record
+ * has no body; callers reject one as invalid input before serializing.
  */
 export function serializeFile(
   frontmatter: Record<string, unknown>,
   body: string,
   writeNulls: "omit" | "explicit" = "omit",
   writeEmptyLists: boolean = true,
+  format: RecordFormat = "markdown",
 ): string {
   const filtered = filterFrontmatter(frontmatter, writeNulls, writeEmptyLists);
-  const result = matter.stringify(body, filtered);
-  return result;
+  if (format === "yaml-document") {
+    if (body !== "") throw new Error("A YAML document record has no body.");
+    return yaml.dump(filtered);
+  }
+  return matter.stringify(body, filtered);
 }
 
 export function filterFrontmatter(

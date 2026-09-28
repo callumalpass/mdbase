@@ -112,6 +112,8 @@ export interface UpdateInput {
   /** Field references whose keys are removed after the patch is applied. */
   unset?: string[];
   body?: string;
+  /** Complete candidate source in the record's format; replaces frontmatter and body. */
+  document?: string;
   if_revision?: string;
 }
 
@@ -199,6 +201,8 @@ export interface V03UpdateInput {
   /** Field references whose keys are removed. */
   unset?: string[];
   body?: string;
+  /** Complete candidate source in the record's format (spec Chapter 12). */
+  document?: string;
   if_revision?: string;
 }
 

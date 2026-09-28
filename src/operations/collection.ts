@@ -32,7 +32,7 @@ import {
   type DataContractDefinition,
   type DataContractImplementationDescriptor,
 } from "../data-contracts/registry.js";
-import { filterFrontmatter, parseFileAsync, serializeFile } from "../frontmatter/parser.js";
+import { filterFrontmatter, parseFileAsync, parseText, recordFormat, serializeFile } from "../frontmatter/parser.js";
 import { validateFrontmatter } from "../validation/validator.js";
 import { MdbaseError } from "../errors.js";
 import { evaluateExpression } from "../expressions/evaluator.js";
@@ -1811,11 +1811,16 @@ fields:
 
     // Write file - only disk frontmatter (no default-only fields)
     const body = input.body ?? "";
+    const format = recordFormat(relativePath);
+    if (format === "yaml-document" && body !== "") {
+      return { error: { code: "invalid_request", message: "A YAML document record has no body." } };
+    }
     const content = serializeFile(
       diskFrontmatter,
       body,
       this.config.settings.write_nulls,
       this.config.settings.write_empty_lists,
+      format,
     );
     // Call pre-write hook (for testing concurrent modifications)
     if (this.preWriteHook) {
@@ -1886,13 +1891,20 @@ fields:
     const readMtime = (await fs.promises.stat(fullPath)).mtimeMs;
 
     const existing = await parseFileAsync(fullPath);
-    if (this.config.spec_profile === "v0.3" && existing.error?.details?.reason === "non_mapping_frontmatter") {
+    const format = recordFormat(relativePath);
+    // A whole-document replacement supplies the complete candidate source in
+    // the record's format (spec Chapter 12).
+    const candidate = input.document === undefined ? undefined : parseText(input.document, format);
+    if (candidate?.error) {
+      return { valid: false, error: candidate.error };
+    }
+    if (!candidate && this.config.spec_profile === "v0.3" && existing.error?.details?.reason === "non_mapping_frontmatter") {
       // A structured update never silently discards non-mapping frontmatter
       // (spec Chapter 03); a document replacement can repair it.
       return { valid: false, error: existing.error };
     }
     const originalFrontmatter: Record<string, unknown> = { ...existing.frontmatter };
-    const frontmatter: Record<string, unknown> = { ...existing.frontmatter };
+    const frontmatter: Record<string, unknown> = { ...(candidate?.frontmatter ?? existing.frontmatter) };
 
     // Apply field updates
     const updates = input.fields ?? input.frontmatter;
@@ -2029,13 +2041,20 @@ fields:
     }
 
     // Write file — use the disk frontmatter (without computed or default-only fields)
-    const body = input.body ?? existing.body;
-    const content = serializeFile(
-      diskFrontmatter,
-      body,
-      this.config.settings.write_nulls,
-      this.config.settings.write_empty_lists,
-    );
+    const body = candidate?.body ?? input.body ?? existing.body;
+    if (format === "yaml-document" && body !== "") {
+      return { valid: false, error: { code: "invalid_request", message: "A YAML document record has no body." } };
+    }
+    // The exact supplied source is kept when policy did not alter it.
+    const content = candidate && canonicalJson(diskFrontmatter) === canonicalJson(candidate.frontmatter)
+      ? input.document!
+      : serializeFile(
+        diskFrontmatter,
+        body,
+        this.config.settings.write_nulls,
+        this.config.settings.write_empty_lists,
+        format,
+      );
 
     // Call pre-write hook (for testing concurrent modifications)
     if (this.preWriteHook) {
@@ -2533,6 +2552,7 @@ fields:
             nextBody,
             this.config.settings.write_nulls,
             this.config.settings.write_empty_lists,
+            recordFormat(filePath),
           );
           await writeFileAtomic(fullPath, updatedContent);
           await this.upsertCacheFromData(filePath, nextFrontmatter, nextBody);
@@ -4032,6 +4052,7 @@ fields:
           upd.body ?? "",
           this.config.settings.write_nulls,
           this.config.settings.write_empty_lists,
+          recordFormat(upd.path),
         );
         const fullPath = path.join(this.root, upd.path);
         await writeFileAtomic(fullPath, content);
@@ -4986,6 +5007,7 @@ export class V03Operations {
       fields: input.patch,
       unset: input.unset,
       body: input.body,
+      document: input.document,
       if_revision: input.if_revision,
     })));
   }
@@ -5313,6 +5335,12 @@ function invalidV03Update(input: V03UpdateInput): string | undefined {
   for (const alias of ["fields", "frontmatter"]) {
     if (members[alias] !== undefined) {
       return `update takes patch and unset; '${alias}' is not a v0.3 update member`;
+    }
+  }
+  if (input.document !== undefined) {
+    if (typeof input.document !== "string") return "document must be a string";
+    if (input.patch !== undefined || input.unset !== undefined || input.body !== undefined) {
+      return "a document replacement cannot be combined with patch, unset, or body";
     }
   }
   if (input.unset === undefined) return undefined;
