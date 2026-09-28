@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- YAML document records (mdbase spec `b3883f9`): a record's format is fixed by
+  its extension, and `.base` files listed in `record_extensions` are records
+  whose whole file is the frontmatter, with no body. A body for such a record
+  is `invalid_request`. `mdbase.lock.yaml` is never a record.
+- `update` accepts `document`, the complete candidate source in the record's
+  format; it replaces frontmatter and body, can repair non-mapping
+  frontmatter, and is written exactly as supplied when lifecycle policy leaves
+  it unchanged. It cannot be combined with `patch`, `unset`, or `body`.
+
 - Identify saved views through the `mdbase.view` record contract. Listing and
   execution resolve a record's single implementing type, project its contract
   view, and validate the canonical view shape, so an implementing type may use

@@ -122,7 +122,11 @@ export class CollectionScanner {
         if (this.includeSubfolders) {
           files.push(...await this.scan(fullPath, recordsOnly));
         }
-      } else if (entry.name !== "mdbase.yaml" && (!recordsOnly || this.isRecordFile(entry.name))) {
+      } else if (
+        // Collection control files are never records (spec Chapter 02).
+        entry.name !== "mdbase.yaml" && relativePath !== "mdbase.lock.yaml"
+        && (!recordsOnly || this.isRecordFile(entry.name))
+      ) {
         files.push(relativePath);
       }
     }
