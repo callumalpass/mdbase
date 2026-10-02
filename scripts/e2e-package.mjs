@@ -6,6 +6,9 @@ import { join, resolve } from "node:path";
 const packageRoot = resolve(import.meta.dirname, "..");
 const tempRoot = mkdtempSync(join(tmpdir(), "mdbase-package-e2e-"));
 const collectionRoot = join(tempRoot, "collection");
+// Saved views are records whose type implements mdbase.view, so the collection
+// installs the published view pack (including its upgrade_from seed) first.
+const viewPack = join(packageRoot, "test", "fixtures", "type-packs", "mdbase.view", "1.0.1.json");
 let tarball;
 
 function runNpm(args, options) {
@@ -20,7 +23,7 @@ function assert(condition, message) {
 }
 
 function runConsumer(mode) {
-  const output = execFileSync(process.execPath, ["consumer.mjs", mode, collectionRoot], {
+  const output = execFileSync(process.execPath, ["consumer.mjs", mode, collectionRoot, viewPack], {
     cwd: tempRoot,
     encoding: "utf8",
     stdio: ["ignore", "pipe", "inherit"],
@@ -48,6 +51,7 @@ try {
   });
 
   const mutation = runConsumer("mutate");
+  assert(mutation.view_pack === "install", `Expected the view pack to install: ${JSON.stringify(mutation)}`);
   assert(mutation.created === 2, `Expected two created records: ${JSON.stringify(mutation)}`);
   assert(mutation.query_count === 2, `Expected warm query to see two records: ${JSON.stringify(mutation)}`);
   assert(mutation.backlinks === 1, `Expected body backlink before rename: ${JSON.stringify(mutation)}`);
@@ -80,11 +84,11 @@ try {
 
 function consumerSource() {
   return String.raw`
-import { Collection } from "@callumalpass/mdbase";
-import { mkdir, writeFile } from "node:fs/promises";
+import { Collection, applyTypePack, assessTypePack } from "@callumalpass/mdbase";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { join } from "node:path";
 
-const [mode, root] = process.argv.slice(2);
+const [mode, root, viewPackPath] = process.argv.slice(2);
 const events = [];
 const options = {
   observability: {
@@ -112,15 +116,15 @@ schema:
       status: { type: string }
 ---
 `)}, "utf8");
-  await writeFile(join(root, "_types", "view.md"), ${JSON.stringify(`---
-kind: mdbase.type
-name: view
-version: 1
-schema:
-  dialect: json-schema-2020-12
-  value: { type: object }
----
-`)}, "utf8");
+  const viewPack = JSON.parse(await readFile(viewPackPath, "utf8"));
+  const installer = { installedBy: "dev.mdbase.package-e2e" };
+  const assessed = await assessTypePack(root, viewPack, installer);
+  if (!assessed.valid) throw new Error(JSON.stringify(assessed.diagnostics));
+  const applied = await applyTypePack(root, viewPack, {
+    ...installer,
+    expectedAssessmentDigest: assessed.result.assessment_digest,
+  });
+  if (!applied.valid) throw new Error(JSON.stringify(applied.diagnostics));
   await mkdir(join(root, "views"), { recursive: true });
   await writeFile(join(root, "views", "tasks.md"), ${JSON.stringify(`---
 type: view
@@ -177,6 +181,7 @@ views:
   await collection.cacheRebuild();
   await collection.close();
   process.stdout.write(JSON.stringify({
+    view_pack: assessed.result.status,
     created: Number(!alpha.error) + Number(!beta.error),
     query_count: query.meta.total_count,
     backlinks: backlinks.length,

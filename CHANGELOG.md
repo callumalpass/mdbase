@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.3.0-rc.8 - 2026-10-03
+
+- The package e2e test installs the published `mdbase.view` 1.0.1 pack
+  (including its `upgrade_from` seed) through the packaged `assessTypePack` /
+  `applyTypePack`, so its saved view implements the `mdbase.view` contract
+  that view execution has required since the contract-based view change.
+
 - Regression tests (no behaviour change): a create that selects a type whose
   `match` rule does not hold is explicit membership whenever an explicit type
   key is configured (`[mdbase_type]`, `[type, types]`), and keeps failing with
