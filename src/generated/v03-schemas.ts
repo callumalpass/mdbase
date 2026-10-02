@@ -1610,6 +1610,23 @@ export const typePackSchema: Record<string, unknown> = {
             "seed"
           ]
         },
+        "upgrade_from": {
+          "type": "object",
+          "required": [
+            "digest",
+            "document"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "digest": {
+              "$ref": "#/$defs/digest"
+            },
+            "document": {
+              "type": "string",
+              "maxLength": 262144
+            }
+          }
+        },
         "source": {
           "$ref": "#/$defs/safeRelativePath"
         },

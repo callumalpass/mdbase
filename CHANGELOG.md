@@ -17,6 +17,22 @@
   any name, match rule, and field mapping. `type: view` records without an
   implementing type are no longer views.
 
+- Seed-type upgrades (mdbase spec chapter 05a): a seed `type` resource may
+  declare `upgrade_from: { digest, document }`, the exact previous starter
+  pinned by digest. Packs using it are no longer rejected as
+  `invalid_type_pack`; `upgrade_from` on any other kind or mode, or with a
+  digest that does not match its document, is. When the seed target exists
+  and is not preserved, assessment plans it like mdbase-rs: a seed already
+  holding the desired starter is `preserve`d, an unedited previous starter is
+  an `update` to the desired starter byte-for-byte, and an edited seed gets
+  the conservative three-way merge (baseline, live, desired) as an `update`,
+  or a `conflict` naming the competing setting. The diff `digest` is the
+  planned document's digest, so the merge result is covered by the
+  assessment digest; the lock records the desired starter's digest.
+- A seed whose pack source was renamed keeps its installed target identity,
+  so a user-deleted seed type is not recreated, and a retained target is no
+  longer also listed for retirement under its old source.
+
 ## 0.3.0-rc.7 - 2026-09-27
 
 Implements mdbase spec v0.3.0-rc.4.
