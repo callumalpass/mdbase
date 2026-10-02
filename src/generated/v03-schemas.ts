@@ -1520,6 +1520,23 @@ export const typePackLockSchema: Record<string, unknown> = {
         },
         "digest": {
           "$ref": "#/$defs/digest"
+        },
+        "origin_digest": {
+          "$ref": "#/$defs/digest"
+        }
+      },
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "managed"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "origin_digest"
+          ]
         }
       },
       "additionalProperties": false
@@ -1587,6 +1604,27 @@ export const typePackSchema: Record<string, unknown> = {
       "type": "string",
       "pattern": "^sha256:[0-9a-f]{64}$"
     },
+    "upgradeBaseline": {
+      "type": "object",
+      "required": [
+        "digest",
+        "document"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "digest": {
+          "$ref": "#/$defs/digest"
+        },
+        "document": {
+          "type": "string",
+          "maxLength": 262144
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
     "resource": {
       "type": "object",
       "required": [
@@ -1611,21 +1649,18 @@ export const typePackSchema: Record<string, unknown> = {
           ]
         },
         "upgrade_from": {
-          "type": "object",
-          "required": [
-            "digest",
-            "document"
-          ],
-          "additionalProperties": false,
-          "properties": {
-            "digest": {
-              "$ref": "#/$defs/digest"
+          "oneOf": [
+            {
+              "$ref": "#/$defs/upgradeBaseline"
             },
-            "document": {
-              "type": "string",
-              "maxLength": 262144
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/upgradeBaseline"
+              }
             }
-          }
+          ]
         },
         "source": {
           "$ref": "#/$defs/safeRelativePath"

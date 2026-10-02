@@ -2,6 +2,36 @@
 
 ## Unreleased
 
+- Seed-type upgrades from any listed baseline, chosen by recorded origin
+  (mdbase spec `f5f5743`, PR mdbase-dev/mdbase-spec#59). `upgrade_from` is one
+  baseline or a non-empty list, each `{ digest, document, version? }`. It is
+  `invalid_type_pack` outside seed types, or when a baseline's digest is not
+  the SHA-256 of its document, two baselines share a digest, a baseline is the
+  resource's own document, a baseline's type kind or name differs from the
+  desired type, or its `version` differs from the version its document
+  declares.
+- The lock records a seed's `origin_digest`: the desired digest when the seed
+  is created or upgraded (exact or merged), or when its live bytes already
+  equal the desired starter; otherwise the previous entry's origin for that
+  target (matched by target) is carried forward, or omitted. The seed's pack
+  `digest` is never used as its origin. An entry without `origin_digest` (including every lock
+  written by earlier releases) has an unknown origin. Recording an origin
+  alone does not make an installed pack `reconfigure`.
+- A seed type with `upgrade_from` whose target exists and is not preserved is
+  planned in order: live equals desired, `preserve`; live equals any baseline,
+  `update` with the exact desired bytes; origin is the desired starter,
+  `preserve`; origin is a listed baseline, three-way merge against that
+  baseline (conflicts still fail closed); otherwise `preserve` with a
+  `reason`, not a conflict. Behaviour change: an edited seed installed by an
+  earlier release (no recorded origin) is now preserved with a reason instead
+  of being merged against the single declared baseline. Seed `update`s report
+  `upgrade_baseline: { digest, version? }`, bound into `assessment_digest`. A
+  preserved seed with `upgrade_from` now reports the desired `digest`, like
+  every other seed `preserve` (it reported the live digest in rc.8).
+- The v0.3 conformance runner supports type-pack `input.history` and the
+  seed-upgrade expectations, and now also asserts type-pack `runs`, `status`,
+  `applicable`, `actions`, `lock_exists`, and `targets_exist`.
+
 ## 0.3.0-rc.8 - 2026-10-03
 
 - The package e2e test installs the published `mdbase.view` 1.0.1 pack

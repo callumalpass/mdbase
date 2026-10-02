@@ -17,7 +17,13 @@ import {
   TYPE_PACK_TRANSACTIONS_FOLDER,
   type TypePackTransactionJournal,
 } from "./recovery.js";
-import { planSeedUpgrade, verifySeedUpgradeBase, type SeedUpgradeBase } from "./seed-upgrade.js";
+import {
+  planSeedUpgrade,
+  seedUpgradeBaselines,
+  verifySeedUpgradeFrom,
+  type SeedUpgradeBaselineRef,
+  type SeedUpgradeFrom,
+} from "./seed-upgrade.js";
 
 export interface TypePackManifestResource {
   kind: "contract" | "type" | "schema";
@@ -26,10 +32,11 @@ export interface TypePackManifestResource {
   target: string;
   digest: string;
   /**
-   * The exact previous publisher document of a seed type, pinned by digest.
-   * Only valid on `kind: type`, `mode: seed` resources.
+   * The exact starters a publisher previously shipped for a seed type, each
+   * pinned by digest: one baseline or a non-empty list. Only valid on
+   * `kind: type`, `mode: seed` resources.
    */
-  upgrade_from?: SeedUpgradeBase;
+  upgrade_from?: SeedUpgradeFrom;
 }
 
 export interface TypePackManifest {
@@ -62,6 +69,8 @@ export interface TypePackResourceDiff {
   current_digest?: string;
   installed_digest?: string;
   adopted_from_digest?: string;
+  /** The baseline a seed `update` upgraded from (exact replacement or merge). */
+  upgrade_baseline?: SeedUpgradeBaselineRef;
   reason?: string;
 }
 
@@ -76,6 +85,11 @@ export interface TypePackReceipt {
     source: string;
     target: string;
     digest: string;
+    /**
+     * Seed resources only: the digest of the publisher document the target
+     * descends from, when known. Absent means the origin is unknown.
+     */
+    origin_digest?: string;
   }>;
 }
 
@@ -353,10 +367,11 @@ async function planAssessment(
   }
   const manifest = provision.manifest;
   for (const [index, resource] of manifest.resources.entries()) {
-    if (resource.upgrade_from === undefined) continue;
-    const problem = verifySeedUpgradeBase(resource.upgrade_from, resource.kind, resource.mode);
-    if (problem) {
-      throw new TypePackError("invalid_type_pack", `/resources/${index}/upgrade_from: ${problem}`);
+    if (resource.upgrade_from !== undefined && (resource.kind !== "type" || resource.mode !== "seed")) {
+      throw new TypePackError(
+        "invalid_type_pack",
+        `/resources/${index}/upgrade_from: upgrade_from is only valid on seed type resources.`,
+      );
     }
   }
   for (const target of Object.keys(targetOverrides)) {
@@ -403,19 +418,27 @@ async function planAssessment(
   if (sources.size !== manifest.resources.length) {
     throw new TypePackError("invalid_type_pack", "The type pack contains undeclared source resources.");
   }
+  for (const [index, resource] of manifest.resources.entries()) {
+    if (resource.upgrade_from === undefined) continue;
+    const document = sources.get(resource.source);
+    if (!document) {
+      throw new TypePackError("invalid_type_pack", `Missing source resource: ${resource.source}.`);
+    }
+    if (digest(document) !== resource.digest) {
+      throw new TypePackError("invalid_type_pack", `Digest mismatch for source resource ${resource.source}.`);
+    }
+    const problem = verifySeedUpgradeFrom(resource, resource.upgrade_from, document);
+    if (problem) {
+      throw new TypePackError("invalid_type_pack", `/resources/${index}/upgrade_from${problem}`);
+    }
+  }
   const lockPath = resolveInside(root, TYPE_PACK_LOCK_PATH);
   const lockBefore = await readOptional(lockPath);
   const lock = parseLock(lockBefore);
   const current = lock.packs.find(({ id }) => id === manifest.id);
-  const desired: TypePackReceipt = {
-    id: manifest.id,
-    version: manifest.version,
-    digest: canonicalDigest(manifest),
-    installed_by: current?.installed_by ?? installedBy,
-    resources: resolvedDefinitions.map(({ kind, mode, source, target, digest: resourceDigest }) => ({
-      kind, mode, source, target, digest: resourceDigest,
-    })),
-  };
+  // The origin each seed target records after apply (05a "Pack Identity And
+  // Portable Provenance"). The seed's pack digest is never its origin.
+  const origins = new Map<string, string | undefined>();
   const targets = new Set<string>();
   const currentBySource = new Map(current?.resources.map((resource) => [resource.source, resource]) ?? []);
   const otherManagedOwners = new Map(
@@ -453,33 +476,45 @@ async function planAssessment(
         : undefined;
     const owner = otherManagedOwners.get(definition.target);
     const currentDigest = before ? digest(before) : undefined;
+    // Matched by target: a renamed seed source keeps its target's origin.
+    const previousOrigin = current?.resources.find(({ target: prior }) => prior === definition.target)
+      ?.origin_digest;
     let action: TypePackResourceDiff["action"];
     let reason: string | undefined;
     let adoptedFromDigest: string | undefined;
+    let upgradeBaseline: SeedUpgradeBaselineRef | undefined;
     let plannedBytes = bytes;
     if (owner) {
       action = "conflict";
       reason = `${definition.target} is managed by ${owner}.`;
-    } else if (
-      definition.upgrade_from
-      && definition.mode === "seed"
-      && !preserveSeedTargets.has(definition.target)
-      && before !== undefined
-    ) {
-      // An explicit seed-type upgrade: reviewed three-way merge of the pinned
-      // previous starter, the live type, and the desired starter.
-      const upgrade = planSeedUpgrade(definition.upgrade_from, before, bytes);
-      if (upgrade.ok) {
+    } else if (definition.mode === "seed" && preserveSeedTargets.has(definition.target)) {
+      // An intentional omission: the target is the user's, whatever it holds.
+      action = "preserve";
+    } else if (definition.mode === "seed" && before === undefined) {
+      // A deleted seed is not recreated.
+      action = currentResource ? "preserve" : "create";
+    } else if (definition.mode === "seed" && before!.equals(bytes)) {
+      action = "preserve";
+    } else if (definition.mode === "seed" && definition.upgrade_from) {
+      // An explicit seed-type upgrade, against the baseline the seed is known
+      // to descend from and no other.
+      const upgrade = planSeedUpgrade({
+        target: definition.target,
+        baselines: seedUpgradeBaselines(definition.upgrade_from),
+        live: before!,
+        desired: bytes,
+        desiredDigest: definition.digest,
+        ...(previousOrigin === undefined ? {} : { previousOrigin }),
+      });
+      action = upgrade.action;
+      if (upgrade.action === "update") {
         plannedBytes = upgrade.bytes;
-        action = sameBytes(before, upgrade.bytes) ? "preserve" : "update";
+        upgradeBaseline = upgrade.baseline;
       } else {
-        action = "conflict";
-        reason = `${definition.target}: ${upgrade.reason}`;
+        reason = upgrade.reason;
       }
     } else if (definition.mode === "seed") {
-      action = before === undefined && !currentResource && !preserveSeedTargets.has(definition.target)
-        ? "create"
-        : "preserve";
+      action = "preserve";
     } else if (!currentResource) {
       if (before === undefined) action = "create";
       else if (currentDigest === definition.digest) {
@@ -514,9 +549,34 @@ async function planAssessment(
       ...(before ? { before, current_digest: currentDigest } : {}),
       ...(currentResource ? { installed_digest: currentResource.digest } : {}),
       ...(adoptedFromDigest ? { adopted_from_digest: adoptedFromDigest } : {}),
+      ...(upgradeBaseline ? { upgrade_baseline: upgradeBaseline } : {}),
       ...(reason ? { reason } : {}),
     });
+    if (definition.mode === "seed") {
+      // Known from bytes this apply writes, or finds equal to the desired
+      // document; otherwise the previous origin for the target carries forward.
+      origins.set(
+        definition.target,
+        action === "create" || action === "update" || currentDigest === definition.digest
+          ? definition.digest
+          : previousOrigin,
+      );
+    }
   }
+
+  const desired: TypePackReceipt = {
+    id: manifest.id,
+    version: manifest.version,
+    digest: canonicalDigest(manifest),
+    installed_by: current?.installed_by ?? installedBy,
+    resources: resolvedDefinitions.map(({ kind, mode, source, target, digest: resourceDigest }) => {
+      const origin = mode === "seed" ? origins.get(target) : undefined;
+      return {
+        kind, mode, source, target, digest: resourceDigest,
+        ...(origin === undefined ? {} : { origin_digest: origin }),
+      };
+    }),
+  };
 
   for (const prior of current?.resources ?? []) {
     const before = await readOptional(resolveInside(root, prior.target));
@@ -546,8 +606,10 @@ async function planAssessment(
   if (planned.some(({ action }) => action === "conflict")) status = "conflict";
   else if (!current) status = "install";
   else if (current.version === desired.version && current.digest === desired.digest) {
+    // Recording or carrying a seed origin is provenance, not a different
+    // resolution of the pack, so it does not make the pack `reconfigure`.
     status = planned.some(({ action }) => !["unchanged", "preserve", "adopt"].includes(action))
-      || JSON.stringify(current.resources) !== JSON.stringify(desired.resources)
+      || JSON.stringify(resolution(current)) !== JSON.stringify(resolution(desired))
       ? "reconfigure"
       : "current";
   }
@@ -718,6 +780,12 @@ function issueKey(issue: {
     issue.field ?? null,
     issue.message,
   ]);
+}
+
+function resolution(receipt: TypePackReceipt): unknown[] {
+  return receipt.resources.map(({ kind, mode, source, target, digest: resourceDigest }) => ({
+    kind, mode, source, target, digest: resourceDigest,
+  }));
 }
 
 function validateManifest(value: unknown): { valid: boolean; errors: string[] } {
