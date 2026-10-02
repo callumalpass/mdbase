@@ -311,10 +311,10 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
       return validateTypePackResources(input);
 
     case "apply_type_pack":
-      return await applyTypePackFixture(context.root, input);
+      return await applyTypePackFixture(context.root, input, testCase.expect);
 
     case "assess_type_pack":
-      return await assessTypePackFixture(context.root, input);
+      return await assessTypePackFixture(context.root, input, testCase.expect);
 
     case "query":
       return await withOperationRoot(context, input, async (root) => {
@@ -443,10 +443,60 @@ async function executeOperation(context: TestContext, testCase: V03TestCase): Pr
   }
 }
 
-async function applyTypePackFixture(root: string, input: Dict): Promise<Dict> {
+/**
+ * `input.history` (tests/v0.3/README.md, "Type-pack history"): steps applied in
+ * order after setup and before the operation.
+ */
+async function runTypePackHistory(root: string, input: Dict): Promise<void> {
+  for (const step of (input.history as Dict[] | undefined) ?? []) {
+    if (typeof step.apply === "string") {
+      const provision = loadTypePackFixture({ pack: step.apply });
+      const assessment = await assessTypePack(root, provision, { installedBy: "dev.mdbase.conformance" });
+      if (!assessment.valid || !assessment.result.applicable) {
+        throw new Error(`history apply ${step.apply} is not applicable: ${JSON.stringify(assessment)}`);
+      }
+      const applied = await applyTypePack(root, provision, {
+        installedBy: "dev.mdbase.conformance",
+        expectedAssessmentDigest: assessment.result.assessment_digest,
+      });
+      if (!applied.valid) {
+        throw new Error(`history apply ${step.apply} failed: ${JSON.stringify(applied.diagnostics)}`);
+      }
+    } else if (step.write && typeof step.write === "object") {
+      const { path: target, content } = step.write as Dict;
+      await write(root, String(target), String(content));
+    } else if (step.replace && typeof step.replace === "object") {
+      const { path: target, old, new: replacement } = step.replace as Dict;
+      const fullPath = path.join(root, String(target));
+      const current = await fsp.readFile(fullPath, "utf8");
+      if (current.split(String(old)).length !== 2) {
+        throw new Error(`history replace in ${String(target)} must match exactly once`);
+      }
+      await fsp.writeFile(fullPath, current.replace(String(old), () => String(replacement)), "utf8");
+    } else {
+      throw new Error(`Unsupported type-pack history step: ${JSON.stringify(step)}`);
+    }
+  }
+}
+
+/** Exact bytes of every collection file named by a seed-upgrade expectation. */
+function typePackSnapshot(root: string, expectation: Dict | undefined): Record<string, string | null> {
+  const targets = new Set<string>([
+    ...((expectation?.target_unchanged as string[] | undefined) ?? []),
+  ]);
+  return Object.fromEntries([...targets].map((target) => {
+    const fullPath = path.join(root, target);
+    return [target, fs.existsSync(fullPath) ? fs.readFileSync(fullPath).toString("base64") : null];
+  }));
+}
+
+async function applyTypePackFixture(root: string, input: Dict, expectation?: Dict): Promise<Dict> {
+  await runTypePackHistory(root, input);
+  const before = typePackSnapshot(root, expectation);
   const { manifest, resources } = loadTypePackFixture(input);
   const provision = { manifest, resources };
   const runs: Dict[] = [];
+  let firstResources: Dict[] | undefined;
   const repeat = Number(input.repeat ?? 1);
   for (let index = 0; index < repeat; index += 1) {
     let adoptResources: Record<string, string> = {};
@@ -475,6 +525,7 @@ async function applyTypePackFixture(root: string, input: Dict): Promise<Dict> {
           expectedAssessmentDigest: assessment.result.assessment_digest,
         })
       : assessment;
+    firstResources ??= assessment.result.resources as unknown as Dict[] | undefined;
     runs.push({
       valid: result.valid,
       status: assessment.result.status,
@@ -497,14 +548,30 @@ async function applyTypePackFixture(root: string, input: Dict): Promise<Dict> {
     implementations,
     lock_exists: fs.existsSync(path.join(root, "mdbase.lock.yaml")),
     targets_exist: manifest.resources.map((resource) => fs.existsSync(path.join(root, resource.target))),
+    resources: firstResources ?? [],
+    before_targets: before,
     ...(last.error ? { error: last.error } : {}),
   };
 }
 
-async function assessTypePackFixture(root: string, input: Dict): Promise<Dict> {
+async function assessTypePackFixture(root: string, input: Dict, expectation?: Dict): Promise<Dict> {
   const provision = loadTypePackFixture(input);
   const initial = await assessTypePack(root, provision, { installedBy: "dev.mdbase.conformance" });
   if (!initial.valid) return adapterResult(initial, {});
+  if (input.history !== undefined) {
+    // The history prepares the collection; the operation is the assessment.
+    await runTypePackHistory(root, input);
+    const before = typePackSnapshot(root, expectation);
+    const assessed = await assessTypePack(root, provision, { installedBy: "dev.mdbase.conformance" });
+    return {
+      ...adapterResult(assessed as unknown as V03OperationResult<Dict>, {}),
+      status: assessed.result.status,
+      applicable: assessed.result.applicable,
+      actions: assessed.result.resources?.map(({ action }) => action) ?? [],
+      resources: assessed.result.resources ?? [],
+      before_targets: before,
+    };
+  }
   await applyTypePack(root, provision, {
     installedBy: "dev.mdbase.conformance",
     expectedAssessmentDigest: initial.result.assessment_digest,
@@ -1011,6 +1078,82 @@ function resolveMigrationSourcePath(context: TestContext, input: Dict): string {
   return path.join(sourceRoot, input.source);
 }
 
+/** Type-pack run, diff, and seed-upgrade expectations (tests/v0.3/README.md). */
+function assertTypePackExpectation(actual: Dict, expected: Dict, testName: string, root: string): void {
+  if (Array.isArray(expected.runs)) {
+    const runs = actual.runs as Dict[] | undefined ?? [];
+    expect(runs.length, `${testName}: runs`).toBe(expected.runs.length);
+    (expected.runs as Dict[]).forEach((run, index) => {
+      assertSubset(runs[index], run, `${testName}: runs[${index}]`);
+    });
+  }
+  for (const key of ["status", "applicable", "actions", "lock_exists", "targets_exist"]) {
+    if (key in expected) expect(actual[key], `${testName}: ${key}`).toEqual(expected[key]);
+  }
+  for (const resource of (expected.resources as Dict[] | undefined) ?? []) {
+    const label = `${testName}: resources[${String(resource.target)}]`;
+    const planned = (actual.resources as Dict[] | undefined ?? []).find(({ target }) => target === resource.target);
+    expect(planned, label).toBeDefined();
+    if ("action" in resource) expect(planned!.action, `${label}.action`).toBe(resource.action);
+    if ("upgrade_baseline_version" in resource) {
+      expect((planned!.upgrade_baseline as Dict | undefined)?.version, `${label}.upgrade_baseline.version`)
+        .toBe(resource.upgrade_baseline_version);
+    }
+    if ("reason" in resource) {
+      expect(typeof planned!.reason === "string" && planned!.reason.length > 0, `${label}.reason`)
+        .toBe(resource.reason);
+    }
+  }
+  const readTarget = (target: string) => fs.readFileSync(path.join(root, target));
+  for (const [target, source] of Object.entries((expected.target_matches_source as Dict | undefined) ?? {})) {
+    expect(readTarget(target).equals(fs.readFileSync(path.join(SPEC_REPO, String(source)))),
+      `${testName}: ${target} matches ${String(source)}`).toBe(true);
+  }
+  for (const target of (expected.target_unchanged as string[] | undefined) ?? []) {
+    const fullPath = path.join(root, target);
+    const now = fs.existsSync(fullPath) ? fs.readFileSync(fullPath).toString("base64") : null;
+    expect(now, `${testName}: ${target} unchanged`).toBe((actual.before_targets as Dict)[target]);
+  }
+  for (const [target, pointers] of Object.entries((expected.target_frontmatter as Dict | undefined) ?? {})) {
+    const frontmatter = splitTypePackDocument(readTarget(target).toString("utf8")).frontmatter;
+    for (const [pointer, value] of Object.entries(pointers as Dict)) {
+      const resolved = getPointer(frontmatter, pointer);
+      expect(resolved, `${testName}: ${target} frontmatter ${pointer}`).not.toBeUndefined();
+      expect(resolved, `${testName}: ${target} frontmatter ${pointer}`).toEqual(value);
+    }
+  }
+  for (const [target, snippets] of Object.entries((expected.target_body_contains as Dict | undefined) ?? {})) {
+    const body = splitTypePackDocument(readTarget(target).toString("utf8")).body;
+    for (const snippet of snippets as string[]) {
+      expect(body, `${testName}: ${target} body`).toContain(snippet);
+    }
+  }
+  if (expected.lock_origin) {
+    const lock = yaml.load(readTarget("mdbase.lock.yaml").toString("utf8")) as {
+      packs: Array<{ resources: Array<{ target: string; origin_digest?: string }> }>;
+    };
+    for (const [target, source] of Object.entries(expected.lock_origin as Dict)) {
+      const entries = lock.packs.flatMap(({ resources }) => resources).filter((entry) => entry.target === target);
+      expect(entries.length, `${testName}: lock entries for ${target}`).toBe(1);
+      const origin = entries[0]!.origin_digest;
+      if (source === "absent") expect(origin, `${testName}: lock origin of ${target}`).toBeUndefined();
+      else {
+        const sourceDigest = `sha256:${createHash("sha256")
+          .update(fs.readFileSync(path.join(SPEC_REPO, String(source))))
+          .digest("hex")}`;
+        expect(origin, `${testName}: lock origin of ${target}`).toBe(sourceDigest);
+      }
+    }
+  }
+}
+
+function splitTypePackDocument(text: string): { frontmatter: unknown; body: string } {
+  if (!text.startsWith("---\n")) throw new Error("document has no frontmatter");
+  const end = text.indexOf("\n---\n", 3);
+  if (end < 0) throw new Error("document has unterminated frontmatter");
+  return { frontmatter: yaml.load(text.slice(4, end + 1)), body: text.slice(end + 5) };
+}
+
 function getPointer(value: unknown, pointer: string): unknown {
   if (pointer === "" || pointer === "/") return value;
   return pointer
@@ -1268,6 +1411,9 @@ if (suites.length === 0) {
                   const actual = await executeOperation(context, testCase);
                   if (testCase.expect) {
                     await assertExpectation(actual, testCase.expect, testCase.name, context);
+                    if (["apply_type_pack", "assess_type_pack"].includes(testCase.operation)) {
+                      assertTypePackExpectation(actual, testCase.expect, testCase.name, context.root);
+                    }
                   }
                   const verify = testCase.verify_after;
                   if (verify) {

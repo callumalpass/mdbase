@@ -9,7 +9,13 @@ import {
   assessTypePack,
   type TypePackProvision,
 } from "../src/index.js";
-import { frontmatterBounds, mergeSeedType, mergeValue } from "../src/type-packs/seed-upgrade.js";
+import {
+  frontmatterBounds,
+  mergeSeedType,
+  mergeValue,
+  type SeedUpgradeBaseline,
+  type SeedUpgradeFrom,
+} from "../src/type-packs/seed-upgrade.js";
 
 // Published mdbase-contracts packs (dist/packs/mdbase.view at 7d3d31e):
 // 1.0.0 seeds `_types/view.md` from types/view/1.md; 1.0.1 declares the
@@ -89,6 +95,7 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
       digest: sha256(desired),
       current_digest: sha256(previous),
       installed_digest: sha256(previous),
+      upgrade_baseline: { digest: sha256(previous) },
     });
 
     const applied = await applyTypePack(root, upgrade, {
@@ -100,7 +107,12 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
     const lock = await readLock(root);
     expect(lock.packs[0]).toMatchObject({ id: "mdbase.view", version: "1.0.1" });
     expect(viewDiff(lock.packs[0].resources)).toEqual({
-      kind: "type", mode: "seed", source: "types/view/2.md", target: VIEW_TARGET, digest: sha256(desired),
+      kind: "type",
+      mode: "seed",
+      source: "types/view/2.md",
+      target: VIEW_TARGET,
+      digest: sha256(desired),
+      origin_digest: sha256(desired),
     });
 
     const repeated = await assessTypePack(root, upgrade, { installedBy: INSTALLER });
@@ -135,7 +147,12 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
     expect(assessment.valid, JSON.stringify(assessment.diagnostics)).toBe(true);
     expect(assessment.result.status).toBe("upgrade");
     const diff = viewDiff(assessment.result.resources)!;
-    expect(diff).toMatchObject({ action: "update", current_digest: sha256(edited), installed_digest: sha256(previous) });
+    expect(diff).toMatchObject({
+      action: "update",
+      current_digest: sha256(edited),
+      installed_digest: sha256(previous),
+      upgrade_baseline: { digest: sha256(previous) },
+    });
     expect(diff).not.toHaveProperty("reason");
     // The diff digest is the merged document; the lock still records the
     // publisher's desired starter digest.
@@ -160,11 +177,16 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
     expect(value.implements).toEqual(desiredValue.implements);
     // Unchanged top-level nodes keep their exact source text.
     expect(merged).toContain("description: Our team views\nx-owner:\n  team: docs # ours\n");
-    expect(viewDiff((await readLock(root)).packs[0].resources)).toMatchObject({ digest: sha256(desired) });
+    expect(viewDiff((await readLock(root)).packs[0].resources))
+      .toMatchObject({ digest: sha256(desired), origin_digest: sha256(desired) });
 
+    // Edited after its upgrade: the origin is the desired starter, so it is
+    // preserved without a reason.
     const repeated = await assessTypePack(root, upgrade, { installedBy: INSTALLER });
     expect(repeated.result.status).toBe("current");
-    expect(viewDiff(repeated.result.resources)).toMatchObject({ action: "preserve", digest: sha256(merged) });
+    // A preserved seed reports the desired digest, as every seed preserve does.
+    expect(viewDiff(repeated.result.resources)).toMatchObject({ action: "preserve", digest: sha256(desired) });
+    expect(viewDiff(repeated.result.resources)).not.toHaveProperty("reason");
   });
 
   it("reports competing customizations as conflicts and writes nothing", async () => {
@@ -206,13 +228,41 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
     await expect(fs.stat(path.join(root, VIEW_TARGET))).rejects.toMatchObject({ code: "ENOENT" });
   });
 
-  it("does not upgrade an intentionally preserved seed target", async () => {
+  it("does not upgrade an intentionally preserved seed target and carries its origin", async () => {
     const { root, previous, upgrade } = await installedView();
     const options = { installedBy: INSTALLER, preserveSeedTargets: [VIEW_TARGET] };
     const assessment = await assessTypePack(root, upgrade, options);
     expect(viewDiff(assessment.result.resources)).toMatchObject({ action: "preserve" });
+    expect(viewDiff(assessment.result.resources)).not.toHaveProperty("upgrade_baseline");
     await install(root, upgrade, { preserveSeedTargets: [VIEW_TARGET] });
     expect(await read(root, VIEW_TARGET)).toBe(previous);
+    expect(viewDiff((await readLock(root)).packs[0].resources)).toMatchObject({ origin_digest: sha256(previous) });
+
+    // Byte equality with the desired starter still records it as the origin.
+    const desired = viewDocument(upgrade);
+    await fs.writeFile(path.join(root, VIEW_TARGET), desired);
+    await install(root, upgrade, { preserveSeedTargets: [VIEW_TARGET] });
+    expect(viewDiff((await readLock(root)).packs[0].resources)).toMatchObject({ origin_digest: sha256(desired) });
+  });
+
+  it("preserves an edited seed with a reason when the lock predates origins", async () => {
+    const { root, previous, upgrade } = await installedView();
+    // A lock written before origin_digest existed: the origin is unknown.
+    const lock = await readLock(root);
+    for (const resource of lock.packs[0].resources) delete resource.origin_digest;
+    await fs.writeFile(path.join(root, "mdbase.lock.yaml"), `${JSON.stringify(lock, null, 2)}\n`);
+    const edited = previous.replace("description: 'Saved views", "description: 'Our saved views");
+    expect(edited).not.toBe(previous);
+    await fs.writeFile(path.join(root, VIEW_TARGET), edited);
+
+    const applied = await install(root, upgrade);
+    expect(applied.result.status).toBe("upgrade");
+    const diff = viewDiff(applied.result.resources)!;
+    expect(diff).toMatchObject({ action: "preserve", current_digest: sha256(edited) });
+    expect(diff).not.toHaveProperty("upgrade_baseline");
+    expect((diff as { reason?: string }).reason).toContain("no upgrade baseline applies");
+    expect(await read(root, VIEW_TARGET)).toBe(edited);
+    expect(viewDiff((await readLock(root)).packs[0].resources)).not.toHaveProperty("origin_digest");
   });
 
   it("rejects upgrade_from outside seed types and baselines that do not match their digest", async () => {
@@ -227,15 +277,24 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
         },
         "/resources/1/upgrade_from",
       ],
-      ["tampered baseline", (pack) => { pack.manifest.resources[2]!.upgrade_from!.document = "tampered"; }, "digest-pinned"],
-      ["malformed digest", (pack) => { pack.manifest.resources[2]!.upgrade_from!.digest = "sha256:nope"; }, "upgrade_from/digest"],
+      [
+        "tampered baseline",
+        (pack) => { (pack.manifest.resources[2]!.upgrade_from as SeedUpgradeBaseline).document = "tampered"; },
+        "digest is not the SHA-256 of its document",
+      ],
+      [
+        "malformed digest",
+        (pack) => { (pack.manifest.resources[2]!.upgrade_from as SeedUpgradeBaseline).digest = "sha256:nope"; },
+        "upgrade_from/digest",
+      ],
       [
         "unknown member",
         (pack) => {
-          (pack.manifest.resources[2]!.upgrade_from as unknown as Record<string, unknown>).version = "1.0.0";
+          (pack.manifest.resources[2]!.upgrade_from as unknown as Record<string, unknown>).note = "x";
         },
         "must NOT have additional properties",
       ],
+      ["empty list", (pack) => { pack.manifest.resources[2]!.upgrade_from = []; }, "/resources/2/upgrade_from"],
     ];
     for (const [label, mutate, expected] of variants) {
       const root = await collection();
@@ -250,6 +309,288 @@ describe("seed type-pack upgrades (upgrade_from)", () => {
       await expect(fs.stat(path.join(root, VIEW_TARGET)), label).rejects.toMatchObject({ code: "ENOENT" });
       await expect(fs.stat(path.join(root, "mdbase.lock.yaml")), label).rejects.toMatchObject({ code: "ENOENT" });
     }
+  });
+});
+
+// A synthetic seed `note` type shipped as v1 (title), v2 (+created), and v3
+// (+tags), mirroring the spec's examples/v0.3/seed-upgrades.
+const NOTE_TARGET = "_types/note.md";
+const PACK_ID = "dev.example.seed-notes";
+const noteType = (version: number, properties: string[], description: string, name = "note") => [
+  "---",
+  "kind: mdbase.type",
+  `name: ${name}`,
+  `version: ${version}`,
+  `description: ${description}`,
+  "match:",
+  "  where:",
+  "    type: note",
+  "schema:",
+  "  dialect: json-schema-2020-12",
+  "  value:",
+  "    type: object",
+  "    required: [title]",
+  "    properties:",
+  ...properties.map((property) => `      ${property}`),
+  "    additionalProperties: true",
+  "---",
+  "# Note",
+  "",
+  "A note in this collection.",
+  "",
+].join("\n");
+const NOTE_V1 = noteType(1, ["title: { type: string }"], "A note.");
+const NOTE_V2 = noteType(2, ["title: { type: string }", "created: { type: string, format: date-time }"], "A dated note.");
+const NOTE_V3 = noteType(3, [
+  "title: { type: string }",
+  "created: { type: string, format: date-time }",
+  "tags: { type: array, items: { type: string } }",
+], "A dated, tagged note.");
+const baseline = (document: string, version?: number): SeedUpgradeBaseline => ({
+  digest: sha256(document),
+  document,
+  ...(version === undefined ? {} : { version }),
+});
+
+function notePack(version: string, document: string, upgradeFrom?: SeedUpgradeFrom): TypePackProvision {
+  return {
+    manifest: {
+      kind: "mdbase.type-pack",
+      id: PACK_ID,
+      version,
+      resources: [{
+        kind: "type",
+        mode: "seed",
+        source: "types/note.md",
+        target: NOTE_TARGET,
+        digest: sha256(document),
+        ...(upgradeFrom ? { upgrade_from: upgradeFrom } : {}),
+      }],
+    },
+    resources: [{ source: "types/note.md", document }],
+  };
+}
+
+const V1 = () => notePack("1.0.0", NOTE_V1);
+const V2_PLAIN = () => notePack("1.5.0", NOTE_V2);
+const V3 = () => notePack("3.0.0", NOTE_V3, [baseline(NOTE_V2, 2), baseline(NOTE_V1, 1)]);
+const V3_ONLY_V2 = () => notePack("3.0.0", NOTE_V3, [baseline(NOTE_V2, 2)]);
+const addMood = (document: string) =>
+  document.replace("      title: { type: string }\n", "      title: { type: string }\n      mood: { type: string }\n");
+const noteEntry = async (root: string) =>
+  (await readLock(root)).packs.find(({ id }: { id: string }) => id === PACK_ID)
+    .resources.find(({ target }: { target: string }) => target === NOTE_TARGET);
+const noteDiff = (resources: Array<{ target: string }>) =>
+  resources.find(({ target }) => target === NOTE_TARGET) as Record<string, unknown>;
+const frontmatterOf = (document: string) => parseYaml(document.slice(...frontmatterBounds(document)));
+
+/** The assessment digest recomputed from the assessment's own fields. */
+function canonical(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(canonical).join(",")}]`;
+  if (value && typeof value === "object") {
+    const object = value as Record<string, unknown>;
+    return `{${Object.keys(object).sort().map((key) => `${JSON.stringify(key)}:${canonical(object[key])}`).join(",")}}`;
+  }
+  return JSON.stringify(value);
+}
+
+describe("seed upgrades from listed baselines, chosen by origin", () => {
+  it("records the desired digest as origin on create, never the pack digest of a preserved seed", async () => {
+    const root = await collection();
+    await install(root, V1());
+    expect(await noteEntry(root)).toEqual({
+      kind: "type", mode: "seed", source: "types/note.md", target: NOTE_TARGET,
+      digest: sha256(NOTE_V1), origin_digest: sha256(NOTE_V1),
+    });
+    // A plain pack that preserves the seed keeps the v1 origin, not its own digest.
+    const preserved = await install(root, V2_PLAIN());
+    expect(noteDiff(preserved.result.resources)).toMatchObject({ action: "preserve" });
+    expect(await noteEntry(root)).toMatchObject({ digest: sha256(NOTE_V2), origin_digest: sha256(NOTE_V1) });
+  });
+
+  it("replaces an unedited seed from an older listed baseline with the exact desired bytes", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const applied = await install(root, V3());
+    expect(applied.result.status).toBe("upgrade");
+    expect(noteDiff(applied.result.resources)).toMatchObject({
+      action: "update",
+      digest: sha256(NOTE_V3),
+      upgrade_baseline: { digest: sha256(NOTE_V1), version: 1 },
+    });
+    expect(await read(root, NOTE_TARGET)).toBe(NOTE_V3);
+    expect(await noteEntry(root)).toMatchObject({ origin_digest: sha256(NOTE_V3) });
+    const repeated = await install(root, V3());
+    expect(repeated.result.status).toBe("current");
+    expect(noteDiff(repeated.result.resources)).toMatchObject({ action: "preserve" });
+  });
+
+  it("matches an exact baseline whatever the lock records", async () => {
+    const root = await collection();
+    await fs.mkdir(path.join(root, "_types"), { recursive: true });
+    // A user-placed copy of the v2 starter, with no origin in the lock.
+    await fs.writeFile(path.join(root, NOTE_TARGET), NOTE_V2);
+    await install(root, V1());
+    expect(await noteEntry(root)).not.toHaveProperty("origin_digest");
+    const applied = await install(root, V3());
+    expect(noteDiff(applied.result.resources)).toMatchObject({
+      action: "update",
+      upgrade_baseline: { digest: sha256(NOTE_V2), version: 2 },
+    });
+    expect(await read(root, NOTE_TARGET)).toBe(NOTE_V3);
+  });
+
+  it("merges an edited seed against its origin baseline, not the newest one", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const edited = addMood(NOTE_V1).replace("A note in this collection.\n", "My notes, as I keep them.\n");
+    await fs.writeFile(path.join(root, NOTE_TARGET), edited);
+    const applied = await install(root, V3());
+    expect(noteDiff(applied.result.resources)).toMatchObject({
+      action: "update",
+      upgrade_baseline: { digest: sha256(NOTE_V1), version: 1 },
+    });
+    const merged = await read(root, NOTE_TARGET);
+    const value = frontmatterOf(merged);
+    expect(value.version).toBe(3);
+    expect(value.description).toBe("A dated, tagged note.");
+    expect(Object.keys(value.schema.value.properties).sort()).toEqual(["created", "mood", "tags", "title"]);
+    expect(merged).toContain("My notes, as I keep them.");
+    expect(await noteEntry(root)).toMatchObject({ origin_digest: sha256(NOTE_V3) });
+  });
+
+  it("carries the origin through a pack version that preserves the seed", async () => {
+    const root = await collection();
+    await install(root, V1());
+    await install(root, V2_PLAIN());
+    await fs.writeFile(path.join(root, NOTE_TARGET), addMood(NOTE_V1));
+    const applied = await install(root, V3());
+    expect(noteDiff(applied.result.resources)).toMatchObject({
+      action: "update",
+      upgrade_baseline: { digest: sha256(NOTE_V1), version: 1 },
+    });
+    expect(frontmatterOf(await read(root, NOTE_TARGET)).schema.value.properties).toHaveProperty("created");
+  });
+
+  it("carries the origin of a deleted seed and of a renamed seed source", async () => {
+    const root = await collection();
+    await install(root, V1());
+    await fs.rm(path.join(root, NOTE_TARGET));
+    const renamed = V2_PLAIN();
+    renamed.manifest.resources[0]!.source = "types/note/2.md";
+    renamed.resources[0]!.source = "types/note/2.md";
+    const applied = await install(root, renamed);
+    expect(noteDiff(applied.result.resources)).toMatchObject({ action: "preserve", source: "types/note/2.md" });
+    expect(await noteEntry(root)).toMatchObject({ source: "types/note/2.md", origin_digest: sha256(NOTE_V1) });
+  });
+
+  it("preserves, with a reason and no conflict, an edited seed whose origin is not listed", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const edited = addMood(NOTE_V1);
+    await fs.writeFile(path.join(root, NOTE_TARGET), edited);
+    const applied = await install(root, V3_ONLY_V2());
+    expect(applied.result).toMatchObject({ status: "upgrade", applicable: true });
+    const diff = noteDiff(applied.result.resources);
+    expect(diff).toMatchObject({ action: "preserve", current_digest: sha256(edited) });
+    expect(diff.reason).toContain("no upgrade baseline applies");
+    expect(diff).not.toHaveProperty("upgrade_baseline");
+    expect(await read(root, NOTE_TARGET)).toBe(edited);
+    expect(await noteEntry(root)).toMatchObject({ origin_digest: sha256(NOTE_V1) });
+  });
+
+  it("never merges a type that existed before the pack into a starter", async () => {
+    const root = await collection();
+    const own = noteType(1, ["title: { type: string }", "mood: { type: string }"], "Our own notes.");
+    await fs.mkdir(path.join(root, "_types"), { recursive: true });
+    await fs.writeFile(path.join(root, NOTE_TARGET), own);
+    await install(root, V1());
+    const applied = await install(root, V3());
+    const diff = noteDiff(applied.result.resources);
+    expect(diff).toMatchObject({ action: "preserve" });
+    expect(diff.reason).toContain("no upgrade baseline applies");
+    expect(await read(root, NOTE_TARGET)).toBe(own);
+    expect(await noteEntry(root)).not.toHaveProperty("origin_digest");
+  });
+
+  it("records the desired origin when a pre-existing target already equals the desired starter", async () => {
+    const root = await collection();
+    await fs.mkdir(path.join(root, "_types"), { recursive: true });
+    await fs.writeFile(path.join(root, NOTE_TARGET), NOTE_V1);
+    const applied = await install(root, V1());
+    expect(noteDiff(applied.result.resources)).toMatchObject({ action: "preserve" });
+    expect(await noteEntry(root)).toMatchObject({ origin_digest: sha256(NOTE_V1) });
+  });
+
+  it("does not report reconfigure when only a recorded origin changes", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const lock = await readLock(root);
+    delete lock.packs[0].resources[0].origin_digest;
+    await fs.writeFile(path.join(root, "mdbase.lock.yaml"), `${JSON.stringify(lock, null, 2)}\n`);
+    const assessed = await assessTypePack(root, V1(), { installedBy: INSTALLER });
+    expect(assessed.result).toMatchObject({ status: "current", lock: { action: "update" } });
+    await install(root, V1());
+    expect(await noteEntry(root)).toMatchObject({ origin_digest: sha256(NOTE_V1) });
+  });
+
+  it("fails closed when the merge against the origin conflicts", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const edited = NOTE_V1.replace("description: A note.", "description: Mine.");
+    await fs.writeFile(path.join(root, NOTE_TARGET), edited);
+    const assessment = await assessTypePack(root, V3(), { installedBy: INSTALLER });
+    expect(assessment.result).toMatchObject({ status: "conflict", applicable: false });
+    expect(noteDiff(assessment.result.resources)).toMatchObject({ action: "conflict" });
+    expect(String(noteDiff(assessment.result.resources).reason)).toContain("/description");
+    expect(assessment.result.desired.resources[0]).toMatchObject({ origin_digest: sha256(NOTE_V1) });
+  });
+
+  it("binds the upgrade baseline into the assessment digest", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const lockBefore = await fs.readFile(path.join(root, "mdbase.lock.yaml"));
+    const assessed = await assessTypePack(root, V3(), { installedBy: INSTALLER });
+    const { assessment_digest: assessmentDigest, ...identity } = assessed.result;
+    expect(noteDiff(identity.resources)).toHaveProperty("upgrade_baseline");
+    expect(sha256(canonical({ ...identity, lock_digest: sha256(lockBefore) }))).toBe(assessmentDigest);
+    const tampered = structuredClone(identity);
+    (noteDiff(tampered.resources).upgrade_baseline as { digest: string }).digest = sha256(NOTE_V2);
+    expect(sha256(canonical({ ...tampered, lock_digest: sha256(lockBefore) }))).not.toBe(assessmentDigest);
+  });
+
+  it("rejects each invalid upgrade_from with invalid_type_pack", async () => {
+    const variants: Array<[string, SeedUpgradeFrom, string?, string?]> = [
+      ["digest mismatch", [{ digest: sha256(NOTE_V2), document: NOTE_V1 }], "not the SHA-256 of its document"],
+      ["duplicate baseline", [baseline(NOTE_V1, 1), baseline(NOTE_V1)], "distinct digests"],
+      ["own digest", [baseline(NOTE_V2), baseline(NOTE_V3)], "own document"],
+      ["version mismatch", [baseline(NOTE_V1, 2)], "version differs"],
+      ["name mismatch", [baseline(noteType(1, ["title: { type: string }"], "A note.", "memo"))], "kind and name"],
+      ["kind mismatch", [baseline(NOTE_V1.replace("kind: mdbase.type", "kind: mdbase.contract"))], "kind and name"],
+      ["no frontmatter", [baseline("Just text.\n")], "not a type document"],
+      ["managed resource", baseline(NOTE_V1), "only valid on seed type resources", "managed"],
+    ];
+    for (const [label, upgradeFrom, expected, mode] of variants) {
+      const root = await collection();
+      const pack = notePack("3.0.0", NOTE_V3, upgradeFrom);
+      if (mode) pack.manifest.resources[0]!.mode = mode as "managed";
+      const assessment = await assessTypePack(root, pack, { installedBy: INSTALLER });
+      expect(assessment.valid, label).toBe(false);
+      expect(assessment.diagnostics[0]?.code, label).toBe("invalid_type_pack");
+      expect(assessment.diagnostics[0]?.message, label).toContain(expected);
+      await expect(fs.stat(path.join(root, NOTE_TARGET)), label).rejects.toMatchObject({ code: "ENOENT" });
+    }
+  });
+
+  it("accepts a single baseline object as a list of one", async () => {
+    const root = await collection();
+    await install(root, V1());
+    const applied = await install(root, notePack("2.0.0", NOTE_V2, baseline(NOTE_V1, 1)));
+    expect(noteDiff(applied.result.resources)).toMatchObject({
+      action: "update",
+      upgrade_baseline: { digest: sha256(NOTE_V1), version: 1 },
+    });
+    expect(await read(root, NOTE_TARGET)).toBe(NOTE_V2);
   });
 });
 

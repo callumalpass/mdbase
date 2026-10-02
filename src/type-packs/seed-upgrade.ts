@@ -2,55 +2,142 @@
  * Conservative, data-free three-way merges for explicitly upgraded seed types
  * (mdbase spec chapter 05a, "seed-type upgrades").
  *
- * This is a port of mdbase-rs `src/v03/type_pack_seed_upgrade.rs`. The merge
+ * `upgrade_from` lists the exact starters a publisher previously shipped. The
+ * engine never guesses which one a live type descends from: a byte-identical
+ * starter is replaced with the exact desired bytes, and an edited type merges
+ * only against the baseline its lock entry records as its origin
+ * (`origin_digest`). Anything else is preserved with a reason.
+ *
+ * The merge is a port of mdbase-rs `src/v03/type_pack_seed_upgrade.rs`; its
  * rules, conflict conditions, and conflict messages match the Rust engine.
- * One deliberate refinement: when the live document is byte-for-byte the
- * previous publisher baseline, the desired document is written exactly as
- * published instead of being re-serialised node by node.
  */
 import { createHash } from "node:crypto";
 import { parse as parseYaml, stringify as stringifyYaml } from "yaml";
 
-/** An explicit, digest-pinned previous publisher baseline for one seed type. */
-export interface SeedUpgradeBase {
+/** One exact starter a publisher previously shipped for a seed type, pinned by digest. */
+export interface SeedUpgradeBaseline {
   digest: string;
   document: string;
+  /** The `version` the baseline document declares; presentation only. */
+  version?: number;
 }
 
+/** A seed type's `upgrade_from`: one baseline, or a non-empty list of them. */
+export type SeedUpgradeFrom = SeedUpgradeBaseline | SeedUpgradeBaseline[];
+
+/** The baseline reported for a seed `update`, as `upgrade_baseline`. */
+export interface SeedUpgradeBaselineRef {
+  digest: string;
+  version?: number;
+}
+
+/**
+ * The planned outcome for a seed type whose target exists, is not an
+ * intentionally preserved seed target, and declares `upgrade_from`.
+ */
 export type SeedUpgradePlan =
-  | { ok: true; bytes: Buffer }
-  | { ok: false; reason: string };
+  | { action: "preserve"; reason?: string }
+  | { action: "update"; bytes: Buffer; baseline: SeedUpgradeBaselineRef }
+  | { action: "conflict"; reason: string };
 
-const BASELINE_ERROR = "Seed upgrade requires a digest-pinned type baseline.";
+/** A single baseline is equivalent to a list containing it. */
+export function seedUpgradeBaselines(value: SeedUpgradeFrom): SeedUpgradeBaseline[] {
+  return Array.isArray(value) ? value : [value];
+}
 
-/** Reject a baseline that is not on a seed type or does not match its digest. */
-export function verifySeedUpgradeBase(base: SeedUpgradeBase, kind: string, mode: string): string | undefined {
-  if (kind !== "type" || mode !== "seed" || revision(Buffer.from(base.document, "utf8")) !== base.digest) {
-    return BASELINE_ERROR;
+export function baselineRef(baseline: SeedUpgradeBaseline): SeedUpgradeBaselineRef {
+  return { digest: baseline.digest, ...(baseline.version === undefined ? {} : { version: baseline.version }) };
+}
+
+/**
+ * Check a schema-valid `upgrade_from` against the rules of chapter 05a. Returns
+ * the first problem, or `undefined` when the declaration is valid. `desired` is
+ * the resource's own document, already verified against `resource.digest`.
+ */
+export function verifySeedUpgradeFrom(
+  resource: { kind: string; mode: string; digest: string },
+  upgradeFrom: SeedUpgradeFrom,
+  desired: Buffer,
+): string | undefined {
+  if (resource.kind !== "type" || resource.mode !== "seed") {
+    return ": upgrade_from is only valid on seed type resources.";
+  }
+  let desiredType: { kind: unknown; name: unknown };
+  try {
+    desiredType = typeIdentity(utf8(desired));
+  } catch (error) {
+    return `: the desired seed type cannot be read: ${errorMessage(error)}`;
+  }
+  const seen = new Set<string>();
+  for (const [index, baseline] of seedUpgradeBaselines(upgradeFrom).entries()) {
+    const at = Array.isArray(upgradeFrom) ? `/${index}` : "";
+    if (revision(Buffer.from(baseline.document, "utf8")) !== baseline.digest) {
+      return `${at}: an upgrade baseline's digest is not the SHA-256 of its document.`;
+    }
+    if (seen.has(baseline.digest)) return `${at}: upgrade baselines must have distinct digests.`;
+    seen.add(baseline.digest);
+    if (baseline.digest === resource.digest) {
+      return `${at}: an upgrade baseline cannot be the resource's own document.`;
+    }
+    let frontmatter: Record<string, unknown>;
+    try {
+      const value = parseFrontmatter(baseline.document);
+      if (!isObject(value)) throw new SeedMergeConflict("Type must be an object.");
+      frontmatter = value;
+    } catch (error) {
+      return `${at}: an upgrade baseline is not a type document: ${errorMessage(error)}`;
+    }
+    if (!deepEqual(frontmatter.kind, desiredType.kind) || !deepEqual(frontmatter.name, desiredType.name)) {
+      return `${at}: an upgrade baseline must have the same type kind and name as the desired type.`;
+    }
+    if (baseline.version !== undefined && frontmatter.version !== baseline.version) {
+      return `${at}: an upgrade baseline's version differs from the version its document declares.`;
+    }
   }
   return undefined;
 }
 
-/** The live type merged with the desired publisher changes. */
-export function planSeedUpgrade(base: SeedUpgradeBase, current: Buffer, desired: Buffer): SeedUpgradePlan {
-  const baseline = Buffer.from(base.document, "utf8");
-  // Exact-bytes rules: an already-current seed stays as it is, and an
-  // unedited previous starter becomes the desired starter byte-for-byte.
-  if (current.equals(desired)) return { ok: true, bytes: current };
-  if (current.equals(baseline)) return { ok: true, bytes: desired };
-  let currentText: string;
-  let desiredText: string;
-  try {
-    currentText = utf8(current);
-    desiredText = utf8(desired);
-  } catch (error) {
-    return { ok: false, reason: errorMessage(error) };
+/**
+ * Plan an explicit seed-type upgrade (chapter 05a), in the normative order:
+ * 1. live equals desired: preserve;
+ * 2. live equals a baseline: update to the exact desired bytes;
+ * 3. the origin is the desired document: preserve (edited since its upgrade);
+ * 4. the origin is a baseline: three-way merge against that baseline;
+ * 5. otherwise (unknown or unlisted origin): preserve, with a reason.
+ */
+export function planSeedUpgrade(input: {
+  target: string;
+  baselines: readonly SeedUpgradeBaseline[];
+  live: Buffer;
+  desired: Buffer;
+  desiredDigest: string;
+  previousOrigin?: string;
+}): SeedUpgradePlan {
+  const { target, baselines, live, desired, desiredDigest, previousOrigin } = input;
+  if (live.equals(desired)) return { action: "preserve" };
+  const exact = baselines.find((baseline) => live.equals(Buffer.from(baseline.document, "utf8")));
+  if (exact) return { action: "update", bytes: desired, baseline: baselineRef(exact) };
+  if (previousOrigin === desiredDigest) return { action: "preserve" };
+  const origin = baselines.find((baseline) => baseline.digest === previousOrigin);
+  if (!origin) {
+    // The origin is unknown, or is not a listed baseline: never guess one.
+    return {
+      action: "preserve",
+      reason: `${target}: no upgrade baseline applies to this type's origin, so it is left as it is.`,
+    };
   }
   try {
-    return { ok: true, bytes: Buffer.from(mergeSeedType(base.document, currentText, desiredText), "utf8") };
+    const merged = mergeSeedType(origin.document, utf8(live), utf8(desired));
+    return { action: "update", bytes: Buffer.from(merged, "utf8"), baseline: baselineRef(origin) };
   } catch (error) {
-    return { ok: false, reason: errorMessage(error) };
+    return { action: "conflict", reason: `${target}: ${errorMessage(error)}` };
   }
+}
+
+function typeIdentity(document: string): { kind: unknown; name: unknown } {
+  const value = parseFrontmatter(document);
+  if (!isObject(value)) throw new SeedMergeConflict("Type must be an object.");
+  return { kind: value.kind, name: value.name };
 }
 
 /** Merge `desired` into `current` relative to `base`; throws on conflicts. */
