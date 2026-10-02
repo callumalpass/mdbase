@@ -1525,6 +1525,20 @@ export const typePackLockSchema: Record<string, unknown> = {
           "$ref": "#/$defs/digest"
         }
       },
+      "if": {
+        "properties": {
+          "mode": {
+            "const": "managed"
+          }
+        }
+      },
+      "then": {
+        "not": {
+          "required": [
+            "origin_digest"
+          ]
+        }
+      },
       "additionalProperties": false
     }
   }
