@@ -2,8 +2,10 @@
 
 ## Unreleased
 
+## 0.3.0-rc.9 - 2026-10-03
+
 - Seed-type upgrades from any listed baseline, chosen by recorded origin
-  (mdbase spec `f5f5743`, PR mdbase-dev/mdbase-spec#59). `upgrade_from` is one
+  (mdbase spec `b2ace4c`, mdbase-dev/mdbase-spec#59). `upgrade_from` is one
   baseline or a non-empty list, each `{ digest, document, version? }`. It is
   `invalid_type_pack` outside seed types, or when a baseline's digest is not
   the SHA-256 of its document, two baselines share a digest, a baseline is the
