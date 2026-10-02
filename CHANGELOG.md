@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Regression tests (no behaviour change): a create that selects a type whose
+  `match` rule does not hold is explicit membership whenever an explicit type
+  key is configured (`[mdbase_type]`, `[type, types]`), and keeps failing with
+  `type_membership_changed` under `explicit_type_keys: []`, as in mdbase-rs.
+  0.3.0-rc.5 rejected the explicit case with `match_failed`; rc.6 fixed it.
+
 - YAML document records (mdbase spec `b3883f9`): a record's format is fixed by
   its extension, and `.base` files listed in `record_extensions` are records
   whose whole file is the frontmatter, with no body. A body for such a record
