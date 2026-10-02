@@ -17,6 +17,7 @@ import {
   TYPE_PACK_TRANSACTIONS_FOLDER,
   type TypePackTransactionJournal,
 } from "./recovery.js";
+import { planSeedUpgrade, verifySeedUpgradeBase, type SeedUpgradeBase } from "./seed-upgrade.js";
 
 export interface TypePackManifestResource {
   kind: "contract" | "type" | "schema";
@@ -24,6 +25,11 @@ export interface TypePackManifestResource {
   source: string;
   target: string;
   digest: string;
+  /**
+   * The exact previous publisher document of a seed type, pinned by digest.
+   * Only valid on `kind: type`, `mode: seed` resources.
+   */
+  upgrade_from?: SeedUpgradeBase;
 }
 
 export interface TypePackManifest {
@@ -346,6 +352,13 @@ async function planAssessment(
     throw new TypePackError("invalid_type_pack", `Type-pack manifest is invalid: ${manifestValidation.errors.join("; ")}`);
   }
   const manifest = provision.manifest;
+  for (const [index, resource] of manifest.resources.entries()) {
+    if (resource.upgrade_from === undefined) continue;
+    const problem = verifySeedUpgradeBase(resource.upgrade_from, resource.kind, resource.mode);
+    if (problem) {
+      throw new TypePackError("invalid_type_pack", `/resources/${index}/upgrade_from: ${problem}`);
+    }
+  }
   for (const target of Object.keys(targetOverrides)) {
     if (!manifest.resources.some((resource) => resource.target === target)) {
       throw new TypePackError(
@@ -404,7 +417,6 @@ async function planAssessment(
     })),
   };
   const targets = new Set<string>();
-  const desiredBySource = new Map(resolvedDefinitions.map((resource) => [resource.source, resource]));
   const currentBySource = new Map(current?.resources.map((resource) => [resource.source, resource]) ?? []);
   const otherManagedOwners = new Map(
     lock.packs
@@ -432,15 +444,38 @@ async function planAssessment(
     }
     const before = await readOptional(target);
     const priorResource = currentBySource.get(definition.source);
-    const currentResource = priorResource?.target === definition.target ? priorResource : undefined;
+    const currentResource = priorResource?.target === definition.target
+      ? priorResource
+      // A renamed seed source keeps its installed seed target, so a
+      // user-deleted seed type is not resurrected and an upgrade knows it.
+      : definition.mode === "seed"
+        ? current?.resources.find((resource) => resource.mode === "seed" && resource.target === definition.target)
+        : undefined;
     const owner = otherManagedOwners.get(definition.target);
     const currentDigest = before ? digest(before) : undefined;
     let action: TypePackResourceDiff["action"];
     let reason: string | undefined;
     let adoptedFromDigest: string | undefined;
+    let plannedBytes = bytes;
     if (owner) {
       action = "conflict";
       reason = `${definition.target} is managed by ${owner}.`;
+    } else if (
+      definition.upgrade_from
+      && definition.mode === "seed"
+      && !preserveSeedTargets.has(definition.target)
+      && before !== undefined
+    ) {
+      // An explicit seed-type upgrade: reviewed three-way merge of the pinned
+      // previous starter, the live type, and the desired starter.
+      const upgrade = planSeedUpgrade(definition.upgrade_from, before, bytes);
+      if (upgrade.ok) {
+        plannedBytes = upgrade.bytes;
+        action = sameBytes(before, upgrade.bytes) ? "preserve" : "update";
+      } else {
+        action = "conflict";
+        reason = `${definition.target}: ${upgrade.reason}`;
+      }
     } else if (definition.mode === "seed") {
       action = before === undefined && !currentResource && !preserveSeedTargets.has(definition.target)
         ? "create"
@@ -472,8 +507,10 @@ async function planAssessment(
       source: definition.source,
       target: definition.target,
       action,
-      digest: definition.digest,
-      bytes,
+      // The digest of the bytes this plan would leave at the target, so a
+      // merged seed upgrade is covered by the assessment digest.
+      digest: digest(plannedBytes),
+      bytes: plannedBytes,
       ...(before ? { before, current_digest: currentDigest } : {}),
       ...(currentResource ? { installed_digest: currentResource.digest } : {}),
       ...(adoptedFromDigest ? { adopted_from_digest: adoptedFromDigest } : {}),
@@ -486,8 +523,9 @@ async function planAssessment(
     const currentDigest = before ? digest(before) : undefined;
     let action: TypePackResourceDiff["action"] = "preserve";
     let reason: string | undefined;
-    const desiredResource = desiredBySource.get(prior.source);
-    if (desiredResource?.target === prior.target) continue;
+    // A publisher may rename a source while retaining its installed target.
+    // The desired resource now owns that path; do not retire it a second time.
+    if (resolvedDefinitions.some((resource) => resource.target === prior.target)) continue;
     if (prior.mode === "managed") {
       if (currentDigest === prior.digest) action = "delete";
       else {
